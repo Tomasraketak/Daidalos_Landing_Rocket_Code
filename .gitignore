@@ -1,0 +1,6 @@
+test/host_test
+*.o
+*.elf
+*.uf2
+__pycache__/
+.DS_Store
