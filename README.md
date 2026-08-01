@@ -51,13 +51,28 @@ rather than saving it. Two consequences drive the whole design:
 Daidalos_Landing_Guidance/
   Daidalos_Landing_Guidance.ino   I/O shell: pins, timing, link, failsafes
   guidance.h  guidance.cpp        the algorithm — no Arduino dependency
+Ariadna_V2/                       three-MCU flight computer built around it
+  common/ariadna_link.h           the inter-processor wire protocol
+  Master_MCU/                     Pico 2 W — state machine, servos, log, LoRa
+  Position_MCU/                   XIAO RP2350 — sensor fusion
+  Navigation_MCU/                 XIAO RP2350 — guidance, TVC, pyros
+  Ground_Station/                 Pico 2 — LoRa receiver
+  Ground_Visualizer/              PyQt6 telemetry display
 test/
   host_test.cpp                   108 numerical checks against the model
+  link_test.cpp                   85 checks on the Ariadna V2 link codec
+  check_py_format.py              pins the Python decoder to the C packet
   golden_vectors.h                reference values from the simulation
   gen_golden.py                   regenerates them from lander_v2.py
   stub/                           fake Arduino headers, for the syntax check
   Makefile
 ```
+
+`Daidalos_Landing_Guidance/` is the single-board V1 computer: it takes a navigation
+solution in and puts servo commands out. `Ariadna_V2/` splits that job across three
+processors and adds the sensors, the mission state machine and the ground segment
+around it — flying the same guidance module, unchanged and byte-identical. See
+[`Ariadna_V2/README.md`](Ariadna_V2/README.md).
 
 **The algorithm is deliberately not in the `.ino`.** Anything inside a sketch can only be
 tested by flashing a board, and firmware that cannot be tested on a workstation ends up
@@ -241,8 +256,11 @@ crash, and the grain finishes burning either way.
 ```
 cd test
 make          # 108 numerical checks against the simulation
-make syntax   # compiles the .ino against stub Arduino headers
-make check    # both
+make link     # 85 checks on the Ariadna V2 link codec
+make sync     # the V2 copy of the guidance module has not drifted
+make pyfmt    # the Python ground station matches the C packet layout
+make syntax   # compiles the sketches against stub Arduino headers
+make check    # all of it
 ```
 
 `make` compiles `guidance.cpp` **unchanged** and compares it to golden vectors generated
