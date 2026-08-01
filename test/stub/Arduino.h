@@ -74,4 +74,8 @@ extern SerialStub Serial;
 extern SerialStub Serial1;
 extern SerialStub Serial2;
 
+
+// The pico-sdk UART handles, for the DMA transmit shim.
+#include "hardware/uart.h"
+
 #endif

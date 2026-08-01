@@ -555,6 +555,169 @@ static void test_link_budget(void)
     check(airtime * ARIADNA_TLM_HZ < 0.4, "downlink stays under a 40 % duty cycle");
 }
 
+// ---------------------------------------------------------------------
+//  9. Transmit ring
+//
+//  The DMA binding cannot be tested on a workstation, but the bookkeeping
+//  can — and the bookkeeping is where the damage is. An off-by-one here
+//  does not crash; it drops or duplicates a servo command.
+//
+//  The fake consumer below does exactly what the DMA channel does: takes
+//  the run it is given, copies it out, reports completion. If the ring is
+//  correct against this, the only thing left to get wrong on hardware is
+//  the channel configuration.
+// ---------------------------------------------------------------------
+static void test_tx_ring(void)
+{
+    printf("transmit ring\n");
+
+    ariadna_tx_ring_t r;
+    ariadna_tx_init(&r);
+
+    check(ariadna_tx_used(&r) == 0, "starts empty");
+    {
+        const uint8_t *p = nullptr;
+        check(ariadna_tx_next(&r, &p) == 0, "nothing to send when empty");
+    }
+
+    // --- byte-exact FIFO order across many wraps -----------------------
+    //
+    // The ring is 512 bytes and an actuator frame is 42, so this pushes
+    // far more than the buffer holds and drains as it goes — every wrap
+    // boundary is crossed repeatedly.
+    {
+        ariadna_tx_init(&r);
+        std::vector<uint8_t> expect, got;
+        uint8_t frame[ARIADNA_FRAME_MAX];
+
+        for (int i = 0; i < 500; i++) {
+            ariadna_actuator_t a;
+            memset(&a, 0, sizeof(a));
+            a.t_ms = (uint32_t)i;
+            a.tvc_x_deg = (float)i;
+            uint16_t n = ariadna_encode(frame, ARIADNA_PKT_ACTUATOR, &a, sizeof(a));
+
+            if (ariadna_tx_push(&r, frame, n))
+                expect.insert(expect.end(), frame, frame + n);
+
+            // Drain a run most of the time, so the ring stays partly full
+            // and the head chases the tail around the buffer.
+            if (i % 3 != 0) {
+                const uint8_t *p = nullptr;
+                uint16_t run = ariadna_tx_next(&r, &p);
+                if (run) {
+                    got.insert(got.end(), p, p + run);
+                    ariadna_tx_complete(&r);
+                }
+            }
+        }
+        // Flush whatever is left.
+        for (int guard = 0; guard < 64; guard++) {
+            const uint8_t *p = nullptr;
+            uint16_t run = ariadna_tx_next(&r, &p);
+            if (!run) break;
+            got.insert(got.end(), p, p + run);
+            ariadna_tx_complete(&r);
+        }
+
+        check(got == expect, "every queued byte comes out once, in order");
+        check(r.sent == expect.size(), "sent counter matches bytes delivered");
+        check(ariadna_tx_used(&r) == 0, "ring drains empty");
+        printf("    %zu bytes through a %d byte ring, %u frames dropped\n",
+               expect.size(), ARIADNA_TX_RING_SZ, (unsigned)r.dropped);
+    }
+
+    // --- a full ring refuses whole frames, never partial ----------------
+    {
+        ariadna_tx_init(&r);
+        uint8_t frame[64];
+        for (int i = 0; i < 64; i++) frame[i] = (uint8_t)(i + 1);
+
+        int accepted = 0;
+        for (int i = 0; i < 20; i++)
+            if (ariadna_tx_push(&r, frame, 64)) accepted++;
+
+        check(accepted == ARIADNA_TX_RING_SZ / 64 - 1 ||
+              accepted == ARIADNA_TX_RING_SZ / 64,
+              "accepts as many whole frames as fit");
+        check(r.dropped == (uint32_t)(20 - accepted), "drops are counted");
+        check(ariadna_tx_used(&r) == accepted * 64, "no partial frame queued");
+
+        // Everything that was accepted must still be intact.
+        std::vector<uint8_t> got;
+        for (int guard = 0; guard < 64; guard++) {
+            const uint8_t *p = nullptr;
+            uint16_t run = ariadna_tx_next(&r, &p);
+            if (!run) break;
+            got.insert(got.end(), p, p + run);
+            ariadna_tx_complete(&r);
+        }
+        bool intact = got.size() == (size_t)accepted * 64;
+        for (size_t i = 0; intact && i < got.size(); i++)
+            if (got[i] != (uint8_t)(i % 64 + 1)) intact = false;
+        check(intact, "a full ring does not corrupt what it already held");
+    }
+
+    // --- the in-flight region is never overwritten -----------------------
+    //
+    // The failure this guards against: the producer refilling the buffer
+    // while DMA is still reading from it, so the bytes on the wire are not
+    // the bytes that were queued. tail does not advance until completion,
+    // which is what makes that impossible — this proves it.
+    {
+        ariadna_tx_init(&r);
+        uint8_t a_frame[100], b_frame[100];
+        memset(a_frame, 0xAA, sizeof(a_frame));
+        memset(b_frame, 0xBB, sizeof(b_frame));
+
+        ariadna_tx_push(&r, a_frame, 100);
+
+        const uint8_t *p = nullptr;
+        uint16_t run = ariadna_tx_next(&r, &p);
+        check(run == 100, "claims the queued run");
+
+        // Simulate the producer running flat out while the transfer is
+        // still going: push until it refuses.
+        int pushes = 0;
+        while (ariadna_tx_push(&r, b_frame, 100)) pushes++;
+
+        bool untouched = true;
+        for (int i = 0; i < 100; i++) if (p[i] != 0xAA) untouched = false;
+        check(untouched, "in-flight bytes survive a producer filling the ring");
+        check(pushes >= 3, "the rest of the ring is still usable meanwhile");
+
+        // And a second claim must be refused while one is outstanding.
+        const uint8_t *q = nullptr;
+        check(ariadna_tx_next(&r, &q) == 0, "no second claim while in flight");
+    }
+
+    // --- oversize frame ---------------------------------------------------
+    {
+        ariadna_tx_init(&r);
+        static uint8_t huge[ARIADNA_TX_RING_SZ + 8];
+        memset(huge, 0x5A, sizeof(huge));
+        check(ariadna_tx_push(&r, huge, sizeof(huge)) == 0,
+              "a frame larger than the ring is refused");
+        check(ariadna_tx_used(&r) == 0, "and leaves the ring untouched");
+    }
+
+    // --- sizing sanity ------------------------------------------------------
+    // The ring must hold at least a few frames of the busiest stream, or a
+    // single blocked transfer starts dropping commands.
+    {
+        const uint16_t nav_frame = ARIADNA_HDR_LEN + sizeof(ariadna_nav_state_t)
+                                 + ARIADNA_CRC_LEN;
+        const uint16_t act_frame = ARIADNA_HDR_LEN + sizeof(ariadna_actuator_t)
+                                 + ARIADNA_CRC_LEN;
+        check(ARIADNA_TX_RING_SZ >= 4 * nav_frame,
+              "ring holds at least 4 nav_state frames");
+        check(ARIADNA_TX_RING_SZ >= 8 * act_frame,
+              "ring holds at least 8 actuator frames");
+        check((ARIADNA_TX_RING_SZ & (ARIADNA_TX_RING_SZ - 1)) == 0,
+              "ring size is a power of two");
+    }
+}
+
 int main(void)
 {
     printf("\nAriadna V2 link codec\n=====================\n");
@@ -566,6 +729,7 @@ int main(void)
     test_corruption();
     test_interleaved();
     test_length_mismatch();
+    test_tx_ring();
     test_link_budget();
 
     printf("\n%d checks, %d failures\n\n", g_checks, g_fails);

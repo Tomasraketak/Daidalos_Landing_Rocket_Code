@@ -93,6 +93,48 @@ At 115200 the same traffic sits near 80 %, and every field added after that come
 control latency. Two `#define`s at the top of `ariadna_link.h` change it back if you want
 115200; `make link` prints the resulting budget.
 
+Debug consoles on the three flight boards are 115200, as is the ground station's USB link
+to the laptop. Note that the flight boards' `Serial` is **native USB CDC, not a UART** — the
+baud argument is ignored and the link runs at USB speed regardless. It is set for
+consistency with every other serial tool here, not because it does anything.
+
+### DMA, and where it is deliberately absent
+
+The processor is not short of cycles. CRC and frame parsing together cost about **1 % of a
+core** at full traffic — measured, not assumed, and printed by `make link`.
+
+What *was* expensive is different: the UART's hardware transmit FIFO is 32 bytes, and a byte
+takes 21.7 µs at 460800 baud. A frame longer than the FIFO cannot be handed over in one go.
+
+| | bytes past the FIFO | per frame | duty |
+|---|---|---|---|
+| Master forwards `nav_state` @100 Hz | 58 | 1.26 ms | **12.6 %** of a core |
+| Position sends `nav_state` @100 Hz | 58 | 1.26 ms | **12.6 %** of a core |
+| Navigation sends `actuator` @200 Hz | 10 | 217 µs | **4.3 %** of a core |
+
+A blocking write spends that time spinning. Worse than the wasted cycles, on the Master
+those 1.26 ms land *inside the forwarding path* — forwarding the frame before parsing it
+saves microseconds, and then blocking on the FIFO gives back a millisecond.
+
+So transmit goes through a ring drained by DMA. Queuing a frame is a memcpy; the processor
+never waits for the wire. One channel per port, four in the vehicle.
+
+**DMA is not used anywhere else**, because nothing else is expensive enough to justify
+another channel to misconfigure:
+
+| | cost | verdict |
+|---|---|---|
+| flash logging | 33 µs of SPI, 17×/s, on an idle core 1 | 0.06 % — no |
+| LoRa | 46 B at 4 Hz; the 92 ms of airtime dominates | no |
+| ADC | 3 blocking conversions ≈ 9 µs per tick, and the IIR already averages ~50 samples | no |
+| UART receive | a receive FIFO does not block the processor; unread bytes just wait | no |
+
+The **ring bookkeeping is host-tested** — byte-exact ordering across repeated wraps,
+whole-frame drops when full, and proof that the in-flight region cannot be overwritten by a
+producer running flat out. The **DMA channel configuration is not**, and cannot be without
+the chip. `#define ARIADNA_USE_DMA_TX 0` falls back to blocking writes if it misbehaves on
+the bench.
+
 ### Coordinate conventions
 
 Pad-local ENU: **+x East, +y North, +z Up**. `vz` is positive up, so it is negative for the
@@ -117,10 +159,11 @@ This matters more than anything else in this README.
 | | how |
 |---|---|
 | **guidance algorithm** | 108 numerical checks against the Monte-Carlo simulation. Unchanged from V1. |
-| **link codec** | 85 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream. |
+| **link codec** | 103 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
+| **DMA channel setup** | ⚠️ **not testable off-target.** The ring it drives is tested; the channel configuration is not. |
 | **3D→planar bridge** | ⚠️ **new code, no golden vectors.** Boot self-test checks the arithmetic. Only a bench checks the conventions. |
 | **state estimator** | ⚠️ **not verified.** Boot self-test checks filter convergence and the barometric conversion. |
 | **body→pad rotation** | ⚠️ **not verified.** Three conventions have to agree and only one is ours. |
@@ -150,7 +193,7 @@ rotate the attitude reference underneath a closed loop that assumes it is fixed)
 ```
 cd ../test
 make          # 108 guidance checks against the simulation
-make link     # 85 link codec checks, and the link budget
+make link     # 103 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled

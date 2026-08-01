@@ -46,6 +46,7 @@
 
 #include "guidance.h"
 #include "../common/ariadna_link.h"
+#include "../common/ariadna_uart_dma.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -263,13 +264,15 @@ static void link_poll(void)
     }
 }
 
+// DMA-fed transmit. A 42-byte actuator frame is 10 bytes longer than the
+// UART's hardware FIFO, so a blocking write would spin for 217 us every
+// tick — 4.3 % of this core, inside the 200 Hz loop. Queuing it costs a
+// memcpy. See ../common/ariadna_uart_dma.h.
+static ariadna_uart_tx_t s_tx;
+
 static void link_send(uint8_t type, const void *payload, uint8_t len)
 {
-    uint8_t frame[ARIADNA_FRAME_MAX];
-    uint16_t n = ariadna_encode(frame, type, payload, len);
-    // One write, never split: a receiver that sees a torn frame during a
-    // reset burns a resync cycle for no reason.
-    if (n) MASTER_PORT.write(frame, n);
+    ariadna_uart_tx_send(&s_tx, MASTER_PORT, type, payload, len);
 }
 
 // =====================================================================
@@ -682,11 +685,13 @@ void setup()
     pinMode(PIN_CONT_3, INPUT);
     analogReadResolution(12);
 
-    Serial.begin(ARIADNA_GS_USB_BAUD);       // pad console, internal USB-C
+    Serial.begin(ARIADNA_CONSOLE_BAUD);      // pad console, internal USB-C
 
     MASTER_PORT.setTX(PIN_MASTER_TX);
     MASTER_PORT.setRX(PIN_MASTER_RX);
     MASTER_PORT.begin(ARIADNA_MCU_BAUD);
+    // uart0 is Serial1 on the arduino-pico core. Must match MASTER_PORT.
+    ariadna_uart_tx_begin(&s_tx, uart0);
 
     ariadna_rx_init(&s_rx);
     memset(&s_state,  0, sizeof(s_state));
@@ -723,6 +728,7 @@ void loop()
     uint32_t t0 = micros();
 
     // ---- link ---------------------------------------------------------
+    ariadna_uart_tx_service(&s_tx);      // retire a finished DMA run first
     link_poll();
 
     bool state_fresh = false;

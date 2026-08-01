@@ -80,7 +80,22 @@
 //  Python tooling.
 // ---------------------------------------------------------------------
 #define ARIADNA_MCU_BAUD    460800UL
+
+// Ground station -> laptop. This one is a real rate on a real link and
+// ground_visualizer.py must open the port at the same number.
 #define ARIADNA_GS_USB_BAUD 115200UL
+
+// The three flight boards' debug consoles, all on native USB CDC.
+//
+// 115200, to match every other serial tool in this project — but note that
+// on the RP2350 the number is cosmetic. `Serial` is USB CDC, not a UART, so
+// the argument to Serial.begin() is ignored and the link runs at USB full
+// speed regardless of what either end asks for. Changing it will not make a
+// console faster and will not break one that is set differently.
+//
+// It is kept separate from ARIADNA_GS_USB_BAUD because they mean different
+// things: that one is a constraint, this one is a convention.
+#define ARIADNA_CONSOLE_BAUD 115200UL
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -643,6 +658,125 @@ static inline uint8_t ariadna_rx_byte(ariadna_rx_t *rx, uint8_t b,
         rx->rx_crc++;
         ariadna_rx_resync(rx, 1);
     }
+}
+
+// =====================================================================
+//  TRANSMIT RING
+//
+//  ---------------------------------------------------------------------
+//  WHY THIS EXISTS
+//  ---------------------------------------------------------------------
+//  The RP2350's UART has a 32-byte hardware transmit FIFO. At 460800 baud
+//  a byte takes 21.7 us to shift out, so a frame longer than 32 bytes
+//  cannot be handed over in one go — something has to wait for the rest:
+//
+//      Master forwards a 90-byte nav_state @100 Hz
+//          58 bytes past the FIFO x 21.7 us  =  1.26 ms per frame
+//          at 100 Hz                         =  12.6 % of a core
+//
+//      Navigation sends a 42-byte actuator @200 Hz
+//          10 bytes past the FIFO            =   217 us per frame
+//          at 200 Hz                         =   4.3 % of a core
+//
+//  A blocking write spends that time spinning. Worse than the wasted
+//  cycles, on the Master those 1.26 ms land INSIDE the forwarding path —
+//  the one place in the vehicle where latency was deliberately minimised.
+//  Forwarding the frame before parsing it saves microseconds; blocking on
+//  the FIFO immediately afterwards gives back a millisecond.
+//
+//  So frames go into this ring instead, and DMA drains it into the UART
+//  while the processor does something useful. The producer never waits.
+//
+//  For comparison, the arithmetic this module does — CRC plus the byte
+//  parser — costs about 1 % of a core at full traffic. That is why there
+//  is no DMA anywhere else in this project: everything else is already
+//  cheap, and DMA that saves nothing only adds ways to be wrong.
+//
+//  ---------------------------------------------------------------------
+//  The ring is kept HERE, with no hardware dependency, so it can be tested
+//  on a workstation. The DMA binding lives in ariadna_uart_dma.h. An
+//  off-by-one in this bookkeeping loses a servo command, which is not
+//  something to discover on the pad.
+//
+//  Single producer, single consumer, both on the SAME core. The consumer
+//  is a DMA channel that only ever reads, so no lock is needed — but the
+//  ring must not be serviced from two cores.
+// =====================================================================
+#define ARIADNA_TX_RING_SZ   512               // must be a power of two
+#define ARIADNA_TX_RING_MASK (ARIADNA_TX_RING_SZ - 1)
+
+typedef struct {
+    uint8_t  buf[ARIADNA_TX_RING_SZ];
+    uint16_t head;       // producer writes here
+    uint16_t tail;       // oldest byte not yet handed to the hardware
+    uint16_t inflight;   // bytes currently being sent; tail is frozen mean-
+                         // while, which is what protects them from the producer
+    uint32_t sent;
+    uint32_t dropped;    // frames refused because the ring was full
+} ariadna_tx_ring_t;
+
+static inline void ariadna_tx_init(ariadna_tx_ring_t *r)
+{
+    memset(r, 0, sizeof(*r));
+}
+
+static inline uint16_t ariadna_tx_used(const ariadna_tx_ring_t *r)
+{
+    return (uint16_t)((r->head - r->tail) & ARIADNA_TX_RING_MASK);
+}
+
+/**
+ * Queue a complete frame. Returns 0 if it did not fit.
+ *
+ * All or nothing: a partially queued frame would be transmitted as a
+ * truncated one, which costs the receiver a resync. Dropping it whole
+ * costs one packet. Note that `used` is measured from tail, which has not
+ * advanced past the in-flight bytes — so the region DMA is reading is
+ * counted as occupied and can never be overwritten.
+ */
+static inline int ariadna_tx_push(ariadna_tx_ring_t *r,
+                                  const uint8_t *frame, uint16_t n)
+{
+    if ((uint32_t)ariadna_tx_used(r) + n > ARIADNA_TX_RING_SZ - 1) {
+        r->dropped++;
+        return 0;
+    }
+    for (uint16_t i = 0; i < n; i++) {
+        r->buf[r->head] = frame[i];
+        r->head = (uint16_t)((r->head + 1) & ARIADNA_TX_RING_MASK);
+    }
+    return 1;
+}
+
+/**
+ * Claim the next contiguous run for the hardware.
+ *
+ * Returns 0 when there is nothing to send or a transfer is still in
+ * flight. The run stops at the end of the buffer, so a wrapped ring simply
+ * takes two transfers — cheaper than the alternative of forcing frames to
+ * be contiguous.
+ */
+static inline uint16_t ariadna_tx_next(ariadna_tx_ring_t *r, const uint8_t **out)
+{
+    if (r->inflight) return 0;
+
+    uint16_t used = ariadna_tx_used(r);
+    if (!used) return 0;
+
+    uint16_t run = (uint16_t)(ARIADNA_TX_RING_SZ - r->tail);
+    if (run > used) run = used;
+
+    *out = &r->buf[r->tail];
+    r->inflight = run;
+    return run;
+}
+
+/** The hardware has finished the run claimed by ariadna_tx_next(). */
+static inline void ariadna_tx_complete(ariadna_tx_ring_t *r)
+{
+    r->tail = (uint16_t)((r->tail + r->inflight) & ARIADNA_TX_RING_MASK);
+    r->sent += r->inflight;
+    r->inflight = 0;
 }
 
 /**

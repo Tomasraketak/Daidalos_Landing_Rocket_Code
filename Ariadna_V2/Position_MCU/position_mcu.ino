@@ -46,6 +46,7 @@
 // =====================================================================
 
 #include "../common/ariadna_link.h"
+#include "../common/ariadna_uart_dma.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -727,11 +728,14 @@ static ariadna_master_state_t s_master;
 static bool                   s_have_master = false;
 static uint32_t               s_master_us   = 0;
 
+// DMA-fed transmit. A 90-byte nav_state frame is nearly three times the
+// UART's hardware FIFO, so a blocking write would spin for 1.26 ms every
+// 10 ms — 12.6 % of this core. See ../common/ariadna_uart_dma.h.
+static ariadna_uart_tx_t s_tx;
+
 static void link_send(uint8_t type, const void *payload, uint8_t len)
 {
-    uint8_t frame[ARIADNA_FRAME_MAX];
-    uint16_t n = ariadna_encode(frame, type, payload, len);
-    if (n) MASTER_PORT.write(frame, n);
+    ariadna_uart_tx_send(&s_tx, MASTER_PORT, type, payload, len);
 }
 
 // Commands arrive from the Master. Anything that touches a sensor is
@@ -973,7 +977,7 @@ static bool self_test(void)
 // =====================================================================
 void setup()
 {
-    Serial.begin(ARIADNA_GS_USB_BAUD);
+    Serial.begin(ARIADNA_CONSOLE_BAUD);
 
     pinMode(PIN_UWB_CS, OUTPUT);
     digitalWrite(PIN_UWB_CS, HIGH);      // deselect before SPI comes up:
@@ -1177,6 +1181,8 @@ void setup1()
     MASTER_PORT.setTX(PIN_MASTER_TX);
     MASTER_PORT.setRX(PIN_MASTER_RX);
     MASTER_PORT.begin(ARIADNA_MCU_BAUD);
+    // uart0 is Serial1 on the arduino-pico core. Must match MASTER_PORT.
+    ariadna_uart_tx_begin(&s_tx, uart0);
 
     GpsPort.begin(GPS_BAUD);
     s_nmea.begin();
@@ -1199,6 +1205,7 @@ void loop1()
     }
 
     // ---- Master link -------------------------------------------------------
+    ariadna_uart_tx_service(&s_tx);      // retire a finished DMA run first
     link_poll();
 
     // ---- navigation state, 100 Hz ------------------------------------------

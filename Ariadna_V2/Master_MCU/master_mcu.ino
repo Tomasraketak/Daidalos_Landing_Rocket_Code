@@ -55,6 +55,7 @@
 // =====================================================================
 
 #include "../common/ariadna_link.h"
+#include "../common/ariadna_uart_dma.h"
 
 // Vehicle constants come from the guidance module rather than being
 // repeated here. The state machine's handover altitude MUST equal the
@@ -625,12 +626,27 @@ static void annunciate(void)
 // =====================================================================
 //  6. LINKS
 // =====================================================================
-static void send_to(HardwareSerial &port, uint8_t type,
+// DMA-fed transmit, one channel per port.
+//
+// This is the single biggest processor saving in the vehicle. Forwarding a
+// 90-byte nav_state means 58 bytes past the UART's 32-byte FIFO, which a
+// blocking write spins on for 1.26 ms — 12.6 % of this core at 100 Hz, and
+// worse, it lands inside the forwarding path below. Forwarding the frame
+// before parsing it saves microseconds; blocking on the FIFO immediately
+// afterwards would give back a millisecond.
+static ariadna_uart_tx_t s_tx_pos;
+static ariadna_uart_tx_t s_tx_nav;
+
+static inline void tx_service_all(void)
+{
+    ariadna_uart_tx_service(&s_tx_pos);
+    ariadna_uart_tx_service(&s_tx_nav);
+}
+
+static void send_to(ariadna_uart_tx_t *tx, HardwareSerial &port, uint8_t type,
                     const void *payload, uint8_t len)
 {
-    uint8_t frame[ARIADNA_FRAME_MAX];
-    uint16_t n = ariadna_encode(frame, type, payload, len);
-    if (n) port.write(frame, n);
+    ariadna_uart_tx_send(tx, port, type, payload, len);
 }
 
 static void broadcast_cmd(uint8_t cmd, uint8_t arg, uint32_t arg32)
@@ -641,8 +657,8 @@ static void broadcast_cmd(uint8_t cmd, uint8_t arg, uint32_t arg32)
     // Sent three times. Commands are events, not a stream — there is no
     // next packet to carry a missed one, and all of them are idempotent.
     for (uint8_t i = 0; i < 3; i++) {
-        send_to(POS_PORT, ARIADNA_PKT_CMD, &c, sizeof(c));
-        send_to(NAV_PORT, ARIADNA_PKT_CMD, &c, sizeof(c));
+        send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_CMD, &c, sizeof(c));
+        send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_CMD, &c, sizeof(c));
     }
 }
 
@@ -662,7 +678,7 @@ static void poll_position(void)
         if (!type) continue;
 
         if (type == ARIADNA_PKT_NAV_STATE && len == sizeof(ariadna_nav_state_t)) {
-            send_to(NAV_PORT, ARIADNA_PKT_NAV_STATE, pl, len);   // forward first
+            send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_NAV_STATE, pl, len);   // forward first
             memcpy(&s_nav, pl, sizeof(s_nav));
             s_nav_us   = micros();
             s_have_nav = true;
@@ -1033,7 +1049,7 @@ void setup()
     pinMode(PIN_BUZZER,    OUTPUT);
     analogReadResolution(12);
 
-    Serial.begin(ARIADNA_GS_USB_BAUD);
+    Serial.begin(ARIADNA_CONSOLE_BAUD);
 
     s_rgb.begin();
     rgb_set(0, 0, 40);
@@ -1055,6 +1071,12 @@ void setup()
     POS_PORT.begin(ARIADNA_MCU_BAUD);
     NAV_PORT.setTX(PIN_NAV_TX); NAV_PORT.setRX(PIN_NAV_RX);
     NAV_PORT.begin(ARIADNA_MCU_BAUD);
+
+    // Serial1 is uart0 and Serial2 is uart1 on the arduino-pico core.
+    // Swapping these two sends the Navigation MCU's traffic out of the
+    // Position MCU's pins, which looks exactly like both links being dead.
+    ariadna_uart_tx_begin(&s_tx_pos, uart0);
+    ariadna_uart_tx_begin(&s_tx_nav, uart1);
 
     ariadna_rx_init(&s_rx_pos);
     ariadna_rx_init(&s_rx_nav);
@@ -1092,6 +1114,7 @@ void loop()
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
 
     // ---- routing, highest priority ------------------------------------
+    tx_service_all();     // retire finished DMA runs before queuing more
     poll_position();      // forwards nav state to Navigation first
     poll_navigation();    // applies actuator commands to the servos
 
@@ -1114,8 +1137,8 @@ void loop()
         ms.flags       = s_flags;
         if (s_flash_ok) ms.flags |= ARIADNA_MST_LOGGING;
 
-        send_to(POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
-        send_to(NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
+        send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
+        send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
     }
 
     // ---- telemetry snapshot and log -------------------------------------
