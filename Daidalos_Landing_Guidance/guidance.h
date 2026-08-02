@@ -15,18 +15,35 @@
 //  net side force. Clamped impulse is WASTED and the ~1.7 s burn cannot
 //  be extended.
 //
-//  THREE DIMENSIONS, TWO GIMBAL AXES. The nozzle deflects about two
-//  perpendicular axes. The third rotational degree of freedom -- roll
-//  about the body's own long axis -- is not actuated and is assumed to
-//  stay at zero. That assumption is self-consistent rather than
-//  optimistic: every torque in this model is perpendicular to the body
-//  axis, so a vehicle with no roll rate never acquires one, and two axes
-//  are then enough for the whole attitude problem.
+//  THREE DIMENSIONS, TWO GIMBAL AXES, AND THE AIRFRAME MAY ROLL.
 //
-//  If your airframe DOES roll -- a canted fin, spin left over from ascent
-//  -- this code cannot correct it, and worse, the two servo axes will
-//  smear across each other as the body turns underneath them. Check that
-//  before flying.
+//  The nozzle deflects about two perpendicular axes. Roll about the body's
+//  own long axis has no actuator -- fin control is future work -- so the
+//  vehicle simply rotates at whatever rate it inherited, up to 90 deg/s.
+//  This code is built to fly through that rather than to assume it away.
+//
+//  Two things follow, and both are handled here:
+//
+//   1. THE SERVO AXES ROTATE WITH THE AIRFRAME. They are bolted to it. A
+//      controller that assumed they were anchored to the world would steer
+//      into the wrong mixture of channels -- smoothly, with no symptom but
+//      a landing in the wrong place. That is why dg_nav_t carries a second
+//      body-fixed axis, g, alongside the thrust axis b: together they pin
+//      the airframe's roll orientation down.
+//
+//   2. THE SPIN COUPLES THE TWO CHANNELS. A demand on one produces a
+//      response on the other: a cross-axis rate feedback of gain
+//      (1 - I_axial/I_transverse) * w_roll, about 1.5 rad/s at 90 deg/s
+//      against a 9 rad/s loop bandwidth. That is a perturbation of the
+//      rate loop, not a threat to it -- the precession torque is ~2 % of
+//      what the gimbal can produce. The loop cancels it anyway with a
+//      gyroscopic feedforward, because it costs one cross product and is
+//      worth about half a point of landing rate. Do not expect more.
+//
+//  The gimbal still cannot produce a roll torque (its moment is
+//  (-L*b) x F, perpendicular to b by construction), so the roll rate is
+//  whatever the vehicle arrived with. The loop projects it out of the rate
+//  feedback rather than trying to fight it.
 // =====================================================================
 #ifndef DAIDALOS_GUIDANCE_H
 #define DAIDALOS_GUIDANCE_H
@@ -47,6 +64,11 @@
 #define DG_L_CP           0.35f         // CG -> centre of pressure (aft), m
 #define DG_M_INITIAL      3.20f         // kg, wet
 #define DG_M_PROP         0.330f        // kg of grain
+// Axial (roll) inertia per kg: a solid cylinder is R^2/2, a thin shell R^2, and a real
+// airframe is between. The smaller value is taken deliberately -- the gyroscopic
+// coupling scales with (I_transverse - I_axial), so under-estimating I_axial over-states
+// the coupling the feedforward has to cancel, which is the safe direction to be wrong in.
+#define DG_I_AXIAL_COEF   0.001378f     // m^2; I_axial = mass * this, 105 mm body
 #define DG_I_TOTAL        286.83f       // N.s, full-throttle impulse
 #define DG_BURN_T         1.75f         // s, nominal burn duration
 #define DG_MASS_PER_NS    0.00115051f   // kg consumed per N.s of RAW impulse
@@ -92,37 +114,49 @@ typedef enum {
 // Frame: WORLD, z up, x and y horizontal, origin at the pad.
 // vz is NEGATIVE while descending.
 //
-// Attitude is the body-axis UNIT VECTOR b -- the direction thrust pushes the
-// vehicle, i.e. the tail-to-nose axis reversed, pointing roughly up during the
-// descent. Not Euler angles: a unit vector has no convention to get backwards,
-// no wrap and no gimbal lock, and it is what the control law consumes directly.
-// A fusion filter carrying a quaternion produces it in one rotation:
-//     b = R(q) * (body axis expressed in body coordinates)
+// Attitude is TWO body-fixed UNIT VECTORS in the world frame, never Euler angles:
 //
-// w is the angular velocity in the SAME world frame, from the gyro, rotated out
-// of body coordinates by the same R(q). Its component along b is the roll rate,
-// which this vehicle cannot control; the guidance projects it out.
+//   b   the thrust axis -- the direction thrust pushes the vehicle, i.e. the
+//       tail-to-nose axis reversed, pointing roughly up during the descent
+//   g   a transverse reference axis, nominally perpendicular to b, marking the
+//       airframe's roll orientation. It is what tells the guidance where the two
+//       servo axes have got to as the vehicle rolls.
+//
+// A fusion filter carrying a quaternion produces both in one rotation each:
+//     b = R(q) * BODY_THRUST_AXIS        (e.g. body -z)
+//     g = R(q) * BODY_SERVO1_AXIS        (the axis servo 1 deflects the nozzle in)
+//
+// g need not be exactly perpendicular to b -- the guidance orthogonalises it -- but
+// it must be body-fixed and it must be the SAME axis servo 1 acts in, or the two
+// channels are mixed by a constant angle for the whole flight.
+//
+// w is the angular velocity in the same world frame, from the gyro, rotated out of
+// body coordinates by the same R(q). Its component along b is the roll rate: send it,
+// the guidance projects it out of the rate loop and uses it for the gyroscopic
+// feedforward.
 typedef struct {
     float h;            // m above the pad
     float vx, vy;       // m/s, world horizontal
     float vz;           // m/s, negative descending
-    float bx, by, bz;   // body-axis unit vector, world frame
+    float bx, by, bz;   // thrust-axis unit vector, world frame
+    float gx, gy, gz;   // body-fixed transverse reference axis, world frame
     float wx, wy, wz;   // rad/s, world frame (use the GYRO, not a differenced angle)
     float t;            // s, monotonic since power-up
     bool  valid;        // false blocks ignition and freezes the servos at zero
 } dg_nav_t;
 
 typedef struct {
-    // Two servos. Axis 1 deflects the nozzle in the vertical plane containing
-    // world +x, axis 2 in the plane containing world +y. With no roll those are
-    // fixed directions in the airframe, which is what makes the mapping constant.
-    float servo1_deg;   // TVC servo, x channel, clamped to +/-DG_SERVO_MAX_DEG
-    float servo2_deg;   // TVC servo, y channel
+    // Two servos, both BODY-FIXED. Axis 1 deflects the nozzle in the plane
+    // containing the reference axis g, axis 2 in the perpendicular one. They turn
+    // with the airframe as it rolls; that is what g is for.
+    float servo1_deg;   // TVC servo, g channel, clamped to +/-DG_SERVO_MAX_DEG
+    float servo2_deg;   // TVC servo, b x g channel
     float clamp;        // axial thrust fraction command, DG_CLAMP_MIN..MAX
     bool  ignite;       // rising edge: fire the igniter
     // telemetry
     float tilt_cmd;     // rad, commanded tilt from vertical
     float tilt_err;     // rad, total angle between commanded and actual body axis
+    float roll_rate;    // rad/s about the body axis: uncontrolled, reported only
     float thrust_est;   // N
     float p_plan;       // current throttle-plan parameter, 0..4
     dg_phase_t phase;
@@ -172,8 +206,11 @@ float dg_project_miss(float h, float vx, float vz, float tau,
 float dg_solve_p_full(float h, float vx, float vz, float tau,
                       float mass, float clamp_now);     // non-amortised, for test
 
-// Orthonormal basis of the plane perpendicular to b: the two gimbal axes.
+// Orthonormal basis of the plane perpendicular to b: the two gimbal axes, obtained
+// by orthogonalising the body-fixed reference axis g against b. Because g is
+// body-fixed, these rotate with the airframe -- which is the point.
 void  dg_gimbal_basis(float bx, float by, float bz,
+                      float gx, float gy, float gz,
                       float *u1x, float *u1y, float *u1z,
                       float *u2x, float *u2y, float *u2z);
 

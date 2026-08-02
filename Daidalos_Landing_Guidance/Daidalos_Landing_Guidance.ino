@@ -15,10 +15,11 @@
 //    * TWO TVC servo angles — where to point the nozzle, in 3-D
 //    * a thrust-clamp value — how much of the grain's thrust to keep
 //
-//  The gimbal has two axes. The third rotational degree of freedom, roll
-//  about the vehicle's own long axis, is NOT actuated and is assumed to
-//  stay at zero. See the note at the top of guidance.h before flying an
-//  airframe that rolls.
+//  The gimbal has two axes. Roll about the vehicle's own long axis has no
+//  actuator — fin control is future work — so the airframe simply spins at
+//  whatever rate it inherited, up to 90 deg/s, and the guidance is built to
+//  fly through that. The servo axes spin with it, which is why the nav
+//  frame carries a second body-fixed vector. See the top of guidance.h.
 //
 //  Core allocation:
 //    core 0  200 Hz attitude loop, ignition decision, actuators, telemetry
@@ -122,7 +123,7 @@ static const uint32_t NAV_HOLD_MS  = 250;           // give up
 // =====================================================================
 //  2. NAVIGATION LINK
 //
-//  Binary frame from the fusion processor, little-endian, 49 bytes:
+//  Binary frame from the fusion processor, little-endian, 61 bytes:
 //
 //    offset  size  field
 //    0       2     sync, 0xDA 0x1D
@@ -131,19 +132,24 @@ static const uint32_t NAV_HOLD_MS  = 250;           // give up
 //    7       4     vx             m/s, world +x
 //    11      4     vy             m/s, world +y
 //    15      4     vz             m/s, NEGATIVE while descending
-//    19      12    bx, by, bz     body-axis UNIT VECTOR, world frame
-//    31      12    wx, wy, wz     rad/s, world frame, straight off the GYRO
-//    43      4     t_ms           u32 milliseconds, monotonic
-//    47      2     CRC-16/CCITT-FALSE over bytes 2..46
+//    19      12    bx, by, bz     THRUST-AXIS unit vector, world frame
+//    31      12    gx, gy, gz     BODY-FIXED reference axis, world frame
+//    43      12    wx, wy, wz     rad/s, world frame, straight off the GYRO
+//    55      4     t_ms           u32 milliseconds, monotonic
+//    59      2     CRC-16/CCITT-FALSE over bytes 2..58
 //
-//  ATTITUDE IS A UNIT VECTOR, not Euler angles. b is the direction thrust
-//  pushes the vehicle — roughly up during the descent. A fusion filter
-//  carrying a quaternion produces it in one rotation, and it has no
-//  convention to get backwards, no wrap and no gimbal lock. w is the
-//  angular velocity in the SAME world frame; rotate the gyro out of body
-//  coordinates with the same quaternion. Its component along b is the roll
-//  rate, which this vehicle cannot control and which the guidance
-//  projects out.
+//  ATTITUDE IS TWO UNIT VECTORS, not Euler angles. b is the direction
+//  thrust pushes the vehicle — roughly up during the descent. g is a
+//  second, body-fixed axis marking the airframe's ROLL orientation: it is
+//  what tells the guidance where the two servo axes have got to as the
+//  vehicle spins. Send g as the body axis servo 1 deflects the nozzle in.
+//  A quaternion gives both in one rotation each.
+//
+//  w is the angular velocity in the same world frame; rotate the gyro out
+//  of body coordinates with the same quaternion. Its component along b is
+//  the roll rate, which this vehicle cannot control — send it anyway, the
+//  guidance projects it out of the rate loop and uses it to cancel the
+//  gyroscopic cross-coupling the spin produces.
 //
 //  w must be the MEASURED rate. Differencing the attitude estimate instead
 //  is the single most damaging thing that can be done to this loop — in
@@ -153,7 +159,7 @@ static const uint32_t NAV_HOLD_MS  = 250;           // give up
 
 static const uint8_t  NAV_SYNC0 = 0xDA;
 static const uint8_t  NAV_SYNC1 = 0x1D;
-static const uint8_t  NAV_PAYLOAD = 45;    // flags..t_ms
+static const uint8_t  NAV_PAYLOAD = 57;    // flags..t_ms
 static const uint8_t  NAV_FRAME   = NAV_PAYLOAD + 4;
 
 static uint16_t crc16_ccitt(const uint8_t *p, uint8_t n)
@@ -183,6 +189,7 @@ static uint32_t s_rx_bad = 0;
 struct nav_rx_t {
     float    h, vx, vy, vz;
     float    bx, by, bz;
+    float    gx, gy, gz;
     float    wx, wy, wz;
     uint32_t t_ms;
     bool     valid;
@@ -204,7 +211,7 @@ static bool nav_poll(nav_rx_t *out)
         if (s_rx_n < NAV_FRAME) continue;
         s_rx_n = 0;
 
-        uint16_t want = (uint16_t)s_rx[47] | ((uint16_t)s_rx[48] << 8);
+        uint16_t want = (uint16_t)s_rx[59] | ((uint16_t)s_rx[60] << 8);
         if (crc16_ccitt(&s_rx[2], NAV_PAYLOAD) != want) { s_rx_bad++; continue; }
 
         out->valid = (s_rx[2] & 0x01) != 0;
@@ -215,10 +222,13 @@ static bool nav_poll(nav_rx_t *out)
         out->bx    = rd_f32(&s_rx[19]);
         out->by    = rd_f32(&s_rx[23]);
         out->bz    = rd_f32(&s_rx[27]);
-        out->wx    = rd_f32(&s_rx[31]);
-        out->wy    = rd_f32(&s_rx[35]);
-        out->wz    = rd_f32(&s_rx[39]);
-        memcpy(&out->t_ms, &s_rx[43], 4);
+        out->gx    = rd_f32(&s_rx[31]);
+        out->gy    = rd_f32(&s_rx[35]);
+        out->gz    = rd_f32(&s_rx[39]);
+        out->wx    = rd_f32(&s_rx[43]);
+        out->wy    = rd_f32(&s_rx[47]);
+        out->wz    = rd_f32(&s_rx[51]);
+        memcpy(&out->t_ms, &s_rx[55], 4);
         s_rx_ok++;
         got = true;                              // keep draining: use the newest
     }
@@ -230,14 +240,19 @@ static bool nav_poll(nav_rx_t *out)
 static bool nav_sane(const nav_rx_t *n)
 {
     float bn = n->bx * n->bx + n->by * n->by + n->bz * n->bz;
+    float gn = n->gx * n->gx + n->gy * n->gy + n->gz * n->gz;
     float wn = n->wx * n->wx + n->wy * n->wy + n->wz * n->wz;
+    // g must be a unit vector and must not have collapsed onto b, or the roll
+    // orientation it is supposed to carry is not in it
+    float gdb = n->gx * n->bx + n->gy * n->by + n->gz * n->bz;
     return isfinite(n->h) && isfinite(n->vx) && isfinite(n->vy) && isfinite(n->vz)
-        && isfinite(bn) && isfinite(wn)
+        && isfinite(bn) && isfinite(gn) && isfinite(wn)
         && n->h > -5.0f && n->h < 500.0f
         && fabsf(n->vx) < 120.0f && fabsf(n->vy) < 120.0f && fabsf(n->vz) < 160.0f
         // b must be a unit vector pointing up: a sender that forgot to normalise,
         // or that has the vehicle inverted, is a link fault and not a state
         && bn > 0.9f && bn < 1.1f && n->bz > 0.03f
+        && gn > 0.9f && gn < 1.1f && fabsf(gdb) < 0.7f
         && wn < 400.0f;
 }
 
@@ -332,6 +347,16 @@ static void nav_extrapolate(dg_nav_t *n, float dt, float thrust, float mass)
     float nz = n->bz + (n->wx * n->by - n->wy * n->bx) * dt;
     float inv = 1.0f / sqrtf(nx * nx + ny * ny + nz * nz);
     n->bx = nx * inv; n->by = ny * inv; n->bz = nz * inv;
+    // The reference axis rides the same rotation, and it MUST: across a 250 ms gap at
+    // 90 deg/s the airframe turns 22 degrees, so a frozen g would hand the loop a
+    // stale roll orientation and mix the two servo channels by that angle.
+    float mx = n->gx + (n->wy * n->gz - n->wz * n->gy) * dt;
+    float my = n->gy + (n->wz * n->gx - n->wx * n->gz) * dt;
+    float mz = n->gz + (n->wx * n->gy - n->wy * n->gx) * dt;
+    float gd = mx * n->bx + my * n->by + mz * n->bz;      // re-orthogonalise
+    mx -= gd * n->bx; my -= gd * n->by; mz -= gd * n->bz;
+    float gi = 1.0f / sqrtf(mx * mx + my * my + mz * mz);
+    n->gx = mx * gi; n->gy = my * gi; n->gz = mz * gi;
     n->t += dt;
 }
 
@@ -352,6 +377,19 @@ static bool self_test(void)
         Serial.println("POST thrust_ref out of range not zero"); ok = false;
     }
 
+    // gimbal axes must FOLLOW the airframe: roll the reference axis through a
+    // quarter turn and the servo axes must go with it. A basis anchored to the
+    // world passes every other check here and fails only this one.
+    {
+        float a1x, a1y, a1z, a2x, a2y, a2z;
+        dg_gimbal_basis(0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f,
+                        &a1x, &a1y, &a1z, &a2x, &a2y, &a2z);
+        if (fabsf(a1y - 1.0f) > 1e-4f || fabsf(a2x + 1.0f) > 1e-4f) {
+            DG_PRINT("POST gimbal axes do not follow roll: %.4f %.4f\n", a1y, a2x);
+            ok = false;
+        }
+    }
+
     // guidance law: no horizontal error must command no tilt, and the two
     // horizontal channels must behave identically -- a swapped or mis-signed
     // axis shows up here and nowhere else until the vehicle is in the air
@@ -369,7 +407,8 @@ static bool self_test(void)
     }
     // gimbal basis must be orthonormal, or the two servo commands are wrong
     float u1x, u1y, u1z, u2x, u2y, u2z;
-    dg_gimbal_basis(0.12f, 0.05f, 0.99f, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+    dg_gimbal_basis(0.12f, 0.05f, 0.99f, 0.9f, 0.1f, -0.1f,
+                    &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
     float dotp = u1x * u2x + u1y * u2y + u1z * u2z;
     float n1 = u1x * u1x + u1y * u1y + u1z * u1z;
     if (fabsf(dotp) > 1e-4f || fabsf(n1 - 1.0f) > 1e-4f) {
@@ -418,7 +457,7 @@ void setup()
     dg_init();
     bool post = self_test();
     DG_PRINT("\nDaidalos landing guidance — POST %s\n", post ? "PASS" : "FAIL");
-    Serial.println("t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,"
+    Serial.println("t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,roll_dps,"
                    "servo1,servo2,clamp,thrust,p,rx_ok,rx_bad,loop_us,overrun,plan");
 
     if (!post) {                           // refuse to fly, and say so
@@ -454,6 +493,7 @@ void loop()
         s_nav.h  = rx.h;
         s_nav.vx = rx.vx;  s_nav.vy = rx.vy;  s_nav.vz = rx.vz;
         s_nav.bx = rx.bx;  s_nav.by = rx.by;  s_nav.bz = rx.bz;
+        s_nav.gx = rx.gx;  s_nav.gy = rx.gy;  s_nav.gz = rx.gz;
         s_nav.wx = rx.wx;  s_nav.wy = rx.wy;  s_nav.wz = rx.wz;
         s_nav.t     = (float)rx.t_ms * 1e-3f;
         s_nav.valid = rx.valid;
@@ -525,7 +565,7 @@ void loop()
         float tilt = acosf(bzc) * (float)RAD_TO_DEG;
         float wmag = sqrtf(s_nav.wx * s_nav.wx + s_nav.wy * s_nav.wy
                            + s_nav.wz * s_nav.wz) * (float)RAD_TO_DEG;
-        DG_PRINT("%lu,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.3f,"
+        DG_PRINT("%lu,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.3f,"
                       "%.1f,%.2f,%lu,%lu,%lu,%lu,%lu\n",
                       (unsigned long)millis(), (int)s_out.phase,
                       s_nav.h, s_nav.vx, s_nav.vy, s_nav.vz,
@@ -533,6 +573,7 @@ void loop()
                       s_out.tilt_cmd * (float)RAD_TO_DEG,
                       s_out.tilt_err * (float)RAD_TO_DEG,
                       wmag,
+                      s_out.roll_rate * (float)RAD_TO_DEG,
                       s_out.servo1_deg, s_out.servo2_deg,
                       s_out.clamp, s_out.thrust_est, s_out.p_plan,
                       (unsigned long)s_rx_ok, (unsigned long)s_rx_bad,

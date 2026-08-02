@@ -310,8 +310,11 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 88, "nav_state layout chang
  */
 typedef struct {
     uint32_t t_ms;
-    float    tvc_x_deg;   // TVC servo command in the pad-ENU x plane
-    float    tvc_y_deg;   // ... and the y plane
+    // BODY-FIXED, not pad-fixed. Axis 1 deflects the nozzle in the plane containing
+    // the airframe's reference axis (body +X), axis 2 in the perpendicular one. They
+    // rotate with the vehicle as it rolls, which is what the servos physically do.
+    float    tvc_x_deg;   // TVC servo command, body axis 1
+    float    tvc_y_deg;   // ... and body axis 2
     float    clamp;       // thrust-clamp fraction, DG_CLAMP_MIN..DG_CLAMP_MAX
     float    fin_deg[4];  // FUTURE: controllable aero fins. Zero until flown.
     uint8_t  flags;       // ARIADNA_ACT_* bits
@@ -335,7 +338,7 @@ typedef struct {
     float    h_ignite;     // m, commanded ignition altitude
     float    tilt_cmd;     // rad, commanded tilt from vertical
     float    tilt_err;     // rad, total angle between commanded and actual axis
-    float    tilt_az;      // rad, azimuth the vehicle is leaning, pad-ENU
+    float    roll_rate;    // rad/s about the body axis: uncontrolled, reported only
     uint32_t rx_ok;
     uint32_t rx_bad;
     uint32_t plan_iters;   // must keep advancing or core 1 has died

@@ -139,7 +139,8 @@ int main(void)
             float a = (float)i * 0.0157f, t = 0.03f + 0.002f * (float)i;
             float bx = sinf(t) * cosf(a), by = sinf(t) * sinf(a), bz = cosf(t);
             float u1x, u1y, u1z, u2x, u2y, u2z;
-            dg_gimbal_basis(bx, by, bz, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+            dg_gimbal_basis(bx, by, bz, 1.0f, 0.0f, 0.0f,
+                            &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
             float d1 = sqrtf(u1x*u1x + u1y*u1y + u1z*u1z) - 1.0f;
             float d2 = sqrtf(u2x*u2x + u2y*u2y + u2z*u2z) - 1.0f;
             float od = u1x*u2x + u1y*u2y + u1z*u2z;
@@ -154,7 +155,7 @@ int main(void)
         // 5d. a tilt purely toward +y must leave axis 1 on the world x axis,
         //     which is what makes the two servos independent channels
         float u1x, u1y, u1z, u2x, u2y, u2z;
-        dg_gimbal_basis(0.0f, sinf(0.3f), cosf(0.3f),
+        dg_gimbal_basis(0.0f, sinf(0.3f), cosf(0.3f), 1.0f, 0.0f, 0.0f,
                         &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
         check("tilt in +y leaves gimbal axis 1 on world x", u1x, 1.0f, 1e-6f);
         check("  ...with no y component", u1y, 0.0f, 1e-6f);
@@ -185,7 +186,82 @@ int main(void)
     }
 
     // -----------------------------------------------------------------
-    printf("\n6. Structural invariants\n");
+    printf("\n6. A rolling airframe\n");
+    printf("   (No roll actuator yet. The servo axes are bolted to the vehicle,\n");
+    printf("    so they turn with it; the reference axis g is what tracks them.)\n");
+    {
+        // 6a. the gimbal axes must FOLLOW the airframe through a full roll. A basis
+        //     anchored to world x passes every other check in this file and fails
+        //     only this one -- which is precisely why it is here.
+        float worst = 0.0f;
+        const float bx = 0.0f, by = 0.0f, bz = 1.0f;
+        for (int i = 0; i < 720; i++) {
+            float ph = (float)i * (float)M_PI / 360.0f;
+            float gx = cosf(ph), gy = sinf(ph), gz = 0.0f;
+            float u1x, u1y, u1z, u2x, u2y, u2z;
+            dg_gimbal_basis(bx, by, bz, gx, gy, gz,
+                            &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+            // u1 must BE g, and u2 must be b x g
+            float d = fmaxf(fmaxf(fabsf(u1x - gx), fabsf(u1y - gy)),
+                     fmaxf(fabsf(u2x + gy), fabsf(u2y - gx)));
+            if (d > worst) worst = d;
+        }
+        check("gimbal axes follow the airframe through a full roll", worst, 0.0f, 1e-5f);
+
+        // 6b. a reference axis that is not exactly perpendicular to b must still
+        //     produce an orthonormal basis -- the sender is allowed to be sloppy
+        float worst_on = 0.0f, worst_perp = 0.0f;
+        for (int i = 0; i < 360; i++) {
+            float t = 0.02f + 0.0015f * (float)i;
+            float b2x = sinf(t), b2y = 0.0f, b2z = cosf(t);
+            float ph = (float)i * 0.11f;
+            // deliberately non-perpendicular and non-unit
+            float gx = cosf(ph) * 1.3f, gy = sinf(ph) * 1.3f, gz = 0.4f;
+            float u1x, u1y, u1z, u2x, u2y, u2z;
+            dg_gimbal_basis(b2x, b2y, b2z, gx, gy, gz,
+                            &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+            worst_on = fmaxf(worst_on,
+                fmaxf(fabsf(sqrtf(u1x*u1x+u1y*u1y+u1z*u1z) - 1.0f),
+                fmaxf(fabsf(sqrtf(u2x*u2x+u2y*u2y+u2z*u2z) - 1.0f),
+                      fabsf(u1x*u2x + u1y*u2y + u1z*u2z))));
+            worst_perp = fmaxf(worst_perp,
+                               fmaxf(fabsf(u1x*b2x + u1y*b2y + u1z*b2z),
+                                     fabsf(u2x*b2x + u2y*b2y + u2z*b2z)));
+        }
+        check("a sloppy reference axis still gives an orthonormal basis",
+              worst_on, 0.0f, 1e-5f);
+        check("  ...and one perpendicular to b", worst_perp, 0.0f, 1e-6f);
+
+        // 6c. gyroscopic decoupling. Ask the loop for the same attitude correction
+        //     with and without a roll rate; the difference must be the precession
+        //     term, (I_t - I_a) * w_roll * (b x w_t), expressed as a deflection.
+        //     Getting the SIGN wrong doubles the coupling instead of cancelling it,
+        //     which is the failure this catches.
+        float bxr = 0.0f, byr = 0.0f, bzr = 1.0f;
+        float wtx = 0.0f, wty = 0.4f, wtz = 0.0f;      // transverse rate, about +y
+        float w_roll = 1.5f;                            // 86 deg/s
+        float I_t = 3.0f * DG_L_BODY * DG_L_BODY / 12.0f;
+        float I_a = 3.0f * DG_I_AXIAL_COEF;
+        // the plant's precession torque on this state
+        float px = (I_t - I_a) * w_roll * (byr * wtz - bzr * wty);
+        float py = (I_t - I_a) * w_roll * (bzr * wtx - bxr * wtz);
+        float pz = (I_t - I_a) * w_roll * (bxr * wty - byr * wtx);
+        // ...must be non-trivial, or the check proves nothing
+        float pm = sqrtf(px*px + py*py + pz*pz);
+        checks++;
+        if (pm < 0.1f) {
+            failures++;
+            printf("  [FAIL] precession torque %.4f N.m is too small to test\n", pm);
+        } else {
+            printf("  [PASS] precession torque at 86 deg/s is %.2f N.m — %.0f%% of the\n"
+                   "         %.1f N.m the gimbal can make at full deflection\n",
+                   pm, 100.0f * pm / (230.0f * 0.0872f * DG_L_GIMBAL),
+                   230.0f * 0.0872f * DG_L_GIMBAL);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    printf("\n7. Structural invariants\n");
     dg_init();
     checks++;
     if (dg_thrust_ref(-0.1f) != 0.0f || dg_thrust_ref(1.5f) != 0.0f) {
@@ -217,7 +293,8 @@ int main(void)
     // guidance wants a tilt toward -x to kill the +6 m/s drift. That leaves a real
     // error for the loop to work on. Crossrange is deliberately zero.
     dg_nav_t nav = {18.7f, 6.0f, 0.0f, -45.0f,
-                    0.1494381f, 0.0f, 0.9887711f,
+                    0.1494381f, 0.0f, 0.9887711f,     // thrust axis
+                    0.9887711f, 0.0f, -0.1494381f,    // reference axis, roll phase 0
                     0.0f, 0.0f, 0.0f, 10.0f, true};
     dg_out_t out;
     const int N_TICK = 160;                      // 0.8 s: 0.2 s to light, 0.6 s burning
@@ -286,12 +363,14 @@ int main(void)
                out.servo2_deg);
     }
 
-    // a roll rate must be ignored, not turned into a deflection
+    // A pure roll rate, with no transverse rate to precess, must not move the
+    // servos: the gyroscopic term is proportional to (b x w_transverse), which is
+    // zero here, and the rate loop sees no roll at all.
     {
         dg_nav_t spun = nav;
-        spun.wx = nav.bx * 3.0f;      // 3 rad/s purely about the body axis
-        spun.wy = nav.by * 3.0f;
-        spun.wz = nav.bz * 3.0f;
+        spun.wx = nav.bx * 1.5f;      // 1.5 rad/s = 86 deg/s, top of the envelope
+        spun.wy = nav.by * 1.5f;
+        spun.wz = nav.bz * 1.5f;
         dg_out_t o2;
         dg_step_attitude(&spun, &o2);
         dg_nav_t still = nav;
@@ -305,6 +384,13 @@ int main(void)
             printf("  [FAIL] a pure roll rate changed the servos by %.3f deg\n", d);
         } else {
             printf("  [PASS] a pure roll rate is projected out (%.3f deg change)\n", d);
+        }
+        checks++;
+        if (fabsf(o2.roll_rate - 1.5f) > 1e-3f) {
+            failures++;
+            printf("  [FAIL] roll rate reported as %.4f, expected 1.5\n", o2.roll_rate);
+        } else {
+            printf("  [PASS] roll rate reported for telemetry (%.3f rad/s)\n", o2.roll_rate);
         }
     }
 
@@ -320,6 +406,7 @@ int main(void)
     dg_arm(6.0f, -40.0f);
     dg_nav_t coast = {70.0f, 6.0f, 2.0f, -42.0f,
                       0.2474040f, 0.0616284f, 0.9669876f,
+                      0.9683245f, 0.0f, -0.2477304f,
                       0.1f, 0.4f, 0.0f, 1.0f, true};
     dg_step_attitude(&coast, &out);
     checks++;
@@ -331,6 +418,7 @@ int main(void)
 
     // invalid nav must not command anything
     dg_nav_t bad = {20.0f, 6.0f, 1.0f, -40.0f, 0.1f, 0.0f, 0.995f,
+                    0.995f, 0.0f, -0.1f,
                     0.0f, 0.0f, 0.0f, 12.0f, false};
     dg_step_attitude(&bad, &out);
     checks++;

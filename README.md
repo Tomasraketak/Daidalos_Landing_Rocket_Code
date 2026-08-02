@@ -42,6 +42,7 @@ rather than saving it. Two consequences drive the whole design:
 | guidance entry | 85 m altitude |
 | entry envelope | \|Vz\| 20–45 m/s (see below), \|Vx\| 0–15 m/s |
 | TVC | two axes, ±10° servo each, 2:1 to the nozzle |
+| roll | uncontrolled, 0–90 °/s, either direction |
 
 ---
 
@@ -59,7 +60,7 @@ Ariadna_V2/                       three-MCU flight computer built around it
   Ground_Station/                 Pico 2 — LoRa receiver
   Ground_Visualizer/              PyQt6 telemetry display
 test/
-  host_test.cpp                   119 numerical checks against the model
+  host_test.cpp                   124 numerical checks against the model
   link_test.cpp                   checks on the Ariadna V2 link codec
   est_test.cpp                    checks on the navigation filter
   check_py_format.py              pins the Python decoder to the C packet
@@ -115,7 +116,7 @@ crash, and the burn is only 1.7 s long.
 
 ## The navigation link
 
-The fusion processor sends a 49-byte little-endian frame. Anything faster than 200 Hz is
+The fusion processor sends a 61-byte little-endian frame. Anything faster than 200 Hz is
 fine — the control loop always uses the newest frame it has.
 
 | offset | size | field | |
@@ -126,41 +127,52 @@ fine — the control loop always uses the newest frame it has.
 | 7 | 4 | `vx` | m/s, world +x |
 | 11 | 4 | `vy` | m/s, world +y |
 | 15 | 4 | `vz` | m/s, **negative while descending** |
-| 19 | 12 | `bx, by, bz` | body-axis **unit vector**, world frame |
-| 31 | 12 | `wx, wy, wz` | rad/s, world frame, **straight off the gyro** |
-| 43 | 4 | `t_ms` | uint32 ms, monotonic |
-| 47 | 2 | CRC-16/CCITT-FALSE | over bytes 2..46 |
+| 19 | 12 | `bx, by, bz` | **thrust-axis** unit vector, world frame |
+| 31 | 12 | `gx, gy, gz` | **body-fixed reference axis**, world frame |
+| 43 | 12 | `wx, wy, wz` | rad/s, world frame, **straight off the gyro** |
+| 55 | 4 | `t_ms` | uint32 ms, monotonic |
+| 59 | 2 | CRC-16/CCITT-FALSE | over bytes 2..58 |
 
 Encoder for the sending side:
 
 ```c
 static void nav_send(const float pv[4],      // h, vx, vy, vz
-                     const float b[3],       // body-axis unit vector
+                     const float b[3],       // thrust-axis unit vector
+                     const float g[3],       // body-fixed reference axis
                      const float w[3],       // rad/s, world frame
                      uint32_t t_ms, bool valid)
 {
-    uint8_t f[49];
+    uint8_t f[61];
     f[0] = 0xDA; f[1] = 0x1D; f[2] = valid ? 1 : 0;
     memcpy(&f[3],  pv,   16);
     memcpy(&f[19], b,    12);
-    memcpy(&f[31], w,    12);
-    memcpy(&f[43], &t_ms, 4);
-    uint16_t crc = crc16_ccitt(&f[2], 45);      // same routine as the .ino
-    f[47] = crc & 0xFF; f[48] = crc >> 8;
+    memcpy(&f[31], g,    12);
+    memcpy(&f[43], w,    12);
+    memcpy(&f[55], &t_ms, 4);
+    uint16_t crc = crc16_ccitt(&f[2], 57);      // same routine as the .ino
+    f[59] = crc & 0xFF; f[60] = crc >> 8;
     NAV_PORT.write(f, sizeof f);
 }
 ```
 
-### Attitude is a unit vector, not Euler angles
+### Attitude is two unit vectors, not Euler angles
 
 `b` is the direction **thrust pushes the vehicle** — the tail-to-nose axis reversed, so it
-points roughly up during the descent. From a quaternion it is one rotation:
+points roughly up during the descent. `g` is a second, **body-fixed** axis marking the
+airframe's roll orientation: send the body axis that servo 1 deflects the nozzle in. Both come
+from the quaternion in one rotation each:
 
 ```c
-// body axis expressed in body coordinates, rotated into the world
-float b[3];  quat_rotate(q, BODY_AXIS, b);
-float w[3];  quat_rotate(q, gyro_body, w);      // same q, same frame
+float b[3];  quat_rotate(q, BODY_THRUST_AXIS, b);   // e.g. body -Z
+float g[3];  quat_rotate(q, BODY_SERVO1_AXIS, g);   // e.g. body +X
+float w[3];  quat_rotate(q, gyro_body, w);          // same q, same frame
 ```
+
+**`g` is what makes a rolling airframe flyable.** Without it the guidance has no way to know
+where the servo axes have got to, and would command them as though the vehicle had never
+turned. It need not be exactly perpendicular to `b` — the guidance orthogonalises it — but it
+must be body-fixed, and it must be the axis servo 1 really acts in, or the two channels are
+mixed by a constant angle for the entire flight.
 
 Three reasons this beats sending angles. It has no convention to get backwards; it has no
 wrap and no gimbal lock; and it saves the flight computer two trig calls per tick, which more
@@ -181,16 +193,17 @@ is the difference between a **1.3 %** and a **75.6 %** landing rate — from tum
 It is worse in 3-D than in the plane, because the noise now enters both channels independently
 and the attitude gate is on the total tilt.
 
-The component of `w` along `b` is the roll rate. Send it anyway — the guidance projects it out,
-because a two-axis gimbal cannot produce a torque about the body axis and feeding one in asks
-for something impossible.
+The component of `w` along `b` is the roll rate. Send it — the guidance projects it out of the
+rate loop, because a two-axis gimbal cannot produce a torque about the body axis and feeding
+one in asks for something impossible, and then uses it to cancel the gyroscopic cross-coupling
+the spin creates.
 
 ### Sign conventions
 
 World frame, z up, origin at the pad. `vx`/`vy` are positive along world +x/+y. Servo **axis 1**
-deflects the nozzle in the vertical plane containing world **+x**, **axis 2** in the plane
-containing **+y**. With no roll those are fixed directions in the airframe, which is exactly
-what makes the mapping a constant.
+deflects the nozzle in the plane containing the reference axis `g`, **axis 2** in the
+perpendicular one. Those are **body-fixed** directions — they turn with the vehicle as it
+rolls, which is what the servos physically do.
 
 Get either servo sign backwards and that channel is positive feedback. Test **both** — see the
 pre-flight list at the end.
@@ -323,7 +336,7 @@ crash, and the grain finishes burning either way.
 
 ```
 cd test
-make          # 119 numerical checks against the simulation
+make          # 124 numerical checks against the simulation
 make est      # the Ariadna V2 navigation filter
 make link     # the Ariadna V2 link codec and transmit ring
 make sync     # the V2 copy of the guidance module has not drifted
@@ -342,7 +355,11 @@ ignition table. On top of that it checks the properties that make the 3-D form c
   toward +y leaves axis 1 on world x, which is what makes the two servos independent;
 - the **dynamic inversion round-trips exactly** — the deflection it solves for produces the
   torque that was asked for;
-- a **pure roll rate is projected out** and does not move either servo;
+- a **pure roll rate is projected out** and does not move either servo, but is reported;
+- the **gimbal axes follow the airframe through a full 360° roll** — a basis anchored to the
+  world passes every other check in the file and fails only this one;
+- a **sloppy reference axis** (non-unit, not perpendicular to `b`) still yields an orthonormal
+  basis, so the sender is allowed to be approximate;
 
 — and the structural invariants: monotonicity of the miss function, servo travel and
 quantisation, clamp range, both servos parked during the coast, no commands on invalid nav.
@@ -356,9 +373,9 @@ make golden MODEL=../../Landing-Rocket-Sim/lander_v2.py
 `gen_golden.py` *imports* the model rather than re-implementing it, so the vectors cannot
 drift away from the simulation they came from.
 
-Current status: **119 checks, 0 failures.** Worst guidance-tilt error over 72 cases is
-0.00005 rad (0.003°); the reduction, isotropy, orthonormality and inversion checks all pass
-at machine precision.
+Current status: **124 checks, 0 failures.** Worst guidance-tilt error over 72 cases is
+0.00005 rad (0.003°); the reduction, isotropy, orthonormality, inversion and roll-tracking
+checks all pass at machine precision.
 
 The golden vectors were **bit-identical before and after the 3-D upgrade**, which is the
 regression that matters: it says the planar law, the projection, the solver and the ignition
@@ -375,12 +392,13 @@ type, a rename in `guidance.h` the sketch was not updated for.
 CSV on USB at 20 Hz:
 
 ```
-t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,servo1,servo2,clamp,thrust,p,
+t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,roll_dps,servo1,servo2,clamp,thrust,p,
 rx_ok,rx_bad,loop_us,overrun,plan
 ```
 
 `phase` is 0 idle, 1 coast, 2 burn, 3 done. `tilt` is the angle from vertical in degrees and
 `tilt_err` the total angle between commanded and actual body axis, so both are azimuth-free.
+`roll_dps` is the uncontrolled spin — watch it, but nothing on this board can change it.
 `loop_us` is the worst control-loop execution time seen so far and `overrun` counts missed
 200 Hz slots — both should stay near zero. `plan` counts planner iterations; if it stops
 advancing, core 1 has died.
@@ -395,14 +413,14 @@ common random numbers. Gates: |vz| < 3 m/s, horizontal **speed** < 0.75 m/s, **t
 
 | entry \|Vz\| at 85 m | design dispersions | full dispersions |
 |---|---|---|
-| 20–45 m/s | 99.4–100 % | 91–98 % |
-| 50 m/s | 91.4 % | 85.8 % |
-| 55 m/s | 66.1 % | 65.8 % |
+| 20–45 m/s | 99.7–100 % | 94–98 % |
+| 50 m/s | 92.2 % | 87.5 % |
+| 55 m/s | 66.1 % | 62.5 % |
 
 *Design* dispersions are igniter delay U(0.1, 0.3) s plus grain variation (1 % impulse,
 2 % burn rate). *Full* adds 3 m/s wind with gusts, mass and Cd spread, 0.30° nozzle
 misalignment, and the flight sensor budget. Entry azimuth and wind azimuth are drawn
-independently per flight.
+independently per flight, and **both** profiles include the 0–90 °/s roll.
 
 **Keep entry below ~45 m/s at 85 m.** Above that the vehicle runs out of grain before it
 runs out of velocity — a sizing problem, not a guidance one. The ΔV budget makes this
@@ -410,9 +428,9 @@ concrete: of ~94 m/s the grain delivers, clamp waste takes 22–41 m/s and gravi
 while **steering costs 0.6 m/s**. Perfect attitude control would recover almost nothing.
 
 **Also keep entry drift below ~12 m/s in wind.** Horizontal entry speed looks free under
-design dispersions (93–96 % flat from 0 to 15 m/s) but falls to **79 %** at 15 m/s under full
-ones, because entry and wind azimuths are independent — the vehicle can be asked to kill a
-large drift in one direction while the wind pushes it in another.
+design dispersions (93–98 % from 0 to 15 m/s) but falls to **82 %** at 15 m/s under full ones,
+because entry and wind azimuths are independent — the vehicle can be asked to kill a large
+drift in one direction while the wind pushes it in another.
 
 ---
 
@@ -436,9 +454,12 @@ Suggested order:
    +x and axis 1 must push back; push it toward +y and axis 2 must. If either follows
    instead, that `TVC*_SIGN` is wrong and the vehicle will diverge in under a second.
    Testing one axis and assuming the other is how a sign error reaches the pad.
-3b. Rotate the airframe about its own long axis and confirm it stays where you put it. This
-   code assumes roll is zero and cannot correct it; a rolling body also turns the two servo
-   axes underneath the controller.
+3b. **Check the roll reference.** Rotate the airframe about its own long axis and watch the
+   nav board's `g`: it must turn with the vehicle, and it must be the axis servo 1 really
+   deflects in. If `g` is 90° out from the true servo-1 axis the two channels are swapped for
+   the whole flight, and every static bench test still passes. Also confirm the roll rate the
+   vehicle arrives with is inside 90 °/s — beyond that is untested, and a vehicle
+   *accelerating* in roll (a canted fin) is outside the model entirely.
 4. Static fire with the clamp servo connected and the TVC locked, to calibrate
    `CLAMP_US_CLOSED` / `CLAMP_US_OPEN` against measured thrust.
 5. Only then fly it, over a range, with the usual model-rocketry safety practice for

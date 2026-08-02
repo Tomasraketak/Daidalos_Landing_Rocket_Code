@@ -380,15 +380,29 @@ static void pyro_all_safe(void)
 // =====================================================================
 //  6. NAV STATE -> GUIDANCE STATE
 //
-//  There is nothing to bridge. guidance.cpp solves the full
-//  three-dimensional problem with a two-axis gimbal, and the link already
-//  carries exactly what it wants:
+//  Almost nothing to bridge. guidance.cpp solves the full three-dimensional
+//  problem with a two-axis gimbal, and the link already carries most of
+//  what it wants:
 //
 //    u  -> b   the thrust-axis unit vector, identically defined at both
 //              ends (see the conventions block in ariadna_link.h)
 //    w  -> w   angular rate in pad-ENU, straight from the gyro
 //
-//  So this is a copy, not a transform. An earlier version of this file
+//  The one thing it does not carry directly is the airframe's ROLL
+//  ORIENTATION, and the guidance needs it: the two TVC servos are bolted
+//  to the vehicle, so as it spins the direction each one pushes spins with
+//  it. A controller that assumed those axes were anchored to the world
+//  would steer into the wrong mixture of channels, smoothly, with no
+//  symptom but a landing somewhere else.
+//
+//  It is one rotation away. The link carries the full body-to-pad
+//  quaternion, so the reference axis is
+//
+//    g = R(q) * BODY_SERVO1_AXIS
+//
+//  the same construction the Position MCU already uses for u. Deriving it
+//  here rather than adding it to the wire keeps ariadna_nav_state_t, the
+//  link tests and the Python decoder untouched, and costs ~30 flops. An earlier version of this file
 //  rotated the 3-D state into a vertical guidance plane, ran the planar
 //  law inside it, and split the single servo command back across the two
 //  gimbal axes by the plane azimuth. That worked, but it steered only
@@ -408,12 +422,32 @@ static void pyro_all_safe(void)
 //  to OPPOSE the motion, in both axes independently.
 // =====================================================================
 
+// The body axis servo 1 deflects the nozzle in. This is a HARDWARE fact about the
+// gimbal mount, and it must match the axis TVC_SIGN_X drives at the Master; if the
+// two disagree by 90 degrees the channels are simply swapped.
+static const float BODY_SERVO1_AXIS[3] = { 1.0f, 0.0f, 0.0f };
+
+/** Rotate a body vector into the pad frame: v' = v + 2*qv x (qv x v + qw*v). */
+static void quat_rotate(const ariadna_nav_state_t *s, const float v[3], float o[3])
+{
+    const float qw = s->qw, qx = s->qx, qy = s->qy, qz = s->qz;
+    const float tx = 2.0f * (qy * v[2] - qz * v[1]);
+    const float ty = 2.0f * (qz * v[0] - qx * v[2]);
+    const float tz = 2.0f * (qx * v[1] - qy * v[0]);
+    o[0] = v[0] + qw * tx + (qy * tz - qz * ty);
+    o[1] = v[1] + qw * ty + (qz * tx - qx * tz);
+    o[2] = v[2] + qw * tz + (qx * ty - qy * tx);
+}
+
 static void nav_from_state(const ariadna_nav_state_t *s, dg_nav_t *out)
 {
     out->h  = s->pz;
     out->vx = s->vx;  out->vy = s->vy;  out->vz = s->vz;
     out->bx = s->ux;  out->by = s->uy;  out->bz = s->uz;
     out->wx = s->wx;  out->wy = s->wy;  out->wz = s->wz;
+    float g[3];
+    quat_rotate(s, BODY_SERVO1_AXIS, g);
+    out->gx = g[0];  out->gy = g[1];  out->gz = g[2];
     out->t     = (float)s->t_ms * 1e-3f;
     out->valid = (s->flags & ARIADNA_NAV_VALID) != 0;
 }
@@ -431,13 +465,23 @@ static void nav_extrapolate(dg_nav_t *n, float dt, float thrust, float mass)
     n->vx += a * n->bx * dt;
     n->vy += a * n->by * dt;
     n->vz += az * dt;
-    // the body axis is carried by the rate: db/dt = w x b, then renormalised
-    // so it stays a unit vector however long the gap runs
+    // the body axes are carried by the rate: db/dt = w x b, dg/dt = w x g, then
+    // renormalised so they stay unit vectors however long the gap runs
     float nx = n->bx + (n->wy * n->bz - n->wz * n->by) * dt;
     float ny = n->by + (n->wz * n->bx - n->wx * n->bz) * dt;
     float nz = n->bz + (n->wx * n->by - n->wy * n->bx) * dt;
     float inv = 1.0f / sqrtf(nx * nx + ny * ny + nz * nz);
     n->bx = nx * inv;  n->by = ny * inv;  n->bz = nz * inv;
+    // The reference axis MUST ride the same rotation. Across a 250 ms gap at 90 deg/s
+    // the airframe turns 22 degrees; a frozen g would hand the loop a stale roll
+    // orientation and mix the two servo channels by that angle.
+    float mx = n->gx + (n->wy * n->gz - n->wz * n->gy) * dt;
+    float my = n->gy + (n->wz * n->gx - n->wx * n->gz) * dt;
+    float mz = n->gz + (n->wx * n->gy - n->wy * n->gx) * dt;
+    float gd = mx * n->bx + my * n->by + mz * n->bz;         // re-orthogonalise
+    mx -= gd * n->bx;  my -= gd * n->by;  mz -= gd * n->bz;
+    float gi = 1.0f / sqrtf(mx * mx + my * my + mz * mz);
+    n->gx = mx * gi;  n->gy = my * gi;  n->gz = mz * gi;
     n->t += dt;
 }
 
@@ -608,22 +652,51 @@ static bool self_test(void)
             ok = false;
         }
 
-        // The gimbal basis must be orthonormal, or the two servo commands
-        // are projections onto the wrong axes.
+        // The gimbal basis must be orthonormal, or the two servo commands are
+        // projections onto the wrong axes.
         float u1x, u1y, u1z, u2x, u2y, u2z;
-        dg_gimbal_basis(0.12f, 0.05f, 0.99f, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+        dg_gimbal_basis(0.12f, 0.05f, 0.99f, 0.9f, 0.1f, -0.1f,
+                        &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
         float dotp = u1x * u2x + u1y * u2y + u1z * u2z;
         float nrm1 = u1x * u1x + u1y * u1y + u1z * u1z;
         if (fabsf(dotp) > 1e-4f || fabsf(nrm1 - 1.0f) > 1e-4f) {
             NAV_PRINT("POST gimbal basis dot=%.6f norm=%.6f\n", dotp, nrm1);
             ok = false;
         }
-        // a tilt purely toward +y must leave axis 1 on world x: that is what
-        // makes the two servos independent channels rather than a mixture
-        dg_gimbal_basis(0.0f, 0.29552f, 0.95534f,
+
+        // ---- the roll case ----
+        // The gimbal axes must FOLLOW the airframe. Roll the reference axis a
+        // quarter turn about a vertical thrust axis and the servo axes must go
+        // with it. A basis anchored to the world passes every other check on this
+        // board and fails only this one -- and the symptom in flight would be a
+        // vehicle steering steadily off-target with no error signal to show for it.
+        dg_gimbal_basis(0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f,
                         &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
-        if (fabsf(u1x - 1.0f) > 1e-4f || fabsf(u1y) > 1e-4f) {
-            NAV_PRINT("POST gimbal axis 1 off world x: %.4f %.4f\n", u1x, u1y);
+        if (fabsf(u1y - 1.0f) > 1e-4f || fabsf(u2x + 1.0f) > 1e-4f) {
+            NAV_PRINT("POST gimbal axes do not follow roll: u1y=%.4f u2x=%.4f\n",
+                      u1y, u2x);
+            ok = false;
+        }
+
+        // The reference axis must come out of the quaternion the right way: at
+        // identity attitude it is the body servo-1 axis unrotated.
+        ariadna_nav_state_t q0;
+        memset(&q0, 0, sizeof(q0));
+        q0.qw = 1.0f;
+        float gv[3];
+        quat_rotate(&q0, BODY_SERVO1_AXIS, gv);
+        if (fabsf(gv[0] - 1.0f) > 1e-5f || fabsf(gv[1]) > 1e-5f ||
+            fabsf(gv[2]) > 1e-5f) {
+            NAV_PRINT("POST quat identity g=(%.3f %.3f %.3f)\n", gv[0], gv[1], gv[2]);
+            ok = false;
+        }
+        // ...and a 90-degree yaw about pad +z must carry it onto pad +y
+        memset(&q0, 0, sizeof(q0));
+        q0.qw = 0.70710678f;  q0.qz = 0.70710678f;
+        quat_rotate(&q0, BODY_SERVO1_AXIS, gv);
+        if (fabsf(gv[0]) > 1e-4f || fabsf(gv[1] - 1.0f) > 1e-4f) {
+            NAV_PRINT("POST quat yaw90 g=(%.3f %.3f %.3f) want (0 1 0)\n",
+                      gv[0], gv[1], gv[2]);
             ok = false;
         }
     }
@@ -818,7 +891,7 @@ void loop()
         st.h_ignite    = dg_h_ignite();
         st.tilt_cmd    = s_dg_out.tilt_cmd;
         st.tilt_err    = s_dg_out.tilt_err;
-        st.tilt_az     = atan2f(s_dg_nav.by, s_dg_nav.bx);
+        st.roll_rate   = s_dg_out.roll_rate;
         st.rx_ok       = s_rx.rx_ok;
         st.rx_bad      = s_rx.rx_crc + s_rx.rx_len;
         st.plan_iters  = s_plan_calls;
@@ -843,10 +916,11 @@ void loop()
         next_pad_ms = millis() + 1000 / PAD_CONSOLE_HZ;
         float bzc = s_dg_nav.bz > 1.0f ? 1.0f
                                        : (s_dg_nav.bz < -1.0f ? -1.0f : s_dg_nav.bz);
-        NAV_PRINT("ph=%d h=%.1f vz=%.1f tilt=%.1f srv=%.2f/%.2f clamp=%.2f "
+        NAV_PRINT("ph=%d h=%.1f vz=%.1f tilt=%.1f roll=%.0f srv=%.2f/%.2f clamp=%.2f "
                   "cont=%c%c%c rx=%lu/%lu loop=%luus ovr=%lu plan=%lu\n",
                   (int)s_dg_out.phase, s_dg_nav.h, s_dg_nav.vz,
                   acosf(bzc) * (float)RAD_TO_DEG,
+                  s_dg_out.roll_rate * (float)RAD_TO_DEG,
                   s_dg_out.servo1_deg, s_dg_out.servo2_deg,
                   s_dg_out.clamp,
                   (s_cont_mask & 1) ? '1' : '-',

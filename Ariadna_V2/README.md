@@ -350,7 +350,7 @@ This matters more than anything else in this README.
 
 | | how |
 |---|---|
-| **guidance algorithm** | 119 numerical checks against the Monte-Carlo simulation, including the properties that make the two-axis form correct: exact reduction to the planar law, isotropy in azimuth, an orthonormal gimbal basis, the dynamic-inversion round trip, and a pure roll rate moving neither servo. |
+| **guidance algorithm** | 124 numerical checks against the Monte-Carlo simulation, including the properties that make the two-axis form correct: exact reduction to the planar law, isotropy in azimuth, an orthonormal gimbal basis, the dynamic-inversion round trip, a pure roll rate moving neither servo, and the gimbal axes tracking the airframe through a full 360° roll. |
 | **link codec** | 110 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
 | **navigation filter** | 29 checks: `make est`. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
@@ -369,8 +369,22 @@ optional.**
 ### There is no longer a 3D→planar bridge
 
 `guidance.cpp` now solves the full three-dimensional problem with a two-axis gimbal, so
-section 6 of `navigation_mcu.ino` is a **copy**, not a transform: the link's `u` vector is
-`dg_nav_t.b` and the link's `w` is `dg_nav_t.w`, identically defined at both ends.
+section 6 of `navigation_mcu.ino` is almost a **copy** rather than a transform: the link's `u`
+vector is `dg_nav_t.b` and the link's `w` is `dg_nav_t.w`, identically defined at both ends.
+
+The one thing it derives is the airframe's **roll orientation**. The TVC servos are bolted to
+the vehicle, so as it spins the direction each one pushes spins with it, and the guidance needs
+a body-fixed reference axis to track them:
+
+```
+g = R(q) * BODY_SERVO1_AXIS
+```
+
+— the same construction the Position MCU already uses for `u`, from the quaternion the link
+already carries. Deriving it on the Navigation MCU rather than adding it to the wire keeps
+`ariadna_nav_state_t`, the link tests and the Python decoder untouched, and costs ~30 flops.
+`BODY_SERVO1_AXIS` **must** match the axis `TVC_SIGN_X` drives at the Master; if the two
+disagree by 90° the channels are simply swapped, and every static bench test still passes.
 
 An earlier version rotated the 3-D state into a vertical guidance plane aligned with the
 horizontal velocity, ran a planar law inside it, and split the single servo angle back onto
@@ -390,7 +404,7 @@ signs at the Master are still hardware conventions and still need bench test 3.*
 
 ```
 cd ../test
-make          # 119 guidance checks against the simulation
+make          # 124 guidance checks against the simulation
 make est      # 29 navigation filter checks
 make link     # 110 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted

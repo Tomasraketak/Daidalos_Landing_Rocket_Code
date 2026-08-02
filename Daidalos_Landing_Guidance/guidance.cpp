@@ -193,21 +193,34 @@ float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
 }
 
 // ---------------------------------------------------------------------
-//  Gimbal axes: an orthonormal basis of the plane perpendicular to b.
-//  u1 is the perpendicular direction whose azimuth is world +x, u2 completes
-//  the frame. With no roll these are fixed directions in the airframe, so each
-//  one is a physical servo. At zero tilt they are simply x and y.
+//  Gimbal axes: an orthonormal basis of the plane perpendicular to b, built by
+//  orthogonalising the BODY-FIXED reference axis g against b.
+//
+//  Because g is body-fixed, u1 and u2 turn with the airframe. That is the whole
+//  reason g is on the wire: the servos are bolted to the vehicle, so as it rolls
+//  the direction each one pushes rotates with it. A basis anchored to world x
+//  would drift away from the hardware at the roll rate, and the only symptom
+//  would be a vehicle steering somewhere other than where it meant to.
 // ---------------------------------------------------------------------
 void dg_gimbal_basis(float bx, float by, float bz,
+                     float gx, float gy, float gz,
                      float *u1x, float *u1y, float *u1z,
                      float *u2x, float *u2y, float *u2z)
 {
-    float ax = 1.0f - bx * bx, ay = -bx * by, az = -bx * bz;
+    float d  = gx * bx + gy * by + gz * bz;
+    float ax = gx - d * bx, ay = gy - d * by, az = gz - d * bz;
     float n2 = ax * ax + ay * ay + az * az;
-    if (n2 < 1e-12f) {                   // body axis along +-x: use the y projection
-        ax = -by * bx; ay = 1.0f - by * by; az = -by * bz;
+    if (n2 < 1e-9f) {
+        // g has collapsed onto b. Cannot happen in flight; can happen to a caller
+        // sending garbage. Fall back to the world-x projection so the loop still
+        // produces a sane deflection rather than a NaN.
+        ax = 1.0f - bx * bx; ay = -bx * by; az = -bx * bz;
         n2 = ax * ax + ay * ay + az * az;
-        if (n2 < 1e-12f) { ax = 1.0f; ay = 0.0f; az = 0.0f; n2 = 1.0f; }
+        if (n2 < 1e-9f) {
+            ax = -by * bx; ay = 1.0f - by * by; az = -by * bz;
+            n2 = ax * ax + ay * ay + az * az;
+            if (n2 < 1e-9f) { ax = 1.0f; ay = 0.0f; az = 0.0f; n2 = 1.0f; }
+        }
     }
     float inv = 1.0f / sqrtf(n2);
     float a = ax * inv, b_ = ay * inv, c = az * inv;
@@ -514,6 +527,7 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
     out->phase     = S.phase;
     out->tilt_cmd  = 0.0f;
     out->tilt_err  = 0.0f;
+    out->roll_rate = 0.0f;
 
     if (!nav->valid || S.phase == DG_PHASE_IDLE || S.phase == DG_PHASE_DONE) {
         S.servo1_act = 0.0f;
@@ -610,22 +624,25 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
         bx *= bi; by *= bi; bz *= bi;
     }
 
-    // Strip the roll rate. This vehicle cannot rotate about its own axis under
-    // control, so feeding a measured roll rate into the loop would ask the gimbal
-    // for a torque it physically cannot make -- and the inversion would answer
-    // with a deflection that does something else instead.
+    // Split the measured rate into ROLL and TRANSVERSE. The gimbal cannot produce
+    // a torque about the body axis, so feeding a roll rate into the rate loop would
+    // ask for something impossible and the inversion would answer with a deflection
+    // that does something else instead. The roll rate is not discarded, though: it
+    // drives the gyroscopic feedforward below.
     float wx = nav->wx, wy = nav->wy, wz = nav->wz;
-    float w_dot_b = wx * bx + wy * by + wz * bz;
-    wx -= w_dot_b * bx;
-    wy -= w_dot_b * by;
-    wz -= w_dot_b * bz;
+    float w_roll = wx * bx + wy * by + wz * bz;
+    wx -= w_roll * bx;
+    wy -= w_roll * by;
+    wz -= w_roll * bz;
+    out->roll_rate = w_roll;
 
     float ucx, ucy, ucz;
     dg_guidance_dir(nav->h, nav->vx, nav->vy, nav->vz, S.mass, &ucx, &ucy, &ucz);
     out->tilt_cmd = acosf(clampf(ucz, -1.0f, 1.0f));      // telemetry only
 
     float u1x, u1y, u1z, u2x, u2y, u2z;
-    dg_gimbal_basis(bx, by, bz, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+    dg_gimbal_basis(bx, by, bz, nav->gx, nav->gy, nav->gz,
+                    &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
 
     // Attitude error as a ROTATION VECTOR: e = b x u_cmd points along the axis
     // that closes the error and has magnitude sin(error). This is the vector form
@@ -668,6 +685,24 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
     float trx  = g_ir * (k_th * ex + DG_KI_ATT * S.eix - wx);
     float trqy = g_ir * (k_th * ey + DG_KI_ATT * S.eiy - wy);
     float trqz = g_ir * (k_th * ez + DG_KI_ATT * S.eiz - wz);
+
+    // ---- gyroscopic decoupling ----
+    // A spinning airframe turns a demand on one gimbal channel into a response on
+    // the other. For an axisymmetric body Euler's equations reduce to
+    //     I_t * dw_t/dt = tau_t - (I_t - I_a) * w_roll * (b x w_t)
+    // so the cross-axis term is known exactly from quantities already in hand, and
+    // cancelling it costs one cross product.
+    //
+    // Keep the size of this in proportion. The coupling is a cross-axis rate
+    // feedback of gain ~1.5 rad/s at 90 deg/s against a 9 rad/s loop bandwidth, and
+    // the precession torque is about 2 % of what the gimbal can make. Measured in
+    // the simulation, the feedforward is worth +0.45 points of landing rate overall
+    // and about +1.0 between 45 and 75 deg/s. It is cheap and correctly signed, not
+    // a rescue.
+    float gyk = (I_pitch - S.mass * DG_I_AXIAL_COEF) * w_roll;
+    trx  += gyk * (by * wz - bz * wy);
+    trqy += gyk * (bz * wx - bx * wz);
+    trqz += gyk * (bx * wy - by * wx);
 
     // Cancel the weathercocking torque the fins generate at angle of attack.
     // tau_aero = L_CP * (b x F_normal), F_normal = q*A*CNA*(a_hat - (a_hat.b)b),
