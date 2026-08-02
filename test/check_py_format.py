@@ -132,6 +132,17 @@ def main():
         check(vm.group(1) == pm.group(1),
               f"version mismatch: header {vm.group(1)}, python {pm.group(1)}")
 
+    # ---- downlink rate ----------------------------------------------------
+    # The visualiser measures link quality against this. If it disagrees
+    # with the vehicle, a perfect link reads as a bad one (or vice versa,
+    # which is worse).
+    cm = re.search(r"#define\s+ARIADNA_TLM_HZ\s+(\d+)", src)
+    pm = re.search(r"^TLM_HZ\s*=\s*(\d+)", vis, re.M)
+    check(cm is not None and pm is not None, "could not read the downlink rate")
+    if cm and pm:
+        check(cm.group(1) == pm.group(1),
+              f"downlink rate mismatch: header {cm.group(1)} Hz, python {pm.group(1)} Hz")
+
     # ---- framing constants ----------------------------------------------------
     for cname, pname in (("ARIADNA_SYNC0", "SYNC0"), ("ARIADNA_SYNC1", "SYNC1"),
                          ("ARIADNA_PKT_TELEMETRY", "PKT_TELEMETRY")):

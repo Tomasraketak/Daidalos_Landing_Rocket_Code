@@ -242,6 +242,14 @@ static float    s_current     = 0.0f;
 static bool     s_rbf_out     = false;
 
 static volatile bool s_flash_ok = false;                // core 1 reads this
+static volatile bool s_lora_ok  = false;                // core 1 owns the radio
+
+// Downlink accounting. A slot skipped because the previous packet was
+// still on air is not an error — it is the guard that keeps the link from
+// falling behind — but if `skipped` climbs faster than `sent`, the
+// configured rate does not fit the airtime and ARIADNA_TLM_HZ is too high.
+static volatile uint32_t s_tlm_sent    = 0;
+static volatile uint32_t s_tlm_skipped = 0;
 static bool     s_servo_ok    = false;
 static bool     s_post_pass   = false;
 
@@ -878,7 +886,7 @@ static uint8_t health_bits(void)
     if (s_flash_ok)                              h |= ARIADNA_HLT_FLASH_OK;
     if (s_flags & ARIADNA_MST_LOGGING)           h |= ARIADNA_HLT_LOGGING;
     if (s_servo_ok)                              h |= ARIADNA_HLT_SERVO_OK;
-    if (s_have_nav && (s_nav.flags & ARIADNA_NAV_GPS_FIX)) h |= ARIADNA_HLT_GPS_FIX;
+    if (s_have_pos_status && s_pos_status.fix >= 3)  h |= ARIADNA_HLT_GPS_FIX;
     if (s_post_pass)                             h |= ARIADNA_HLT_POST_PASS;
     return h;
 }
@@ -901,18 +909,22 @@ static void build_telemetry(ariadna_tlm_t *t)
     t->t_ms    = millis();
     t->state   = s_state;
 
-    t->lat = s_nav.lat;
-    t->lon = s_nav.lon;
+    // Attitude in degrees, position and temperature live in the status
+    // packet now, not the 240 Hz state packet — see ariadna_nav_state_t.
+    // 20 Hz is five times the downlink rate, so nothing here is ever stale
+    // relative to what the ground actually sees.
+    t->lat = s_pos_status.lat;
+    t->lon = s_pos_status.lon;
 
     t->alt_dm  = sat16(s_nav.h * 10.0f);
     t->vz_dms  = sat16(s_nav.vz * 10.0f);
     t->vh_dms  = sat16(sqrtf(s_nav.vx * s_nav.vx + s_nav.vy * s_nav.vy) * 10.0f);
     t->acc_cg  = sat16(s_nav.accel_mag * 100.0f);
 
-    t->roll_ddeg  = sat16(s_nav.roll  * 10.0f);
-    t->pitch_ddeg = sat16(s_nav.pitch * 10.0f);
-    t->yaw_ddeg   = sat16(s_nav.yaw   * 10.0f);
-    t->temp_dc    = sat16(s_nav.temp_c * 10.0f);
+    t->roll_ddeg  = sat16(s_pos_status.roll  * 10.0f);
+    t->pitch_ddeg = sat16(s_pos_status.pitch * 10.0f);
+    t->yaw_ddeg   = sat16(s_pos_status.yaw   * 10.0f);
+    t->temp_dc    = sat16(s_pos_status.temp_c * 10.0f);
 
     t->tvc_x_cdeg = sat16(s_act.tvc_x_deg * 100.0f);
     t->tvc_y_cdeg = sat16(s_act.tvc_y_deg * 100.0f);
@@ -934,8 +946,8 @@ static void build_telemetry(ariadna_tlm_t *t)
     if (ca > 255.0f) ca = 255.0f;
     t->curr_da = (uint8_t)ca;
 
-    t->hdop_x10 = s_nav.hdop_x10;
-    t->sats     = s_nav.sats;
+    t->hdop_x10 = s_pos_status.hdop_x10;
+    t->sats     = s_pos_status.sats;
 
     // Low nibble continuity, high nibble fired.
     if (s_have_nav_status)
@@ -1162,8 +1174,15 @@ void loop()
         r.h     = s_nav.h;
         r.vx    = s_nav.vx;  r.vy = s_nav.vy;  r.vz = s_nav.vz;
         r.ux    = s_nav.ux;  r.uy = s_nav.uy;  r.uz = s_nav.uz;
-        r.roll  = s_nav.roll; r.pitch = s_nav.pitch; r.yaw = s_nav.yaw;
-        r.lat   = s_nav.lat;  r.lon = s_nav.lon;
+        // Attitude in degrees and position come from the status packet at
+        // 20 Hz. The 240 Hz thrust-axis unit vector above already captures
+        // tilt at full rate; roll about the long axis is the only thing
+        // logged at the slower rate, and it is not a control quantity.
+        r.roll  = s_pos_status.roll;
+        r.pitch = s_pos_status.pitch;
+        r.yaw   = s_pos_status.yaw;
+        r.lat   = s_pos_status.lat;
+        r.lon   = s_pos_status.lon;
         r.tvc_x = s_act.tvc_x_deg;
         r.tvc_y = s_act.tvc_y_deg;
         r.clamp = s_act.clamp;
@@ -1186,7 +1205,7 @@ void loop()
     if (millis() >= next_print_ms) {
         next_print_ms = millis() + 500;
         MASTER_PRINT("st=%u h=%.1f vz=%.1f tvc=%.2f/%.2f clamp=%.2f "
-                     "vb=%.2f i=%.2f pos=%lu/%lu nav=%lu/%lu drop=%lu\n",
+                     "vb=%.2f i=%.2f pos=%lu/%lu nav=%lu/%lu drop=%lu tlm=%lu/%lu\n",
                      s_state, s_nav.h, s_nav.vz,
                      s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp,
                      s_vbat, s_current,
@@ -1194,7 +1213,9 @@ void loop()
                      (unsigned long)(s_rx_pos.rx_crc + s_rx_pos.rx_len),
                      (unsigned long)s_rx_nav.rx_ok,
                      (unsigned long)(s_rx_nav.rx_crc + s_rx_nav.rx_len),
-                     (unsigned long)s_log_dropped);
+                     (unsigned long)s_log_dropped,
+                     (unsigned long)s_tlm_sent,
+                     (unsigned long)s_tlm_skipped);
     }
 }
 
@@ -1275,15 +1296,22 @@ void setup1()
     LoRa.setSPI(SPI);
     LoRa.setPins(PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_DIO0);
 
-    if (LoRa.begin(433E6)) {
-        // Must match ground_station.ino exactly. SF7 / 125 kHz / CR4-5 is
-        // the fastest of the usable settings, which is what a 46-byte
-        // packet at 4 Hz needs — see the airtime note in ariadna_link.h.
-        LoRa.setSpreadingFactor(7);
-        LoRa.setSignalBandwidth(125E3);
-        LoRa.setCodingRate4(5);
-        LoRa.setTxPower(20);
+    // Every parameter comes from ariadna_link.h, which the ground station
+    // reads too. A mismatch in any one of them is a radio that hears
+    // nothing, with no error to show for it — so there is one definition.
+    if (LoRa.begin(ARIADNA_LORA_FREQ_HZ)) {
+        LoRa.setSpreadingFactor(ARIADNA_LORA_SF);
+        LoRa.setSignalBandwidth(ARIADNA_LORA_BW_HZ);
+        LoRa.setCodingRate4(ARIADNA_LORA_CR4);
+        LoRa.setPreambleLength(ARIADNA_LORA_PREAMBLE);
+        LoRa.setTxPower(ARIADNA_LORA_TX_DBM);
         LoRa.enableCrc();
+        s_lora_ok = true;
+        MASTER_PRINT("# LoRa %lu Hz SF%d BW%lu, %lu us on air, %d Hz downlink\n",
+                     (unsigned long)ARIADNA_LORA_FREQ_HZ, ARIADNA_LORA_SF,
+                     (unsigned long)ARIADNA_LORA_BW_HZ,
+                     (unsigned long)ariadna_lora_airtime_us(sizeof(ariadna_tlm_t)),
+                     ARIADNA_TLM_HZ);
     }
 }
 
@@ -1298,17 +1326,33 @@ void loop1()
     }
 
     // ---- LoRa downlink ---------------------------------------------------
-    // endPacket() blocks for the ~92 ms the packet is on air. That is fine
-    // here and only here: core 0 never waits on this, and the RAM ring is
-    // sized to cover the pause in flash service.
-    if (millis() >= next_tlm_ms) {
-        next_tlm_ms = millis() + 1000 / ARIADNA_TLM_HZ;
-
-        ariadna_tlm_t t;
-        if (tlm_acquire(&t)) {
-            LoRa.beginPacket();
-            LoRa.write((const uint8_t *)&t, sizeof(t));
-            LoRa.endPacket();
+    //
+    // ASYNCHRONOUS. endPacket(true) returns as soon as the packet is handed
+    // to the radio, and isTransmitting() reports when the air is clear.
+    //
+    // At 10 Hz a 46-byte packet is 46 ms on air inside a 100 ms slot, so a
+    // blocking endPacket() would put this core in the radio driver for
+    // nearly half its life — and the flash log is the other thing this core
+    // does. Blocking would not lose telemetry, but it would make the log
+    // bursty for no reason.
+    //
+    // A slot whose predecessor is still on air is SKIPPED, never queued.
+    // Queuing is how a downlink degrades from "occasionally late" to
+    // "permanently a second behind": each late packet delays the next, and
+    // the backlog only grows. Skipping keeps every packet that does arrive
+    // fresh, which is what a ground station needs.
+    if (s_lora_ok && millis() >= next_tlm_ms) {
+        if (LoRa.isTransmitting()) {
+            s_tlm_skipped++;
+        } else {
+            next_tlm_ms = millis() + 1000 / ARIADNA_TLM_HZ;
+            ariadna_tlm_t t;
+            if (tlm_acquire(&t)) {
+                LoRa.beginPacket();
+                LoRa.write((const uint8_t *)&t, sizeof(t));
+                LoRa.endPacket(true);          // async
+                s_tlm_sent++;
+            }
         }
     }
 }

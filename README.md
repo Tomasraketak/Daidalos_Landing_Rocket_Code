@@ -256,7 +256,7 @@ crash, and the grain finishes burning either way.
 ```
 cd test
 make          # 108 numerical checks against the simulation
-make link     # 103 checks on the Ariadna V2 link codec and transmit ring
+make link     # 107 checks on the Ariadna V2 link codec and transmit ring
 make sync     # the V2 copy of the guidance module has not drifted
 make pyfmt    # the Python ground station matches the C packet layout
 make syntax   # compiles the sketches against stub Arduino headers

@@ -195,7 +195,25 @@ typedef enum {
  * every control decision on the Navigation MCU is taken from this.
  *
  * Path: Position MCU -> Master (routed, unmodified) -> Navigation MCU.
- * Default rate 100 Hz, see ARIADNA_NAV_STATE_HZ.
+ * Emitted on the estimator's own schedule, not on a timer — see
+ * ARIADNA_NAV_STATE_HZ.
+ *
+ * ---------------------------------------------------------------------
+ * THIS PACKET CARRIES ONLY WHAT A CONTROL LOOP CONSUMES
+ * ---------------------------------------------------------------------
+ * Attitude in degrees, latitude, longitude, GPS altitude and temperature
+ * used to live here. They were moved to ariadna_pos_status_t, which goes
+ * to the Master at 20 Hz and which the Navigation MCU ignores.
+ *
+ * The reason is arithmetic. This packet is the highest-rate thing on the
+ * link, and it crosses the link TWICE — Position to Master, then Master to
+ * Navigation. At 240 Hz the old 84-byte version cost 47 % of a 460800 baud
+ * link in each direction; the 52-byte version costs 30 %. Nothing was lost:
+ * every field that moved is telemetry, GPS updates at 10 Hz at best, and a
+ * navball redrawn at 20 Hz looks identical to one redrawn at 240 Hz.
+ *
+ * Before adding a field here, ask whether a control law reads it. If not,
+ * it belongs in the status packet.
  */
 typedef struct {
     uint32_t t_ms;        // Position MCU monotonic clock, ms
@@ -203,19 +221,13 @@ typedef struct {
     float    vx, vy, vz;  // m/s, pad-ENU, vz positive up
     float    ux, uy, uz;  // thrust-axis unit vector, pad-ENU (see conventions)
     float    wx, wy, wz;  // rad/s, RAW GYRO rotated into pad-ENU
-    float    roll, pitch, yaw;   // deg, telemetry only
-    int32_t  lat, lon;    // 1e-7 deg  (V2 raises this from the V1 1e-6)
-    float    gps_alt;     // m MSL
-    float    accel_mag;   // |a| in g, including gravity
-    float    temp_c;
+    float    accel_mag;   // |a| in g, including gravity. The Navigation MCU
+                          // uses this to decide whether the motor lit.
     uint16_t flags;       // ARIADNA_NAV_* bits
-    uint8_t  sats;
-    uint8_t  fix;         // 0 none, 2 2D, 3 3D
-    uint8_t  hdop_x10;
     uint8_t  quality;     // 0..255 estimator self-confidence, 255 = best
-    uint8_t  _pad[2];
+    uint8_t  _pad;
 } ariadna_nav_state_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 84, "nav_state layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 52, "nav_state layout changed");
 
 // --- ariadna_actuator_t.flags ----------------------------------------
 #define ARIADNA_ACT_VALID      (1u << 0)   // commands are live; else hold
@@ -281,7 +293,16 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 48, "nav_status layout cha
 #define ARIADNA_SENS_UWB       (1u << 4)   // FUTURE
 #define ARIADNA_SENS_LIDAR     (1u << 5)   // FUTURE
 
-/** Position MCU housekeeping, 20 Hz. */
+/**
+ * Position MCU housekeeping and telemetry, 20 Hz.
+ *
+ * Everything the ground wants to see but no control law reads. Keeping it
+ * off the 240 Hz path is what makes that path affordable — see the note on
+ * ariadna_nav_state_t.
+ *
+ * 20 Hz is five times the fastest downlink rate and comfortably faster
+ * than GPS produces new fixes, so nothing here is ever the stale link.
+ */
 typedef struct {
     uint32_t t_ms;
     uint32_t rx_ok;
@@ -289,14 +310,18 @@ typedef struct {
     float    fusion_hz;      // measured, from TriSense getActualFusionHz()
     float    pad_pressure;   // Pa, reference captured at arming
     float    pad_alt_msl;    // m, GPS altitude at the pad
+    float    roll, pitch, yaw;   // deg, telemetry and the ground navball
+    int32_t  lat, lon;       // 1e-7 deg  (V2 raises this from the V1 1e-6)
+    float    gps_alt;        // m MSL
+    float    temp_c;
     uint16_t sensor_ok;      // ARIADNA_SENS_* bits
     uint16_t imu_overflow;   // ICM42688P FIFO overflow count
     uint8_t  sats;
-    uint8_t  fix;
+    uint8_t  fix;            // 0 none, 2 2D, 3 3D
     uint8_t  hdop_x10;
     uint8_t  cal_state;      // 0 uncal, 1 gyro done, 2 gyro+accel, 3 full
 } ariadna_pos_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 32, "pos_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 60, "pos_status layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
@@ -441,19 +466,97 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 48, "gs serial layout chang
 // ---------------------------------------------------------------------
 //  Default rates
 // ---------------------------------------------------------------------
-#define ARIADNA_NAV_STATE_HZ   100   // Position -> Navigation state stream
+// The navigation state is NOT sent on a timer. It is emitted by the
+// Position MCU the instant its estimator finishes a step, so the number
+// below is the estimator's rate rather than a transmit schedule — see
+// "Event-driven, not timed" in position_mcu.ino.
+//
+// 240 Hz, feeding a 200 Hz control loop. Running the producer FASTER than
+// the consumer is the point: at equal rates two free-running crystals beat
+// against each other and a tick occasionally finds no new frame. At 1.2
+// frames per tick every tick has one.
+#define ARIADNA_NAV_STATE_HZ   240   // Position -> Navigation state stream
 #define ARIADNA_ACTUATOR_HZ    200   // Navigation -> Master servo commands
 #define ARIADNA_STATUS_HZ       20   // housekeeping both ways
 #define ARIADNA_MASTER_HZ       10   // Master state broadcast
 
-// LoRa downlink rate. A 46-byte payload at SF7 / BW125 / CR4-5 is ~92 ms
-// on air, so 4 Hz is already a 37 % duty cycle and 5 Hz would be 46 %.
-// Raise this only after checking the airtime figure printed by
-// ../../test/link_test.cpp, and note that the 433 MHz ISM band has duty
-// cycle limits in the EU that this is already close to. If you need a
-// faster downlink, widen the bandwidth to 250 kHz — that halves airtime
-// for about 3 dB of link budget — rather than shortening the packet.
-#define ARIADNA_TLM_HZ           4   // Master -> ground station
+// ---------------------------------------------------------------------
+//  LoRa radio
+//
+//  Defined here, not in the two sketches, because the vehicle and the
+//  ground station must agree on all five. A mismatch in any one of them is
+//  a radio that hears nothing, with no error message to show for it.
+//
+//  BANDWIDTH IS 250 kHz, NOT THE USUAL 125 kHz. That halves airtime, which
+//  is what makes a 10 Hz downlink possible at all:
+//
+//      46-byte payload, SF7, CR4/5      BW 125 kHz    BW 250 kHz
+//          time on air                     92.4 ms       46.2 ms
+//          duty cycle at 10 Hz             92.4 %        46.2 %
+//
+//  At 125 kHz a 10 Hz downlink would need the transmitter on 92 % of the
+//  time, which is not a margin, it is a coincidence.
+//
+//  The cost is 3 dB of receiver sensitivity, -123 dBm to -120 dBm. That is
+//  nothing here: at 2 km and +20 dBm the received signal is about -71 dBm,
+//  roughly 49 dB of margin. Airtime is the scarce resource in this link,
+//  not sensitivity. If you ever do need the range back, SF8 at 250 kHz
+//  buys most of it and still beats SF7/125k on airtime.
+//
+//  ⚠️ DUTY CYCLE REGULATION. 433.05-434.79 MHz is an ISM band, and in the
+//  EU it is generally limited to a 10 % duty cycle at 10 mW ERP under
+//  ETSI EN 300 220. 10 Hz at +20 dBm is well outside that. Check your
+//  competition rules and your national regulator before flying it; drop
+//  ARIADNA_TLM_HZ to 5 (23 %) or 2 (9 %), or reduce TX power, if you need
+//  to comply. This is your call to make, not the firmware's, so nothing
+//  here enforces it — but do not discover it at the pad.
+// ---------------------------------------------------------------------
+#define ARIADNA_LORA_FREQ_HZ   433000000UL
+#define ARIADNA_LORA_SF                 7
+#define ARIADNA_LORA_BW_HZ         250000UL
+#define ARIADNA_LORA_CR4                5    // 4/5
+#define ARIADNA_LORA_TX_DBM            20
+#define ARIADNA_LORA_PREAMBLE           8
+
+// Master -> ground station. 10 Hz is 46 % duty at the settings above;
+// ../../test/link_test.cpp prints the figure and fails if it goes past a
+// half. See the regulatory note before raising it.
+#define ARIADNA_TLM_HZ          10
+
+/**
+ * LoRa time on air, in microseconds, for a payload of `pl` bytes.
+ *
+ * The SX1276/78 datasheet formula, with an explicit header and CRC on. Put
+ * here rather than in a spreadsheet so the firmware, the ground station
+ * and the test all get the same number from the same source — and so that
+ * changing a radio setting immediately shows up as a changed duty cycle in
+ * the test output instead of as a surprise on the pad.
+ *
+ * Integer arithmetic throughout: this is also called on the RP2350, where
+ * a stray double would be software-emulated.
+ */
+static inline uint32_t ariadna_lora_airtime_us(uint16_t pl)
+{
+    const uint32_t sf = ARIADNA_LORA_SF;
+    const uint32_t cr = ARIADNA_LORA_CR4 - 4;          // 1..4
+
+    // Symbol time in nanoseconds, to keep the integer maths honest.
+    const uint32_t t_sym_ns = (uint32_t)(((uint64_t)(1u << sf) * 1000000000ULL)
+                                         / ARIADNA_LORA_BW_HZ);
+
+    // Payload symbol count. DE (low data rate optimise) is off: it only
+    // applies when the symbol time exceeds 16 ms, and SF7 is nowhere near.
+    int32_t num = 8 * (int32_t)pl - 4 * (int32_t)sf + 28 + 16;   // IH = 0, CRC = 1
+    int32_t den = 4 * (int32_t)sf;
+    int32_t blocks = (num + den - 1) / den;                      // ceil
+    if (blocks < 0) blocks = 0;
+    uint32_t n_payload = 8 + (uint32_t)blocks * (cr + 4);
+
+    // Preamble is n + 4.25 symbols; x4 keeps the quarter symbol exact.
+    uint32_t sym_x4 = (ARIADNA_LORA_PREAMBLE * 4 + 17) + n_payload * 4;
+
+    return (uint32_t)(((uint64_t)sym_x4 * t_sym_ns) / 4000ULL);
+}
 
 // =====================================================================
 //  CRC-16/CCITT-FALSE

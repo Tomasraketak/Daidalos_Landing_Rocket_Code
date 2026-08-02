@@ -29,14 +29,14 @@ control loop, so none of them do.
    Position MCU                Master MCU                 Navigation MCU
   ┌────────────┐             ┌────────────┐              ┌────────────┐
   │ TriSense   │  nav state  │  routing   │  nav state   │  guidance  │
-  │ GPS LK76   │ ──100 Hz──► │   state    │ ──100 Hz──►  │  planner   │
+  │ GPS LK76   │ ──240 Hz──► │   state    │ ──240 Hz──►  │  planner   │
   │ estimator  │             │  machine   │              │  pyros     │
   │            │             │            │ ◄──200 Hz──  │  TVC solve │
   └────────────┘             │  PCA9685   │  actuators   └────────────┘
                              │  W25Q128   │
                              │  LoRa      │
                              └─────┬──────┘
-                                   │ 433 MHz, 4 Hz
+                                   │ 433 MHz, 10 Hz
                              ┌─────▼──────┐      USB      ┌────────────┐
                              │ Ground stn │ ──framed────► │ visualiser │
                              └────────────┘               └────────────┘
@@ -65,13 +65,13 @@ a receiver accept a mis-sized frame. It is bit-identical to the routine already 
 
 | type | payload | direction | rate |
 |---|---|---|---|
-| `NAV_STATE` | 84 B | Position → Master → Navigation | 100 Hz |
+| `NAV_STATE` | 52 B | Position → Master → Navigation | 240 Hz, event-driven |
 | `ACTUATOR` | 36 B | Navigation → Master | 200 Hz |
 | `NAV_STATUS` | 48 B | Navigation → Master | 20 Hz |
-| `POS_STATUS` | 32 B | Position → Master | 20 Hz |
+| `POS_STATUS` | 60 B | Position → Master | 20 Hz |
 | `MASTER_STATE` | 16 B | Master → both | 10 Hz |
 | `CMD` | 8 B | Master → both | on event |
-| `TELEMETRY` | 46 B | Master → LoRa → ground | 4 Hz |
+| `TELEMETRY` | 46 B | Master → LoRa → ground | 10 Hz |
 
 Every inter-MCU struct is laid out 4-byte fields first, then 2-byte, then 1-byte, padded to
 a multiple of four. The packed and natural layouts are then identical, no member is ever
@@ -84,9 +84,9 @@ day someone inserts a field and forgets the padding.
 rate costs nothing, and it keeps each stream under a quarter of the link:
 
 ```
-Position→Master   nav state @100 Hz : 19.5 %
-Master→Navigation nav state @100 Hz : 19.5 %
-Navigation→Master actuator + status : 20.6 %
+Position→Master   nav state @240 Hz + status : 33.1 %
+Master→Navigation nav state @240 Hz          : 30.2 %
+Navigation→Master actuator @200 Hz + status  : 20.6 %
 ```
 
 At 115200 the same traffic sits near 80 %, and every field added after that comes out of
@@ -98,6 +98,46 @@ to the laptop. Note that the flight boards' `Serial` is **native USB CDC, not a 
 baud argument is ignored and the link runs at USB speed regardless. It is set for
 consistency with every other serial tool here, not because it does anything.
 
+### The navigation state stream
+
+`nav_state` is **not sent on a timer.** The Position MCU emits it the instant its
+estimator finishes a step. Two things were wrong with a timer:
+
+- it samples the estimator at an unrelated rate, so the state sits in a buffer for
+  anywhere from zero to a full transmit period before it goes out — *variable* latency,
+  which is worse for a control loop than latency that is merely large;
+- two free-running timers beat against each other, so the age of the state the Navigation
+  MCU sees wanders.
+
+The rate is therefore the estimator's rate: **240 Hz, feeding a 200 Hz control loop.**
+Deliberately faster than the consumer — at equal rates two crystals drift and a tick
+occasionally finds no new frame. At 1.2 frames per tick, every tick has one. `make link`
+asserts that the producer outruns the consumer.
+
+To pay for 240 Hz the packet was cut from 84 to 52 bytes: attitude in degrees, latitude,
+longitude, GPS altitude and temperature moved to `POS_STATUS` at 20 Hz. That halves the
+cost of the highest-rate thing on the link — and it crosses the link *twice*, Position to
+Master and Master to Navigation. Nothing was lost: every field that moved is telemetry,
+GPS updates at 10 Hz at best, and a navball redrawn at 20 Hz looks identical to one
+redrawn at 240 Hz. **Before adding a field to `nav_state`, ask whether a control law reads
+it.**
+
+#### Predict at 240 Hz, correct at 50 Hz
+
+The estimator's *prediction* step runs every tick. The barometer *correction* runs only on
+a genuinely new sample — about 50 Hz, which is what the BMP580 delivers at the OSR ×16 this
+build uses for its altitude noise floor.
+
+That distinction matters. Applying the correction on every predict step would feed the same
+measurement in roughly five times, multiplying the effective gain by five and moving the
+filter's crossover well above the bandwidth it was tuned for. It would still converge — it
+would just be a different filter than `BARO_W_NOMINAL` claims. The correction also
+integrates over the interval since the *last correction*, not over one prediction step.
+
+Sampling the barometer faster would not help: the vertical filter believes it below about
+0.3 Hz and the accelerometer above, so 50 Hz is already more than a hundred times
+oversampled for the job. A quieter sample at 50 Hz beats a noisier one at 240 Hz here.
+
 ### DMA, and where it is deliberately absent
 
 The processor is not short of cycles. CRC and frame parsing together cost about **1 % of a
@@ -108,8 +148,8 @@ takes 21.7 µs at 460800 baud. A frame longer than the FIFO cannot be handed ove
 
 | | bytes past the FIFO | per frame | duty |
 |---|---|---|---|
-| Master forwards `nav_state` @100 Hz | 58 | 1.26 ms | **12.6 %** of a core |
-| Position sends `nav_state` @100 Hz | 58 | 1.26 ms | **12.6 %** of a core |
+| Master forwards `nav_state` @240 Hz | 26 | 564 µs | **13.5 %** of a core |
+| Position sends `nav_state` @240 Hz | 26 | 564 µs | **13.5 %** of a core |
 | Navigation sends `actuator` @200 Hz | 10 | 217 µs | **4.3 %** of a core |
 
 A blocking write spends that time spinning. Worse than the wasted cycles, on the Master
@@ -135,6 +175,56 @@ producer running flat out. The **DMA channel configuration is not**, and cannot 
 the chip. `#define ARIADNA_USE_DMA_TX 0` falls back to blocking writes if it misbehaves on
 the bench.
 
+### The downlink, and what makes 10 Hz work
+
+Three separate things had to change for a 10 Hz downlink to be *reliable* rather than
+merely configured.
+
+**1. Airtime.** A 46-byte payload at SF7 is 92.4 ms on air at 125 kHz bandwidth — a 92 %
+duty cycle at 10 Hz, which is not a margin, it is a coincidence. **Bandwidth is now
+250 kHz**, halving airtime to 46.2 ms:
+
+| SF7, CR4/5, 46 B | airtime | duty at 5 Hz | duty at 10 Hz | sensitivity |
+|---|---|---|---|---|
+| BW 125 kHz | 92.4 ms | 46 % | 92 % | −123 dBm |
+| **BW 250 kHz** | **46.2 ms** | **23 %** | **46 %** | **−120 dBm** |
+| BW 500 kHz | 23.1 ms | 12 % | 23 % | −117 dBm |
+
+The 3 dB costs nothing here: at 2 km and +20 dBm the received signal is about −71 dBm,
+roughly **49 dB of margin**. Airtime is the scarce resource in this link, not sensitivity.
+
+All five radio parameters now live in `ariadna_link.h` and are read by both ends. They were
+previously duplicated in two files under a "must match" comment — which is a comment, not a
+guarantee.
+
+**2. The transmitter no longer blocks, and never queues.** `endPacket(true)` is
+asynchronous, and a slot whose predecessor is still on air is **skipped, not queued**.
+Queuing is how a downlink degrades from "occasionally late" to "permanently a second
+behind": each late packet delays the next and the backlog only grows. The Master counts
+`sent` and `skipped` and prints both — if `skipped` climbs, `ARIADNA_TLM_HZ` is too high
+for the airtime.
+
+**3. The ground station stopped being blind half the time.** This was a real bug. A full
+SSD1306 refresh is 1024 bytes over I²C, and the Arduino default clock is 100 kHz:
+
+```
+1024 bytes × 9 bits / 100 kHz = 92.2 ms per redraw
+1024 bytes × 9 bits / 400 kHz = 23.0 ms per redraw
+```
+
+The receiver was redrawing every 100 ms at 100 kHz — blocked for 92 % of the interval
+between packets. The SX1278 holds one packet in its FIFO so a single overlap survives, but
+two in a row does not. Fixed by running I²C at 400 kHz, dropping the redraw to 5 Hz, and
+**putting the display on core 1 with the radio alone on core 0.** The OLED is on I²C and the
+radio on SPI1, so the split is clean.
+
+> ⚠️ **Duty cycle regulation.** 433.05–434.79 MHz is an ISM band, and in the EU it is
+> generally limited to a **10 % duty cycle at 10 mW ERP** under ETSI EN 300 220. 10 Hz at
+> +20 dBm is well outside that. `make link` prints the figure and warns. Check your
+> competition rules and national regulator; drop `ARIADNA_TLM_HZ` to 5 (23 %) or 2 (9 %),
+> or reduce TX power, to comply. Nothing in the firmware enforces this — it is your call —
+> but do not discover it at the pad.
+
 ### Coordinate conventions
 
 Pad-local ENU: **+x East, +y North, +z Up**. `vz` is positive up, so it is negative for the
@@ -159,7 +249,7 @@ This matters more than anything else in this README.
 | | how |
 |---|---|
 | **guidance algorithm** | 108 numerical checks against the Monte-Carlo simulation. Unchanged from V1. |
-| **link codec** | 103 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring. |
+| **link codec** | 107 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
@@ -193,7 +283,7 @@ rotate the attitude reference underneath a closed loop that assumes it is fixed)
 ```
 cd ../test
 make          # 108 guidance checks against the simulation
-make link     # 103 link codec checks, the transmit ring, and the link budget
+make link     # 107 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled

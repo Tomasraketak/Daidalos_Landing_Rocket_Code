@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 
 static int g_checks = 0;
@@ -65,10 +66,10 @@ static void test_layout(void)
 {
     printf("layout\n");
 
-    check(sizeof(ariadna_nav_state_t)     == 84, "nav_state is 84 bytes");
+    check(sizeof(ariadna_nav_state_t)     == 52, "nav_state is 52 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
     check(sizeof(ariadna_nav_status_t)    == 48, "nav_status is 48 bytes");
-    check(sizeof(ariadna_pos_status_t)    == 32, "pos_status is 32 bytes");
+    check(sizeof(ariadna_pos_status_t)    == 60, "pos_status is 60 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
     check(sizeof(ariadna_tlm_t)           == 46, "telemetry is 46 bytes");
@@ -167,12 +168,9 @@ static void test_roundtrip(void)
     tx.vx    = 1.5f;  tx.vy = -2.25f;  tx.vz = -31.5f;
     tx.ux    = 0.0871557f; tx.uy = 0.0f; tx.uz = 0.9961947f;   // 5 deg tilt
     tx.wx    = 0.25f; tx.wy = -0.125f; tx.wz = 0.0f;
-    tx.roll  = 5.0f;  tx.pitch = -1.0f; tx.yaw = 271.5f;
-    tx.lat   = 497985411; tx.lon = 166912772;
     tx.accel_mag = 1.02f;
-    tx.temp_c    = 21.5f;
     tx.flags = ARIADNA_NAV_VALID | ARIADNA_NAV_BARO_OK | ARIADNA_NAV_GPS_FIX;
-    tx.sats  = 14; tx.fix = 3; tx.hdop_x10 = 11; tx.quality = 240;
+    tx.quality = 240;
 
     uint8_t frame[ARIADNA_FRAME_MAX];
     uint16_t n = ariadna_encode(frame, ARIADNA_PKT_NAV_STATE, &tx, sizeof(tx));
@@ -194,7 +192,7 @@ static void test_roundtrip(void)
                              &out, sizeof(out)) == 1, "unpack accepts right size");
         check(memcmp(&tx, &out, sizeof(tx)) == 0, "payload survives the round trip");
         check(out.h == 84.75f && out.vz == -31.5f, "floats are bit exact");
-        check(out.lat == 497985411, "int32 survives");
+        check(out.quality == 240, "trailing byte survives");
     }
 
     check(rx.rx_ok == 1 && rx.rx_crc == 0 && rx.rx_len == 0, "counters clean");
@@ -527,32 +525,75 @@ static void test_link_budget(void)
                     * ARIADNA_NAV_STATE_HZ * byte_time;
     double act_load = (ARIADNA_HDR_LEN + sizeof(ariadna_actuator_t) + ARIADNA_CRC_LEN)
                     * ARIADNA_ACTUATOR_HZ * byte_time;
-    double sts_load = (ARIADNA_HDR_LEN + sizeof(ariadna_nav_status_t) + ARIADNA_CRC_LEN)
+    double sts_load = (ARIADNA_HDR_LEN + sizeof(ariadna_pos_status_t) + ARIADNA_CRC_LEN)
+                    * ARIADNA_STATUS_HZ * byte_time;
+    double nst_load = (ARIADNA_HDR_LEN + sizeof(ariadna_nav_status_t) + ARIADNA_CRC_LEN)
                     * ARIADNA_STATUS_HZ * byte_time;
 
-    printf("    Position->Master   nav state @%3d Hz : %5.1f %%\n",
+    printf("    Position->Master   nav state @%3d Hz + status : %5.1f %%\n",
+           ARIADNA_NAV_STATE_HZ, (nav_load + sts_load) * 100.0);
+    printf("    Master->Navigation nav state @%3d Hz          : %5.1f %%\n",
            ARIADNA_NAV_STATE_HZ, nav_load * 100.0);
-    printf("    Master->Navigation nav state @%3d Hz : %5.1f %%\n",
-           ARIADNA_NAV_STATE_HZ, nav_load * 100.0);
-    printf("    Navigation->Master actuator+status   : %5.1f %%\n",
-           (act_load + sts_load) * 100.0);
+    printf("    Navigation->Master actuator @%3d Hz + status  : %5.1f %%\n",
+           ARIADNA_ACTUATOR_HZ, (act_load + nst_load) * 100.0);
 
-    // Half the link is the working limit. Above that, one retransmission or
-    // one burst of status traffic starts delaying control packets.
-    check(nav_load < 0.5, "nav state stream under 50 % of the link");
-    check(act_load + sts_load < 0.5, "actuator + status under 50 % of the link");
+    // Half the link is the working limit. Past that, one burst of status
+    // traffic starts delaying a control packet.
+    check(nav_load + sts_load < 0.5, "Position uplink under 50 % of the link");
+    check(nav_load < 0.5,            "Navigation downlink under 50 % of the link");
+    check(act_load + nst_load < 0.5, "actuator + status under 50 % of the link");
 
-    // LoRa airtime. SF7, BW 125 kHz, CR 4/5, explicit header, 8-symbol
-    // preamble — the settings in ground_station.ino.
-    const double t_sym = 128.0 / 125000.0;                 // 2^SF / BW
-    double payload_sym = 8.0 + (double)(int)((8 * (int)sizeof(ariadna_tlm_t) - 4 * 7
-                                             + 28 + 16 + 20 - 1) / (4 * 7)) * 5.0;
-    double airtime = (8.0 + 4.25) * t_sym + payload_sym * t_sym;
-    printf("    LoRa %2u B payload at SF7/125k/4-5    : %5.1f ms on air, "
-           "%4.1f %% duty at %d Hz\n",
-           (unsigned)sizeof(ariadna_tlm_t), airtime * 1000.0,
-           airtime * ARIADNA_TLM_HZ * 100.0, ARIADNA_TLM_HZ);
-    check(airtime * ARIADNA_TLM_HZ < 0.4, "downlink stays under a 40 % duty cycle");
+    // The producer must outrun the consumer, or a control tick occasionally
+    // finds no new state. This is the whole reason the estimator runs at
+    // 240 Hz against a 200 Hz loop.
+    check(ARIADNA_NAV_STATE_HZ > ARIADNA_ACTUATOR_HZ,
+          "nav state is produced faster than the control loop consumes it");
+
+    // ---- LoRa ----------------------------------------------------------
+    // ariadna_lora_airtime_us() is integer arithmetic on the target, so it
+    // is checked against the datasheet formula in floating point here. A
+    // drift between the two would silently mis-state the duty cycle.
+    {
+        const double t_sym = (double)(1u << ARIADNA_LORA_SF) / ARIADNA_LORA_BW_HZ;
+        for (uint16_t pl = 8; pl <= 64; pl += 8) {
+            double num = 8.0 * pl - 4.0 * ARIADNA_LORA_SF + 28 + 16;
+            double den = 4.0 * ARIADNA_LORA_SF;
+            double blocks = ceil(num / den);
+            if (blocks < 0) blocks = 0;
+            double n_payload = 8 + blocks * (ARIADNA_LORA_CR4 - 4 + 4);
+            double ref = ((ARIADNA_LORA_PREAMBLE + 4.25) + n_payload) * t_sym * 1e6;
+            double got = (double)ariadna_lora_airtime_us(pl);
+            if (fabs(got - ref) > 50.0) {
+                char msg[96];
+                snprintf(msg, sizeof msg,
+                         "airtime(%u) = %.0f us, datasheet says %.0f", pl, got, ref);
+                check(false, msg);
+            }
+        }
+        check(true, "integer airtime matches the datasheet formula");
+    }
+
+    const uint32_t air_us = ariadna_lora_airtime_us(sizeof(ariadna_tlm_t));
+    const double duty = air_us * 1e-6 * ARIADNA_TLM_HZ;
+
+    printf("    LoRa %2u B at SF%d/%luk/4-%d : %5.1f ms on air, %4.1f %% duty at %d Hz\n",
+           (unsigned)sizeof(ariadna_tlm_t), ARIADNA_LORA_SF,
+           (unsigned long)(ARIADNA_LORA_BW_HZ / 1000), ARIADNA_LORA_CR4,
+           air_us / 1000.0, duty * 100.0, ARIADNA_TLM_HZ);
+
+    // The transmitter must be idle at least half the time. Below that the
+    // radio has no room to recover from a retry, and the ground station
+    // has no gap in which to be doing anything else.
+    check(duty < 0.5, "downlink duty cycle leaves the radio idle half the time");
+
+    // And the packet must physically fit in its slot with room to spare.
+    check(air_us < (1000000u / ARIADNA_TLM_HZ),
+          "one packet fits inside one downlink period");
+
+    if (duty > 0.10)
+        printf("    NOTE: %.0f %% duty exceeds the EU 433 MHz ISM 10 %% limit -- see\n"
+               "          the regulatory note in ariadna_link.h before flying this\n",
+               duty * 100.0);
 }
 
 // ---------------------------------------------------------------------

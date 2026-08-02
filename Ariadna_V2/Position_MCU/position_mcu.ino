@@ -10,7 +10,7 @@
 //  ships it to the Master, which routes it to the Navigation MCU.
 //
 //  It makes no control decisions. Its entire product is
-//  ariadna_nav_state_t at 100 Hz.
+//  ariadna_nav_state_t, emitted the moment each estimator step finishes.
 //
 //  ---------------------------------------------------------------------
 //  WHY THE ESTIMATOR LIVES HERE AND NOT ON THE NAVIGATION MCU
@@ -26,14 +26,36 @@
 //  CORE ALLOCATION
 //  ---------------------------------------------------------------------
 //    core 0   ALL sensor I/O — TriSense fusion, barometer — plus the
-//             estimator. Every I2C and SPI transaction in the vehicle's
-//             sensor stack happens on this core, so there is no bus
-//             arbitration to get wrong.
-//    core 1   GPS parsing (UART, no shared bus), the Master link, and the
-//             100 Hz state transmit.
+//             estimator AND every outgoing packet. Every I2C and SPI
+//             transaction in the vehicle's sensor stack happens on this
+//             core, so there is no bus arbitration to get wrong, and the
+//             DMA transmit ring has exactly one producer.
+//    core 1   GPS parsing and receiving from the Master. Both are UARTs,
+//             so this core touches no shared bus and can be as bursty as
+//             NMEA wants to be.
 //
-//  The two directions of shared state each get their own seqlock. Neither
+//  The GPS fix crosses from core 1 to core 0 through a seqlock. Neither
 //  core ever blocks on the other.
+//
+//  ---------------------------------------------------------------------
+//  EVENT-DRIVEN, NOT TIMED
+//  ---------------------------------------------------------------------
+//  The navigation state is transmitted at the end of each estimator step,
+//  not by a separate timer. Two things were wrong with a timer:
+//
+//    * it samples the estimator at an unrelated rate, so the state sits
+//      in a buffer for anything from zero to a full transmit period
+//      before it goes out — latency that varies packet to packet, which
+//      is worse for a control loop than latency that is merely large;
+//    * two free-running timers beat against each other, so the age of the
+//      state the Navigation MCU sees wanders.
+//
+//  Emitting on completion removes both. The state on the wire is always
+//  the state that was just computed.
+//
+//  The rate is therefore the estimator's rate: 240 Hz, feeding a 200 Hz
+//  control loop. Deliberately faster than the consumer — at equal rates
+//  two crystals drift and a tick occasionally finds no new frame.
 //
 //  ---------------------------------------------------------------------
 //  WHAT IS NOT VERIFIED
@@ -108,8 +130,26 @@ static const uint32_t GPS_BAUD         = 9600;   // LK76 default
 SerialPIO GpsPort(PIN_GPS_TX, PIN_GPS_RX, 256);
 
 // ---- rates -------------------------------------------------------------
-static const uint32_t BARO_HZ          = 50;   // BMP580 read rate
-static const uint32_t ESTIMATOR_HZ     = 200;  // filter step rate
+//
+// The estimator rate is the nav_state transmit rate; see "Event-driven,
+// not timed" above. ARIADNA_NAV_STATE_HZ is the single definition, shared
+// with the link budget check in ../../test/link_test.cpp.
+static const uint32_t ESTIMATOR_HZ = ARIADNA_NAV_STATE_HZ;   // 240 Hz
+
+// Barometer sampling. NOT the estimator rate, and deliberately far below
+// it.
+//
+// The BMP580 will run at 240 Hz, but only at minimum oversampling. This
+// build uses OSR x16 on pressure for the altitude noise floor, which caps
+// the achievable rate far lower — so 50 Hz is what the sensor can actually
+// deliver at this quality, and asking for more would mean asking for a
+// noisier altitude.
+//
+// That costs nothing. The vertical filter believes the barometer below
+// about 0.3 Hz and the accelerometer above it, so 50 Hz is already more
+// than a hundred times oversampled for the job the barometer is doing.
+// A quieter sample at 50 Hz beats a noisier one at 240 Hz here, every time.
+static const uint32_t BARO_HZ = 50;
 
 // Diagnostics only. printf promotes float to double by language rule and
 // the RP2350 emulates double in software, so the promotion is confined
@@ -379,43 +419,26 @@ static NmeaParser s_nmea;
 // =====================================================================
 //  5. CROSS-CORE HANDOVER
 //
-//  Two seqlocks, one per direction. A seqlock rather than a mutex because
-//  neither core may ever block: core 0 is running the estimator on a fixed
-//  tick and core 1 is servicing two UARTs.
+//  One seqlock, one direction: the GPS fix, from core 1 to core 0.
 //
-//  The writer bumps an odd/even counter around the copy; the reader
-//  retries if it saw a torn window. A stale read is harmless here — both
-//  payloads are snapshots, not deltas.
+//  There used to be a second one carrying the navigation solution the
+//  other way, back when core 1 did the transmitting. Emitting the state
+//  from the core that computes it removed both the seqlock and the timer
+//  that sampled it — the state now goes on the wire without ever being
+//  buffered. Fewer moving parts and less latency for the same work.
+//
+//  A seqlock rather than a mutex because neither core may ever block: core
+//  0 is running the estimator on a fixed tick and core 1 is servicing two
+//  UARTs. The writer bumps an odd/even counter around the copy; the reader
+//  retries if it saw a torn window. A stale read is harmless — the payload
+//  is a snapshot, not a delta.
 // =====================================================================
-
-// core 0 -> core 1 : the navigation solution
-static volatile uint32_t     s_nav_seq = 0;
-static ariadna_nav_state_t   s_nav_shared;
 
 // core 1 -> core 0 : the GPS fix
 static volatile uint32_t     s_gps_seq = 0;
 static GpsFix                s_gps_shared;
 
 static volatile bool         s_core0_ready = false;
-
-static inline void nav_publish(const ariadna_nav_state_t *n)
-{
-    s_nav_seq++;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    s_nav_shared = *n;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    s_nav_seq++;
-}
-
-static inline bool nav_acquire(ariadna_nav_state_t *n)
-{
-    uint32_t a = s_nav_seq;
-    if (a & 1u) return false;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    *n = s_nav_shared;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return s_nav_seq == a;
-}
 
 static inline void gps_publish(const GpsFix *g)
 {
@@ -570,6 +593,7 @@ public:
     {
         _h = _vz = _bias = 0.0f;
         _vx = _vy = 0.0f;
+        _since_corr = 0.0f;
         _pad_pressure = 0.0f;
         _have_pad_ref = false;
         _baro_w       = BARO_W_NOMINAL;
@@ -590,6 +614,7 @@ public:
         _have_pad_ref = true;
         _h = _vz = _bias = 0.0f;
         _vx = _vy = 0.0f;
+        _since_corr = 0.0f;
     }
 
     bool have_pad_reference(void) const { return _have_pad_ref; }
@@ -623,7 +648,7 @@ public:
      * getGlobalLinearAcceleration() produces.
      */
     void step(float dt, float ax_world, float ay_world, float az_world,
-              float h_baro, bool baro_ok)
+              float h_baro, bool baro_fresh)
     {
         if (dt <= 0.0f || dt > 0.1f) return;      // a stalled tick, not a state
 
@@ -633,7 +658,30 @@ public:
         _vz += a_corr * dt;
 
         // --- vertical: correct ------------------------------------------
-        if (baro_ok) {
+        //
+        // ONLY on a genuinely new barometer sample, and with the time since
+        // the previous one — not the prediction step.
+        //
+        // This distinction is the whole reason the parameter is called
+        // `baro_fresh` rather than `baro_ok`. The predictor runs at 240 Hz;
+        // the barometer produces a sample at about 50 Hz. Applying the
+        // correction on every predict step would feed the same measurement
+        // in roughly five times, which multiplies the effective correction
+        // gain by five and moves the filter's crossover well above the
+        // bandwidth it was tuned for. The filter would still converge — it
+        // would just be a different filter than the one `_baro_w` claims.
+        _since_corr += dt;
+
+        if (baro_fresh) {
+            // The correction integrates over the interval since the LAST
+            // correction, not over one prediction step. Using the predict
+            // dt here would scale every gain by the ratio of the two rates
+            // and quietly detune the filter by a factor of five.
+            const float cdt = (_since_corr > 0.5f) ? 0.5f : _since_corr;
+            _since_corr = 0.0f;
+
+            const float dt = cdt;      // shadows deliberately: the gains below
+                                       // are all per correction interval
             const float w  = _baro_w;
             const float K1 = 3.0f * w;
             const float K2 = 3.0f * w * w;
@@ -712,6 +760,8 @@ private:
 
     float   _h = 0.0f, _vz = 0.0f, _bias = 0.0f;
     float   _vx = 0.0f, _vy = 0.0f;
+    float   _since_corr = 0.0f;   // seconds of prediction since the last
+                                  // barometer correction
     float   _pad_pressure = 0.0f;
     bool    _have_pad_ref = false;
     float   _baro_w = BARO_W_NOMINAL;
@@ -925,8 +975,10 @@ static bool self_test(void)
         e.begin();
         e.set_pad_reference(100000.0f);
         const float dt = 1.0f / (float)ESTIMATOR_HZ;
+        const int   every = (int)(ESTIMATOR_HZ / BARO_HZ);
         for (int i = 0; i < (int)ESTIMATOR_HZ * 20; i++)
-            e.step(dt, 0.0f, 0.0f, 0.4f, 100.0f, true);   // 0.4 m/s^2 of bias
+            // Correction only on a fresh sample, exactly as in flight.
+            e.step(dt, 0.0f, 0.0f, 0.4f, 100.0f, (i % every) == 0);
 
         if (fabsf(e.h() - 100.0f) > 1.0f) {
             POS_PRINT("POST filter h %.2f want 100\n", e.h());
@@ -1001,7 +1053,15 @@ void setup()
     POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s)\n",
               s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL");
 
-    memset(&s_nav_shared, 0, sizeof(s_nav_shared));
+    // The Master link belongs to core 0: it transmits, so it owns the DMA
+    // ring. Core 1 only receives, which needs no state of its own.
+    MASTER_PORT.setTX(PIN_MASTER_TX);
+    MASTER_PORT.setRX(PIN_MASTER_RX);
+    MASTER_PORT.begin(ARIADNA_MCU_BAUD);
+    ariadna_uart_tx_begin(&s_tx, uart0);   // uart0 is Serial1 on this core
+    ariadna_rx_init(&s_rx);
+    memset(&s_master, 0, sizeof(s_master));
+
     memset(&s_gps_shared, 0, sizeof(s_gps_shared));
     s_core0_ready = true;
 }
@@ -1011,9 +1071,9 @@ void loop()
     static uint32_t next_us     = 0;
     static uint32_t next_baro_us = 0;
     static float    h_baro      = 0.0f;
-    static bool     baro_ok     = false;
     static uint32_t last_step_us = 0;
     static uint32_t last_gps_ms  = 0;
+    static uint32_t next_status_ms = 0;
 
     const uint32_t period = (uint32_t)(1000000UL / ESTIMATOR_HZ);
 
@@ -1022,6 +1082,8 @@ void loop()
     if ((int32_t)(now - next_us) < 0) return;
     next_us += period;
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
+
+    ariadna_uart_tx_service(&s_tx);      // retire a finished DMA run
 
     // ---- deferred commands from core 1 ---------------------------------
     // Executed here because they touch the sensor buses, which belong to
@@ -1047,15 +1109,17 @@ void loop()
     if (fused) s_sensor_ok |= ARIADNA_SENS_IMU;
 
     // ---- barometer ------------------------------------------------------
+    // baro_fresh is true for exactly ONE estimator step per sample. The
+    // correction consumes it; see Estimator::step().
+    bool baro_fresh = false;
     if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
         float p = sensor.readPressure();
         if (p > 30000.0f && p < 110000.0f) {
-            h_baro  = s_est.baro_altitude(p);
-            baro_ok = s_est.have_pad_reference();
+            h_baro      = s_est.baro_altitude(p);
+            baro_fresh  = s_est.have_pad_reference();
             s_sensor_ok |= ARIADNA_SENS_BARO;
         } else {
-            baro_ok = false;
             s_sensor_ok &= (uint16_t)~ARIADNA_SENS_BARO;
         }
     }
@@ -1091,7 +1155,7 @@ void loop()
     uint32_t step_now = micros();
     float dt = (float)(step_now - last_step_us) * 1e-6f;
     last_step_us = step_now;
-    s_est.step(dt, ax_world, ay_world, aup, h_baro, baro_ok);
+    s_est.step(dt, ax_world, ay_world, aup, h_baro, baro_fresh);
 
     // The plume corrupts the barometer during the burn. The Master tells us
     // when that is; until then the barometer is the altitude reference.
@@ -1114,9 +1178,14 @@ void loop()
     s_est.fuse_range(s_uwb.range());
 
     // ---- publish -----------------------------------------------------------
-    TriSenseDataSnapshot snap;
-    bool snap_ok = sensor.getSnapshot(snap);
-
+    //
+    // Built and transmitted right here, at the end of the step that
+    // produced it. Nothing buffers it and no timer decides when it leaves;
+    // see "Event-driven, not timed" at the top of this file.
+    //
+    // Only control-relevant fields. Attitude in degrees, position, GPS and
+    // temperature go out in the status packet below at 20 Hz — see the
+    // note on ariadna_nav_state_t.
     ariadna_nav_state_t st;
     memset(&st, 0, sizeof(st));
     st.t_ms  = millis();
@@ -1126,23 +1195,13 @@ void loop()
     st.vz    = s_est.vz();
     st.ux    = u[0];  st.uy = u[1];  st.uz = u[2];
     st.wx    = w[0];  st.wy = w[1];  st.wz = w[2];
-    st.roll  = roll;  st.pitch = pitch;  st.yaw = heading;
-    st.temp_c = sensor.readTemperature();
 
-    if (snap_ok) {
+    TriSenseDataSnapshot snap;
+    if (sensor.getSnapshot(snap)) {
         float g2 = snap.accelX * snap.accelX +
                    snap.accelY * snap.accelY +
                    snap.accelZ * snap.accelZ;
         st.accel_mag = sqrtf(g2) * (1.0f / 9.80665f);   // library gives m/s^2
-    }
-
-    if (have_gps && gps.valid) {
-        st.lat      = gps.lat_1e7;
-        st.lon      = gps.lon_1e7;
-        st.gps_alt  = gps.alt_msl;
-        st.sats     = gps.sats;
-        st.fix      = gps.fix;
-        st.hdop_x10 = gps.hdop_x10;
     }
 
     st.quality = s_est.quality();
@@ -1164,71 +1223,13 @@ void loop()
                          s_post_pass;
     if (core_ok) st.flags |= ARIADNA_NAV_VALID;
 
-    nav_publish(&st);
-}
+    link_send(ARIADNA_PKT_NAV_STATE, &st, sizeof(st));
 
-// =====================================================================
-//  12. CORE 1 — GPS, the Master link, and the state transmit
-//
-//  No sensor bus is touched here, by design. GPS is a UART and the Master
-//  link is a UART, so this core can be as bursty as NMEA wants to be
-//  without ever delaying a filter step.
-// =====================================================================
-void setup1()
-{
-    while (!s_core0_ready) tight_loop_contents();
-
-    MASTER_PORT.setTX(PIN_MASTER_TX);
-    MASTER_PORT.setRX(PIN_MASTER_RX);
-    MASTER_PORT.begin(ARIADNA_MCU_BAUD);
-    // uart0 is Serial1 on the arduino-pico core. Must match MASTER_PORT.
-    ariadna_uart_tx_begin(&s_tx, uart0);
-
-    GpsPort.begin(GPS_BAUD);
-    s_nmea.begin();
-    ariadna_rx_init(&s_rx);
-    memset(&s_master, 0, sizeof(s_master));
-}
-
-void loop1()
-{
-    static uint32_t next_state_us  = 0;
-    static uint32_t next_status_ms = 0;
-
-    // ---- GPS -------------------------------------------------------------
-    // Bounded per pass so a burst of sentences cannot starve the transmit
-    // below. At 9600 baud the module cannot produce more than ~1 byte per
-    // millisecond anyway; the bound is insurance, not throughput.
-    for (int i = 0; i < 64 && GpsPort.available(); i++) {
-        if (s_nmea.feed((char)GpsPort.read()))
-            gps_publish(&s_nmea.fix());
-    }
-
-    // ---- Master link -------------------------------------------------------
-    ariadna_uart_tx_service(&s_tx);      // retire a finished DMA run first
-    link_poll();
-
-    // ---- navigation state, 100 Hz ------------------------------------------
-    uint32_t now = micros();
-    if (next_state_us == 0) next_state_us = now;
-    if ((int32_t)(now - next_state_us) >= 0) {
-        next_state_us += 1000000UL / ARIADNA_NAV_STATE_HZ;
-        if ((int32_t)(micros() - next_state_us) > 0)
-            next_state_us = micros() + 1000000UL / ARIADNA_NAV_STATE_HZ;
-
-        ariadna_nav_state_t st;
-        if (nav_acquire(&st))
-            link_send(ARIADNA_PKT_NAV_STATE, &st, sizeof(st));
-        // A torn read simply skips this slot. At 100 Hz the next one is
-        // 10 ms away and the consumer extrapolates across far longer gaps.
-    }
-
-    // ---- housekeeping, 20 Hz -------------------------------------------------
+    // ---- status, 20 Hz -------------------------------------------------
+    // Also sent from this core, so the DMA transmit ring has exactly one
+    // producer and needs no lock.
     if (millis() >= next_status_ms) {
         next_status_ms = millis() + 1000 / ARIADNA_STATUS_HZ;
-
-        GpsFix g;
-        bool have_gps = gps_acquire(&g);
 
         ariadna_pos_status_t ps;
         memset(&ps, 0, sizeof(ps));
@@ -1237,14 +1238,60 @@ void loop1()
         ps.rx_bad       = s_rx.rx_crc + s_rx.rx_len;
         ps.fusion_hz    = fusion.getActualFusionHz();
         ps.pad_pressure = s_est.pad_pressure();
-        ps.pad_alt_msl  = (have_gps && g.valid) ? g.alt_msl : 0.0f;
+        ps.pad_alt_msl  = (have_gps && gps.valid) ? gps.alt_msl : 0.0f;
+        ps.roll         = roll;
+        ps.pitch        = pitch;
+        ps.yaw          = heading;
+        ps.temp_c       = sensor.readTemperature();
         ps.sensor_ok    = s_sensor_ok;
         ps.imu_overflow = (uint16_t)sensor.imu.getFIFOOverflowCount();
-        ps.sats         = have_gps ? g.sats : 0;
-        ps.fix          = have_gps ? g.fix : 0;
-        ps.hdop_x10     = have_gps ? g.hdop_x10 : 0;
         ps.cal_state    = s_cal_state;
+
+        if (have_gps && gps.valid) {
+            ps.lat      = gps.lat_1e7;
+            ps.lon      = gps.lon_1e7;
+            ps.gps_alt  = gps.alt_msl;
+            ps.sats     = gps.sats;
+            ps.fix      = gps.fix;
+            ps.hdop_x10 = gps.hdop_x10;
+        }
 
         link_send(ARIADNA_PKT_POS_STATUS, &ps, sizeof(ps));
     }
+}
+
+// =====================================================================
+//  12. CORE 1 — GPS and receiving from the Master
+//
+//  No sensor bus is touched here, by design. GPS is a UART and the Master
+//  link is a UART, so this core can be as bursty as NMEA wants to be
+//  without ever delaying a filter step.
+//
+//  It does not TRANSMIT. Everything outbound goes from core 0, which is
+//  what lets the DMA transmit ring be a single-producer structure with no
+//  lock in it.
+// =====================================================================
+void setup1()
+{
+    // The Master port is opened by core 0, which also owns the transmit
+    // ring. Wait for it rather than racing it.
+    while (!s_core0_ready) tight_loop_contents();
+
+    GpsPort.begin(GPS_BAUD);
+    s_nmea.begin();
+}
+
+void loop1()
+{
+    // ---- GPS -------------------------------------------------------------
+    // Bounded per pass so a burst of sentences cannot monopolise the core.
+    // At 9600 baud the module cannot produce more than about one byte per
+    // millisecond anyway; the bound is insurance, not throughput.
+    for (int i = 0; i < 64 && GpsPort.available(); i++) {
+        if (s_nmea.feed((char)GpsPort.read()))
+            gps_publish(&s_nmea.fix());
+    }
+
+    // ---- inbound from the Master -------------------------------------------
+    link_poll();
 }

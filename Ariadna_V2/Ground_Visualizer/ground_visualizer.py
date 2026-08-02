@@ -73,6 +73,11 @@ SYNC1 = 0x1D
 PKT_TELEMETRY = 0x40
 TLM_VERSION = 2
 
+# Downlink rate the vehicle is configured for. Must match ARIADNA_TLM_HZ in
+# ariadna_link.h — it is what the link-quality percentage is measured
+# against, so a stale value here reads as a permanently bad link.
+TLM_HZ = 10
+
 #            t_ms lat lon | 11 x int16                | 12 x uint8      | rssi snr
 GS_FORMAT = "<Iii" + "h" * 11 + "B" * 12 + "bb"
 GS_SIZE = struct.calcsize(GS_FORMAT)
@@ -1151,7 +1156,7 @@ class GroundStation(QtWidgets.QMainWindow):
             # Packet delivery ratio against the vehicle's nominal downlink
             # rate. Anything under about 80 % on the pad means the link will
             # not survive the flight.
-            expected = 3.0 * 4          # 3 s window at ARIADNA_TLM_HZ = 4
+            expected = 3.0 * TLM_HZ     # 3 s window
             pdr = min(100.0, len(self.rx_timestamps) / expected * 100.0)
             self.cards["LINK QUALITY"].set_value(f"{pdr:.0f} %")
             self.cards["LINK QUALITY"].set_status(
