@@ -80,18 +80,23 @@ day someone inserts a field and forgets the padding.
 
 ### Link speed
 
-**The inter-MCU links run at 460800, not 115200.** They are short PCB traces, so the higher
+**The inter-MCU links run at 921600, not 115200.** They are short PCB traces, so the higher
 rate costs nothing, and it keeps each stream under a quarter of the link:
 
 ```
-Position→Master   nav state @240 Hz + status : 33.1 %
-Master→Navigation nav state @240 Hz          : 30.2 %
-Navigation→Master actuator @200 Hz + status  : 20.6 %
+Position→Master   nav state @240 Hz + status : 26.1 %
+Master→Navigation nav state @240 Hz          : 24.5 %
+Navigation→Master actuator @200 Hz + status  : 10.3 %
 ```
 
-At 115200 the same traffic sits near 80 %, and every field added after that comes out of
-control latency. Two `#define`s at the top of `ariadna_link.h` change it back if you want
-115200; `make link` prints the resulting budget.
+It was 460800 until `nav_state` grew to carry the attitude quaternion, local position and
+world-frame acceleration. At 88 bytes that stream costs 49 % of a 460800 link, in each
+direction, on two links — enough that one burst of status traffic starts delaying a control
+packet. Doubling the rate put it back where the design wants it. The RP2350's UART divisor
+hits 921600 exactly at the default 150 MHz clock, so nothing is being rounded.
+
+At 115200 this traffic does not fit at all. One `#define` at the top of `ariadna_link.h`
+changes the rate; `make link` prints the resulting budget and fails past half the link.
 
 Debug consoles on the three flight boards are 115200, as is the ground station's USB link
 to the laptop. Note that the flight boards' `Serial` is **native USB CDC, not a UART** — the
@@ -114,13 +119,111 @@ Deliberately faster than the consumer — at equal rates two crystals drift and 
 occasionally finds no new frame. At 1.2 frames per tick, every tick has one. `make link`
 asserts that the producer outruns the consumer.
 
-To pay for 240 Hz the packet was cut from 84 to 52 bytes: attitude in degrees, latitude,
-longitude, GPS altitude and temperature moved to `POS_STATUS` at 20 Hz. That halves the
-cost of the highest-rate thing on the link — and it crosses the link *twice*, Position to
-Master and Master to Navigation. Nothing was lost: every field that moved is telemetry,
-GPS updates at 10 Hz at best, and a navball redrawn at 20 Hz looks identical to one
-redrawn at 240 Hz. **Before adding a field to `nav_state`, ask whether a control law reads
-it.**
+#### What it carries
+
+| field | | |
+|---|---|---|
+| `px py pz` | m | position in pad-ENU. `pz` is height above the pad |
+| `vx vy vz` | m/s | velocity, same frame, `vz` positive up |
+| `ax ay az` | m/s² | acceleration, same frame, **gravity and estimated bias removed** |
+| `qw qx qy qz` | — | body→pad attitude quaternion, normalised |
+| `ux uy uz` | — | thrust-axis unit vector, pad-ENU |
+| `wx wy wz` | rad/s | raw gyro rotated into pad-ENU |
+| `accel_mag` | g | \|a\| including gravity — how the Navigation MCU knows the motor lit |
+
+88 bytes. Attitude in degrees, latitude, longitude, GPS altitude, temperature and the
+filter's own accuracy estimates live in `POS_STATUS` at 20 Hz instead, because no control
+law reads them and this packet crosses the link *twice*, Position to Master and Master to
+Navigation. **Before adding a field to `nav_state`, ask whether a control law reads it.**
+
+Attitude travels twice, as both `q` and `u`, and that is deliberate. `u` is just `q`
+applied to the body thrust axis — but it is what the 200 Hz control path consumes, so
+carrying it saves that loop a quaternion rotation every tick. Both are derived from the
+same rotation in the same step, so they cannot drift apart; `make est` and the boot
+self-test both check it.
+
+### The estimator
+
+Three 3-state Kalman filters, one per pad-ENU axis, each holding **position, velocity and
+accelerometer bias**. Corrected by the barometer (vertical), GPS position and velocity
+(horizontal), and zero-velocity updates on the pad.
+
+Three filters rather than one 9-state filter is an **exact factorisation, not an
+approximation**: attitude is supplied externally by the fusion library, so the system matrix
+is block diagonal per axis, the process noise is diagonal, and every measurement touches
+exactly one axis. A block-diagonal covariance stays block diagonal forever. Every
+measurement is scalar and observes one state directly, so H is a unit row and the update
+collapses to a handful of multiply-adds — **there is no matrix inversion anywhere in the
+navigation code.** `make est` pins the independence property so a future "optimisation"
+that shares state between axes fails on a workstation.
+
+#### What it replaced, and why
+
+A third-order complementary filter on the vertical channel, plus dead reckoning with a
+fixed 0.15 gain toward GPS velocity and a 20 s leak toward zero on the horizontal. Four
+things it could not do:
+
+1. **It had no horizontal position state at all.** Not a tuning weakness — the state did
+   not exist, so the `px`/`py` this packet now carries could not have come from it.
+2. **Fixed gains cannot weight a measurement by how good it is.** GPS horizontal accuracy
+   swings by an order of magnitude with HDOP and satellite count; one gain is right at one
+   HDOP and wrong at every other. A Kalman gain is recomputed from the measurement's
+   variance every time, which is the entire reason to pay for the covariance.
+3. **No outlier rejection**, so one multipath fix went straight into the state. There is
+   now a 4σ innovation gate, with a re-anchoring escape hatch for when the *filter*, not
+   the sensor, is the thing that is wrong.
+4. **The leak toward zero was a documented lie**, and it biased velocity low by roughly
+   40 % over a ten-second descent — the one horizontal quantity the guidance law flies.
+
+What was kept: pad-referenced barometry (the ratio form, so pad temperature and absolute
+pressure both cancel), a bias state, and dropping trust in the barometer during the burn.
+
+#### The plume is an R, not a bandwidth
+
+The landing motor's plume raises static pressure around the airframe, so the barometer reads
+*low* — it thinks the vehicle is higher than it is, exactly when altitude matters most. The
+old filter dropped its barometer bandwidth during the burn. This one inflates the
+barometer's measurement variance instead.
+
+Same intent, better mechanism. Inflating R states the thing that is actually true — *this
+measurement is now bad* — and lets the filter work out the consequences, including how much
+to trust the altitude it already has. Lowering a bandwidth asserts the answer rather than
+the evidence, and does nothing to stop a plume-corrupted sample being gated in as good.
+
+#### ZUPT is pre-launch only, and that is a safety property
+
+Standing still is the only condition under which accelerometer bias is *directly
+observable*, so the minutes on the pad are where the bias states are actually learned. With
+only position measurements, a constant bias and a slowly growing velocity explain a position
+error almost equally well — the same convergence takes over two minutes instead of twenty
+seconds.
+
+It is also the most dangerous thing in the filter, which is why it is gated on the Master's
+mission state and not on the motion test alone:
+
+> ⚠️ A vehicle in steady-state descent at terminal velocity — drag balancing weight — reads
+> **exactly 1 g with a quiet gyro.** That is indistinguishable from sitting on the pad by
+> any test this board can make from its own sensors. A ZUPT there would pin velocity to
+> zero during the descent; the guidance law divides by vertical speed, so it would compute
+> an infinite time-to-go and never light the motor.
+
+With no Master state heard from, the answer is no.
+
+#### Losing GPS
+
+The horizontal channel dead reckons, and its covariance grows honestly — `sigma_pos_h` in
+`POS_STATUS` is the filter's real confidence, and `quality` in `nav_state` is derived from
+it rather than counted up from boot as it used to be.
+
+A **weak speed prior** (σ = 50 m/s, applied at 1 Hz while GPS is stale) replaces the old
+leak. Because it goes in as a measurement, the Kalman gain decides how much notice to take:
+converged, K ≈ 1/2500 and a real 12 m/s survives ten seconds of it essentially untouched;
+after a long outage, K approaches ½ and it holds the estimate inside the envelope. Silent
+when the filter knows what it is doing, firm when it does not.
+
+The failure it prevents is not subtle. An unbounded horizontal velocity eventually exceeds
+the Navigation MCU's sanity limits, at which point that board rejects the **whole**
+`nav_state` — throwing away a perfectly good altitude and attitude and parking the TVC.
 
 #### Predict at 240 Hz, correct at 50 Hz
 
@@ -131,12 +234,11 @@ build uses for its altitude noise floor.
 That distinction matters. Applying the correction on every predict step would feed the same
 measurement in roughly five times, multiplying the effective gain by five and moving the
 filter's crossover well above the bandwidth it was tuned for. It would still converge — it
-would just be a different filter than `BARO_W_NOMINAL` claims. The correction also
-integrates over the interval since the *last correction*, not over one prediction step.
+would just be a filter that is roughly √5 more confident in its altitude than the sensor
+justifies — and one that then quietly rejects the GPS corrections that disagree with it.
 
-Sampling the barometer faster would not help: the vertical filter believes it below about
-0.3 Hz and the accelerometer above, so 50 Hz is already more than a hundred times
-oversampled for the job. A quieter sample at 50 Hz beats a noisier one at 240 Hz here.
+Sampling the barometer faster would not help: a quieter sample at 50 Hz beats a noisier one
+at 240 Hz here, and the filter weights it by its variance either way.
 
 ### DMA, and where it is deliberately absent
 
@@ -144,17 +246,17 @@ The processor is not short of cycles. CRC and frame parsing together cost about 
 core** at full traffic — measured, not assumed, and printed by `make link`.
 
 What *was* expensive is different: the UART's hardware transmit FIFO is 32 bytes, and a byte
-takes 21.7 µs at 460800 baud. A frame longer than the FIFO cannot be handed over in one go.
+takes 10.9 µs at 921600 baud. A frame longer than the FIFO cannot be handed over in one go.
 
 | | bytes past the FIFO | per frame | duty |
 |---|---|---|---|
-| Master forwards `nav_state` @240 Hz | 26 | 564 µs | **13.5 %** of a core |
-| Position sends `nav_state` @240 Hz | 26 | 564 µs | **13.5 %** of a core |
-| Navigation sends `actuator` @200 Hz | 10 | 217 µs | **4.3 %** of a core |
+| Master forwards `nav_state` @240 Hz | 62 | 673 µs | **16.2 %** of a core |
+| Position sends `nav_state` @240 Hz | 62 | 673 µs | **16.2 %** of a core |
+| Navigation sends `actuator` @200 Hz | 10 | 109 µs | **2.2 %** of a core |
 
 A blocking write spends that time spinning. Worse than the wasted cycles, on the Master
-those 1.26 ms land *inside the forwarding path* — forwarding the frame before parsing it
-saves microseconds, and then blocking on the FIFO gives back a millisecond.
+those 673 µs land *inside the forwarding path* — forwarding the frame before parsing it
+saves microseconds, and then blocking on the FIFO gives it all back.
 
 So transmit goes through a ring drained by DMA. Queuing a frame is a memcpy; the processor
 never waits for the wire. One channel per port, four in the vehicle.
@@ -230,8 +332,8 @@ radio on SPI1, so the split is clean.
 Pad-local ENU: **+x East, +y North, +z Up**. `vz` is positive up, so it is negative for the
 whole descent — the same sign the guidance module uses.
 
-Attitude travels as the **thrust-axis unit vector**, not Euler angles: `u` is the direction
-the landing motor accelerates the vehicle. Standing on the pad, `u = (0,0,-1)`; in a
+Attitude travels as a **quaternion** and as the **thrust-axis unit vector**, never as Euler
+angles in the control path. `u` is the direction the landing motor accelerates the vehicle. Standing on the pad, `u = (0,0,-1)`; in a
 perfect nose-first descent, `u = (0,0,+1)`. Defining it this way makes the guidance tilt
 angle simply the angle between `u` and vertical, with no sign gymnastics and no singularity
 where an Euler yaw would have one.
@@ -249,13 +351,14 @@ This matters more than anything else in this README.
 | | how |
 |---|---|
 | **guidance algorithm** | 108 numerical checks against the Monte-Carlo simulation. Unchanged from V1. |
-| **link codec** | 107 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring. |
+| **link codec** | 110 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
+| **navigation filter** | 29 checks: `make est`. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
 | **DMA channel setup** | ⚠️ **not testable off-target.** The ring it drives is tested; the channel configuration is not. |
 | **3D→planar bridge** | ⚠️ **new code, no golden vectors.** Boot self-test checks the arithmetic. Only a bench checks the conventions. |
-| **state estimator** | ⚠️ **not verified.** Boot self-test checks filter convergence and the barometric conversion. |
+| **estimator wiring** | ⚠️ **partly verified.** The filter arithmetic is covered by `make est`; how the sketch feeds it — sensor axes, GPS parsing, the pad reference — is not. Boot self-test checks convergence, the barometric conversion, the innovation gate and quaternion/matrix agreement. |
 | **body→pad rotation** | ⚠️ **not verified.** Three conventions have to agree and only one is ours. |
 | **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. Build them in Arduino IDE. |
 
@@ -283,7 +386,8 @@ rotate the attitude reference underneath a closed loop that assumes it is fixed)
 ```
 cd ../test
 make          # 108 guidance checks against the simulation
-make link     # 107 link codec checks, the transmit ring, and the link budget
+make est      # 29 navigation filter checks
+make link     # 110 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled
@@ -307,9 +411,16 @@ Arduino IDE 2, board package **arduino-pico** (earlephilhower).
 | `Navigation_MCU/navigation_mcu.ino` | Seeed XIAO RP2350 | none |
 | `Ground_Station/ground_station.ino` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
 
-The sketches reach the shared header by relative path (`#include "../common/ariadna_link.h"`).
+The sketches reach the shared headers by relative path (`#include "../common/ariadna_link.h"`).
 Arduino IDE 2 resolves quoted includes relative to the including file, so one copy serves all
 four. Keep the directory layout as it is.
+
+`common/` holds three headers, and the split is deliberate: `ariadna_link.h` is the wire
+format, `ariadna_uart_dma.h` is the only part with a hardware dependency, and
+`ariadna_kf.h` is the navigation filter — kept out of `position_mcu.ino` for the same reason
+`guidance.cpp` is kept out of the Navigation MCU's sketch. Anything inside a `.ino` can only
+be tested by flashing a board, and the Position MCU sketch cannot be host-compiled at all
+because it pulls in TriSense. The filter can, and is: `make est`.
 
 Visualiser:
 

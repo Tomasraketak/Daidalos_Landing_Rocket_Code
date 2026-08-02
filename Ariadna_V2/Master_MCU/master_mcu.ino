@@ -538,11 +538,17 @@ static uint32_t flash_find_append(void)
  *
  * Deliberately larger than the downlink packet: this is the only complete
  * record of the flight, and flash is the one resource that is not scarce.
- * 88 bytes at 50 Hz is 4.4 kB/s, so a 16 MB chip holds about an hour.
+ * 96 bytes at 50 Hz is 4.8 kB/s, so a 16 MB chip holds about an hour.
+ *
+ * px/py are logged even though no control law reads them, because the
+ * question this log exists to answer after a flight — "where did it
+ * actually go?" — is a horizontal one, and the downlink's 1e-7 degree
+ * lat/lon is a clumsy way to ask it. Metres from the pad plot directly.
  */
 #pragma pack(push, 1)
 struct LogRecord {
     uint32_t t_ms;
+    float    px, py;
     float    h, vx, vy, vz;
     float    ux, uy, uz;
     float    roll, pitch, yaw;
@@ -555,7 +561,7 @@ struct LogRecord {
     uint8_t  reserved[6];      // room for fields you will want later
 };
 #pragma pack(pop)
-ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 88, "LogRecord layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
 
 // RAM ring, drained to flash by core 1.
 //
@@ -637,8 +643,8 @@ static void annunciate(void)
 // DMA-fed transmit, one channel per port.
 //
 // This is the single biggest processor saving in the vehicle. Forwarding a
-// 90-byte nav_state means 58 bytes past the UART's 32-byte FIFO, which a
-// blocking write spins on for 1.26 ms — 12.6 % of this core at 100 Hz, and
+// 94-byte nav_state means 62 bytes past the UART's 32-byte FIFO, which a
+// blocking write spins on for 673 us — 16.2 % of this core at 240 Hz, and
 // worse, it lands inside the forwarding path below. Forwarding the frame
 // before parsing it saves microseconds; blocking on the FIFO immediately
 // afterwards would give back a millisecond.
@@ -769,7 +775,7 @@ static void set_state(uint8_t s)
 {
     if (s == s_state) return;
     MASTER_PRINT("# state %u -> %u at t=%lu h=%.1f vz=%.1f\n",
-                 s_state, s, (unsigned long)millis(), s_nav.h, s_nav.vz);
+                 s_state, s, (unsigned long)millis(), s_nav.pz, s_nav.vz);
     s_state = s;
     s_state_since = millis();
 }
@@ -778,7 +784,7 @@ static void state_machine(void)
 {
     const bool nav_ok  = s_have_nav && link_alive(s_nav_us) &&
                          (s_nav.flags & ARIADNA_NAV_VALID);
-    const bool on_pad  = s_have_nav && fabsf(s_nav.vz) < 2.0f && s_nav.h < 5.0f;
+    const bool on_pad  = s_have_nav && fabsf(s_nav.vz) < 2.0f && s_nav.pz < 5.0f;
     const bool bw_open = digitalRead(PIN_BREAKWIRE) == HIGH;
 
     if (bw_open) s_flags |= ARIADNA_MST_BREAKWIRE;
@@ -821,7 +827,7 @@ static void state_machine(void)
         // known failure and it must not strand the state machine on the
         // pad while the rocket is in the air.
         if (bw_open || (nav_ok && s_nav.accel_mag > 3.0f) ||
-            (nav_ok && s_nav.h > 15.0f)) {
+            (nav_ok && s_nav.pz > 15.0f)) {
             s_t_launch_ms = millis();
             broadcast_cmd(ARIADNA_CMD_ZERO_CLOCK, 0, s_t_launch_ms);
             set_state(ARIADNA_STATE_ASCENT);
@@ -829,7 +835,7 @@ static void state_machine(void)
         break;
 
     case ARIADNA_STATE_ASCENT:
-        if (nav_ok && s_nav.vz < 0.0f && s_nav.h > 20.0f)
+        if (nav_ok && s_nav.vz < 0.0f && s_nav.pz > 20.0f)
             set_state(ARIADNA_STATE_APOGEE);
         break;
 
@@ -843,13 +849,13 @@ static void state_machine(void)
         // itself on the same altitude and picks its own ignition point.
         // This board only reports it — announcing the handover is not the
         // same as commanding it, and nothing here can hurry the burn.
-        if (nav_ok && s_nav.h <= GUIDANCE_ENTRY_M && s_nav.vz < -2.0f)
+        if (nav_ok && s_nav.pz <= GUIDANCE_ENTRY_M && s_nav.vz < -2.0f)
             set_state(ARIADNA_STATE_GUIDANCE);
         break;
 
     case ARIADNA_STATE_GUIDANCE:
         // Down and stopped, or the guidance module says it is finished.
-        if ((nav_ok && s_nav.h < 3.0f && fabsf(s_nav.vz) < 1.5f &&
+        if ((nav_ok && s_nav.pz < 3.0f && fabsf(s_nav.vz) < 1.5f &&
              millis() - s_state_since > 1000) ||
             (s_have_nav_status && s_nav_status.phase == DG_PHASE_DONE))
             set_state(ARIADNA_STATE_LANDED);
@@ -916,7 +922,7 @@ static void build_telemetry(ariadna_tlm_t *t)
     t->lat = s_pos_status.lat;
     t->lon = s_pos_status.lon;
 
-    t->alt_dm  = sat16(s_nav.h * 10.0f);
+    t->alt_dm  = sat16(s_nav.pz * 10.0f);
     t->vz_dms  = sat16(s_nav.vz * 10.0f);
     t->vh_dms  = sat16(sqrtf(s_nav.vx * s_nav.vx + s_nav.vy * s_nav.vy) * 10.0f);
     t->acc_cg  = sat16(s_nav.accel_mag * 100.0f);
@@ -1171,7 +1177,8 @@ void loop()
         LogRecord r;
         memset(&r, 0, sizeof(r));
         r.t_ms  = millis();
-        r.h     = s_nav.h;
+        r.px    = s_nav.px;  r.py = s_nav.py;
+        r.h     = s_nav.pz;
         r.vx    = s_nav.vx;  r.vy = s_nav.vy;  r.vz = s_nav.vz;
         r.ux    = s_nav.ux;  r.uy = s_nav.uy;  r.uz = s_nav.uz;
         // Attitude in degrees and position come from the status packet at
@@ -1206,7 +1213,7 @@ void loop()
         next_print_ms = millis() + 500;
         MASTER_PRINT("st=%u h=%.1f vz=%.1f tvc=%.2f/%.2f clamp=%.2f "
                      "vb=%.2f i=%.2f pos=%lu/%lu nav=%lu/%lu drop=%lu tlm=%lu/%lu\n",
-                     s_state, s_nav.h, s_nav.vz,
+                     s_state, s_nav.pz, s_nav.vz,
                      s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp,
                      s_vbat, s_current,
                      (unsigned long)s_rx_pos.rx_ok,

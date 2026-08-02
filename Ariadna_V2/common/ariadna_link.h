@@ -70,16 +70,29 @@
 // ---------------------------------------------------------------------
 //  Link speeds
 //
-//  The inter-MCU links run at 460800, not 115200. They are 20 mm PCB
+//  The inter-MCU links run at 921600, not 115200. They are 20 mm PCB
 //  traces, so the higher rate is free, and it keeps the 200 Hz actuator
-//  stream and the 100 Hz navigation stream each under a quarter of the
-//  link. At 115200 the same traffic sits near 80 % and any added field
-//  starts costing control latency. Change these two lines to drop back.
+//  stream and the 240 Hz navigation stream each under a quarter of the
+//  link. At 115200 the same traffic sits well past 100 % and the link is
+//  simply not able to carry it. Change this line to drop back.
+//
+//  WHY IT WENT UP FROM 460800. ariadna_nav_state_t grew from 52 to 88
+//  bytes when it started carrying the attitude quaternion, local position
+//  and world-frame acceleration. At 460800 that is 49 % of the link at
+//  240 Hz, in each direction, and it crosses two links — enough that one
+//  burst of status traffic starts delaying a control packet. Doubling the
+//  rate puts it back at 24 %, which is where the design wants it. The
+//  RP2350's UART divisor reaches 921600 exactly at the default 150 MHz
+//  clock, so nothing is being asked for that the hardware has to round.
+//
+//  ../../test/link_test.cpp prints the resulting utilisation and fails
+//  past half the link, so a future field that does not fit shows up on a
+//  workstation rather than as jitter on the pad.
 //
 //  The ground-station USB link stays at 115200 to match the existing
 //  Python tooling.
 // ---------------------------------------------------------------------
-#define ARIADNA_MCU_BAUD    460800UL
+#define ARIADNA_MCU_BAUD    921600UL
 
 // Ground station -> laptop. This one is a real rate on a real link and
 // ground_visualizer.py must open the port at the same number.
@@ -136,12 +149,42 @@ typedef enum {
 //      +y  North
 //      +z  Up
 //
-//  h    metres above the pad, from the barometer referenced at arming.
-//  vz   POSITIVE up. It is NEGATIVE for the whole descent. The guidance
-//       module uses the same sign.
+//  px/py/pz  metres from the pad in that frame. pz is height above the
+//            pad and is what used to travel as the scalar `h`; the
+//            horizontal pair is new, and comes from the GPS-aided
+//            navigation filter rather than from dead reckoning.
+//  vx/vy/vz  m/s in the same frame. vz is POSITIVE up, so it is NEGATIVE
+//            for the whole descent. The guidance module uses that sign.
+//  ax/ay/az  m/s^2 in the same frame, with GRAVITY REMOVED and the
+//            filter's estimated accelerometer bias removed. This is the
+//            specific force the vehicle is actually being accelerated by,
+//            not what the accelerometer read.
 //
-//  Attitude travels as the THRUST-AXIS UNIT VECTOR (ux, uy, uz) expressed
-//  in pad-ENU. Not as Euler angles.
+//  All three vectors are expressed in ONE frame on purpose. Anything that
+//  needs to differentiate or integrate between them — the link-gap dead
+//  reckoner on the Navigation MCU, most obviously — can then do it
+//  without a rotation, and a rotation not performed is a rotation that
+//  cannot be performed with the wrong sign.
+//
+//  ---------------------------------------------------------------------
+//  ATTITUDE TRAVELS TWICE, AND THAT IS DELIBERATE
+//  ---------------------------------------------------------------------
+//  qw/qx/qy/qz is the body-to-pad rotation quaternion, normalised, scalar
+//  part first. It is the complete attitude: no wrap-around, no gimbal
+//  lock, and — unlike the Euler triple in the status packet — usable at
+//  the vertical, which is exactly where this vehicle spends its flight.
+//
+//  ux/uy/uz is the THRUST-AXIS UNIT VECTOR in pad-ENU, which is just
+//  q applied to the body thrust axis. It is redundant with q, and it is
+//  carried anyway because it is what the control path consumes: the
+//  guidance tilt is the angle between u and vertical, so the Navigation
+//  MCU gets it with a dot product instead of a quaternion rotation in the
+//  200 Hz loop. Twelve bytes to keep the control path free of a rotation
+//  it would otherwise repeat every tick.
+//
+//  If they ever disagree, u is the one the flight control law used and q
+//  is the one the log and the navball show. The Position MCU derives both
+//  from the same quaternion in the same step, so they cannot drift.
 //
 //  u is the direction the LANDING MOTOR accelerates the vehicle, i.e. the
 //  vehicle's long axis pointing away from that motor's nozzle. On Daidalos
@@ -189,6 +232,9 @@ typedef enum {
 #define ARIADNA_NAV_LIDAR_OK   (1u << 7)   // FUTURE: TF Luna range valid
 #define ARIADNA_NAV_ACC_SAT    (1u << 8)   // accelerometer clipped this cycle
 #define ARIADNA_NAV_DEADRECK   (1u << 9)   // extrapolated, not measured
+#define ARIADNA_NAV_POS_ORIGIN (1u << 10)  // horizontal origin set: px/py mean m from the pad
+#define ARIADNA_NAV_GPS_AIDED  (1u << 11)  // a GPS fix was accepted recently
+#define ARIADNA_NAV_ZUPT       (1u << 12)  // zero-velocity update active (pre-launch only)
 
 /**
  * Navigation state estimate. The most important packet in the system:
@@ -207,18 +253,27 @@ typedef enum {
  *
  * The reason is arithmetic. This packet is the highest-rate thing on the
  * link, and it crosses the link TWICE — Position to Master, then Master to
- * Navigation. At 240 Hz the old 84-byte version cost 47 % of a 460800 baud
- * link in each direction; the 52-byte version costs 30 %. Nothing was lost:
- * every field that moved is telemetry, GPS updates at 10 Hz at best, and a
- * navball redrawn at 20 Hz looks identical to one redrawn at 240 Hz.
+ * Navigation. Every field here is paid for 240 times a second, twice.
+ *
+ * The 52-byte version of this struct carried a scalar altitude and no
+ * quaternion, because the estimator behind it could not produce a
+ * horizontal position and had no honest world-frame acceleration to
+ * report. It now can, so the packet carries the full state: 88 bytes,
+ * 24 % of a 921600 baud link at 240 Hz. See ARIADNA_MCU_BAUD for why that
+ * number went up rather than the rate coming down.
  *
  * Before adding a field here, ask whether a control law reads it. If not,
- * it belongs in the status packet.
+ * it belongs in ariadna_pos_status_t, which goes out at 20 Hz and which
+ * the Navigation MCU ignores entirely. Attitude in degrees, latitude,
+ * longitude, GPS altitude, temperature and the filter's own accuracy
+ * estimates all live there for exactly that reason.
  */
 typedef struct {
     uint32_t t_ms;        // Position MCU monotonic clock, ms
-    float    h;           // m above pad
+    float    px, py, pz;  // m from the pad, pad-ENU. pz is height above pad.
     float    vx, vy, vz;  // m/s, pad-ENU, vz positive up
+    float    ax, ay, az;  // m/s^2, pad-ENU, gravity AND estimated bias removed
+    float    qw, qx, qy, qz;  // body -> pad rotation quaternion, normalised
     float    ux, uy, uz;  // thrust-axis unit vector, pad-ENU (see conventions)
     float    wx, wy, wz;  // rad/s, RAW GYRO rotated into pad-ENU
     float    accel_mag;   // |a| in g, including gravity. The Navigation MCU
@@ -227,7 +282,7 @@ typedef struct {
     uint8_t  quality;     // 0..255 estimator self-confidence, 255 = best
     uint8_t  _pad;
 } ariadna_nav_state_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 52, "nav_state layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 88, "nav_state layout changed");
 
 // --- ariadna_actuator_t.flags ----------------------------------------
 #define ARIADNA_ACT_VALID      (1u << 0)   // commands are live; else hold
@@ -314,6 +369,14 @@ typedef struct {
     int32_t  lat, lon;       // 1e-7 deg  (V2 raises this from the V1 1e-6)
     float    gps_alt;        // m MSL
     float    temp_c;
+    // The navigation filter's own 1-sigma accuracy, straight off its
+    // covariance diagonal. Not an advertised number: it grows during a GPS
+    // outage and shrinks after a good fix, so watching sigma_pos_h on the
+    // pad console is watching the filter's real confidence. Here rather
+    // than in nav_state because no control law reads it — it is a
+    // diagnostic, and the estimator already folds it into `quality`.
+    float    sigma_pos_h;    // m,   horizontal position
+    float    sigma_vel_h;    // m/s, horizontal velocity
     uint16_t sensor_ok;      // ARIADNA_SENS_* bits
     uint16_t imu_overflow;   // ICM42688P FIFO overflow count
     uint8_t  sats;
@@ -321,7 +384,7 @@ typedef struct {
     uint8_t  hdop_x10;
     uint8_t  cal_state;      // 0 uncal, 1 gyro done, 2 gyro+accel, 3 full
 } ariadna_pos_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 60, "pos_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 68, "pos_status layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
@@ -769,20 +832,20 @@ static inline uint8_t ariadna_rx_byte(ariadna_rx_t *rx, uint8_t b,
 //  ---------------------------------------------------------------------
 //  WHY THIS EXISTS
 //  ---------------------------------------------------------------------
-//  The RP2350's UART has a 32-byte hardware transmit FIFO. At 460800 baud
-//  a byte takes 21.7 us to shift out, so a frame longer than 32 bytes
+//  The RP2350's UART has a 32-byte hardware transmit FIFO. At 921600 baud
+//  a byte takes 10.9 us to shift out, so a frame longer than 32 bytes
 //  cannot be handed over in one go — something has to wait for the rest:
 //
-//      Master forwards a 90-byte nav_state @100 Hz
-//          58 bytes past the FIFO x 21.7 us  =  1.26 ms per frame
-//          at 100 Hz                         =  12.6 % of a core
+//      Master forwards a 94-byte nav_state @240 Hz
+//          62 bytes past the FIFO x 10.9 us  =   673 us per frame
+//          at 240 Hz                         =  16.2 % of a core
 //
 //      Navigation sends a 42-byte actuator @200 Hz
-//          10 bytes past the FIFO            =   217 us per frame
-//          at 200 Hz                         =   4.3 % of a core
+//          10 bytes past the FIFO            =   109 us per frame
+//          at 200 Hz                         =   2.2 % of a core
 //
 //  A blocking write spends that time spinning. Worse than the wasted
-//  cycles, on the Master those 1.26 ms land INSIDE the forwarding path —
+//  cycles, on the Master those 673 us land INSIDE the forwarding path —
 //  the one place in the vehicle where latency was deliberately minimised.
 //  Forwarding the frame before parsing it saves microseconds; blocking on
 //  the FIFO immediately afterwards gives back a millisecond.
