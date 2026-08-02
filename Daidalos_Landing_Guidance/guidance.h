@@ -14,6 +14,19 @@
 //  nose-first descent. A thrust-diverting clamp cuts axial thrust without
 //  net side force. Clamped impulse is WASTED and the ~1.7 s burn cannot
 //  be extended.
+//
+//  THREE DIMENSIONS, TWO GIMBAL AXES. The nozzle deflects about two
+//  perpendicular axes. The third rotational degree of freedom -- roll
+//  about the body's own long axis -- is not actuated and is assumed to
+//  stay at zero. That assumption is self-consistent rather than
+//  optimistic: every torque in this model is perpendicular to the body
+//  axis, so a vehicle with no roll rate never acquires one, and two axes
+//  are then enough for the whole attitude problem.
+//
+//  If your airframe DOES roll -- a canted fin, spin left over from ascent
+//  -- this code cannot correct it, and worse, the two servo axes will
+//  smear across each other as the body turns underneath them. Check that
+//  before flying.
 // =====================================================================
 #ifndef DAIDALOS_GUIDANCE_H
 #define DAIDALOS_GUIDANCE_H
@@ -76,25 +89,40 @@ typedef enum {
 } dg_phase_t;
 
 // Navigation solution, supplied by the fusion processor.
-// Frame: h up, x horizontal. vz is NEGATIVE while descending.
-// theta is the vehicle attitude measured from vertical toward +x, radians.
+// Frame: WORLD, z up, x and y horizontal, origin at the pad.
+// vz is NEGATIVE while descending.
+//
+// Attitude is the body-axis UNIT VECTOR b -- the direction thrust pushes the
+// vehicle, i.e. the tail-to-nose axis reversed, pointing roughly up during the
+// descent. Not Euler angles: a unit vector has no convention to get backwards,
+// no wrap and no gimbal lock, and it is what the control law consumes directly.
+// A fusion filter carrying a quaternion produces it in one rotation:
+//     b = R(q) * (body axis expressed in body coordinates)
+//
+// w is the angular velocity in the SAME world frame, from the gyro, rotated out
+// of body coordinates by the same R(q). Its component along b is the roll rate,
+// which this vehicle cannot control; the guidance projects it out.
 typedef struct {
-    float h;        // m above the pad
-    float vx;       // m/s, inertial
-    float vz;       // m/s, inertial, negative descending
-    float theta;    // rad, from vertical
-    float omega;    // rad/s, pitch rate (use the GYRO, not a differenced angle)
-    float t;        // s, monotonic since power-up
-    bool  valid;    // false blocks ignition and freezes the servo at zero
+    float h;            // m above the pad
+    float vx, vy;       // m/s, world horizontal
+    float vz;           // m/s, negative descending
+    float bx, by, bz;   // body-axis unit vector, world frame
+    float wx, wy, wz;   // rad/s, world frame (use the GYRO, not a differenced angle)
+    float t;            // s, monotonic since power-up
+    bool  valid;        // false blocks ignition and freezes the servos at zero
 } dg_nav_t;
 
 typedef struct {
-    float servo_deg;    // TVC servo command, clamped to +/-DG_SERVO_MAX_DEG
+    // Two servos. Axis 1 deflects the nozzle in the vertical plane containing
+    // world +x, axis 2 in the plane containing world +y. With no roll those are
+    // fixed directions in the airframe, which is what makes the mapping constant.
+    float servo1_deg;   // TVC servo, x channel, clamped to +/-DG_SERVO_MAX_DEG
+    float servo2_deg;   // TVC servo, y channel
     float clamp;        // axial thrust fraction command, DG_CLAMP_MIN..MAX
     bool  ignite;       // rising edge: fire the igniter
     // telemetry
-    float theta_cmd;    // rad
-    float theta_err;    // rad
+    float tilt_cmd;     // rad, commanded tilt from vertical
+    float tilt_err;     // rad, total angle between commanded and actual body axis
     float thrust_est;   // N
     float p_plan;       // current throttle-plan parameter, 0..4
     dg_phase_t phase;
@@ -123,13 +151,30 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out);
 void dg_step_planner(const dg_nav_t *nav);
 
 // Introspection, for the host test and for telemetry.
+//
+// NOTE ON THE `vx` ARGUMENTS BELOW. The guidance law and the whole trajectory
+// projection are PLANAR even though the vehicle flies in 3-D, and `vx` is the
+// horizontal SPEED. This is exact, not a simplification: every horizontal
+// acceleration these functions apply (the -v/t_go term and drag) is anti-parallel
+// to the horizontal velocity, so its direction never changes and the problem lives
+// in the vertical plane containing it. The 3-D command is that planar solution
+// rotated into the velocity's azimuth -- which dg_guidance_dir does, and which
+// costs one square root. The expensive part, the planner, is untouched by the
+// second axis.
 float dg_h_ignite(void);          // commanded ignition altitude, m
 float dg_thrust_ref(float tau);   // un-clamped thrust at burn fraction tau, N
 float dg_guidance_tilt(float h, float vx, float vz, float mass,
-                       float *sin_th, float *cos_th);   // returns t_go
+                       float *sin_th, float *cos_th);   // planar; returns t_go
+float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
+                      float *ux, float *uy, float *uz); // 3-D; returns t_go
 float dg_project_miss(float h, float vx, float vz, float tau,
                       float mass, float clamp_now, float p);
 float dg_solve_p_full(float h, float vx, float vz, float tau,
                       float mass, float clamp_now);     // non-amortised, for test
+
+// Orthonormal basis of the plane perpendicular to b: the two gimbal axes.
+void  dg_gimbal_basis(float bx, float by, float bz,
+                      float *u1x, float *u1y, float *u1z,
+                      float *u2x, float *u2y, float *u2z);
 
 #endif // DAIDALOS_GUIDANCE_H

@@ -102,7 +102,90 @@ int main(void)
     }
 
     // -----------------------------------------------------------------
-    printf("\n5. Structural invariants\n");
+    printf("\n5. Three dimensions: the second gimbal axis\n");
+    printf("   (The guidance law and the whole projection stay PLANAR: every\n");
+    printf("    horizontal term is parallel to the horizontal velocity, so the\n");
+    printf("    3-D command is the planar one rotated into its azimuth.)\n");
+    {
+        // 5a. the 3-D law reduces exactly to the planar one it is built from
+        float worst = 0.0f;
+        for (int i = 0; i < N_TILT; i++) {
+            float h = G_TILT[i][0], vx = G_TILT[i][1], vz = G_TILT[i][2];
+            float sn, cs, ux, uy, uz;
+            dg_guidance_tilt(h, vx, vz, 3.0f, &sn, &cs);
+            dg_guidance_dir(h, vx, 0.0f, vz, 3.0f, &ux, &uy, &uz);
+            float d = fmaxf(fabsf(ux - sn), fmaxf(fabsf(uy), fabsf(uz - cs)));
+            if (d > worst) worst = d;
+        }
+        check("3-D law reduces to the planar law (y = 0)", worst, 0.0f, 1e-6f);
+
+        // 5b. rotating the horizontal velocity rotates the command with it
+        float worst_iso = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            float az = (float)i * 0.0981748f;      // 2*pi/64
+            float vh = 7.0f, vz = -38.0f, h = 26.0f;
+            float sn, cs, ux, uy, uz;
+            dg_guidance_tilt(h, vh, vz, 3.0f, &sn, &cs);
+            dg_guidance_dir(h, vh * cosf(az), vh * sinf(az), vz, 3.0f, &ux, &uy, &uz);
+            float d = fmaxf(fabsf(ux - sn * cosf(az)),
+                     fmaxf(fabsf(uy - sn * sinf(az)), fabsf(uz - cs)));
+            if (d > worst_iso) worst_iso = d;
+        }
+        check("command is isotropic in azimuth", worst_iso, 0.0f, 1e-5f);
+
+        // 5c. gimbal basis: orthonormal and perpendicular to the body axis
+        float worst_on = 0.0f, worst_perp = 0.0f;
+        for (int i = 0; i < 400; i++) {
+            float a = (float)i * 0.0157f, t = 0.03f + 0.002f * (float)i;
+            float bx = sinf(t) * cosf(a), by = sinf(t) * sinf(a), bz = cosf(t);
+            float u1x, u1y, u1z, u2x, u2y, u2z;
+            dg_gimbal_basis(bx, by, bz, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+            float d1 = sqrtf(u1x*u1x + u1y*u1y + u1z*u1z) - 1.0f;
+            float d2 = sqrtf(u2x*u2x + u2y*u2y + u2z*u2z) - 1.0f;
+            float od = u1x*u2x + u1y*u2y + u1z*u2z;
+            worst_on = fmaxf(worst_on, fmaxf(fabsf(d1), fmaxf(fabsf(d2), fabsf(od))));
+            worst_perp = fmaxf(worst_perp,
+                               fmaxf(fabsf(u1x*bx + u1y*by + u1z*bz),
+                                     fabsf(u2x*bx + u2y*by + u2z*bz)));
+        }
+        check("gimbal basis is orthonormal", worst_on, 0.0f, 1e-5f);
+        check("gimbal basis is perpendicular to b", worst_perp, 0.0f, 1e-6f);
+
+        // 5d. a tilt purely toward +y must leave axis 1 on the world x axis,
+        //     which is what makes the two servos independent channels
+        float u1x, u1y, u1z, u2x, u2y, u2z;
+        dg_gimbal_basis(0.0f, sinf(0.3f), cosf(0.3f),
+                        &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+        check("tilt in +y leaves gimbal axis 1 on world x", u1x, 1.0f, 1e-6f);
+        check("  ...with no y component", u1y, 0.0f, 1e-6f);
+
+        // 5e. dynamic inversion round trip: s = (b x tau)/(L*T) must give back tau
+        float worst_inv = 0.0f;
+        for (int i = 0; i < 400; i++) {
+            float a = (float)i * 0.0157f, t = 0.05f + 0.001f * (float)i;
+            float bx = sinf(t) * cosf(a), by = sinf(t) * sinf(a), bz = cosf(t);
+            // any torque perpendicular to b
+            float tx = cosf(a * 2.0f), ty = sinf(a * 3.0f), tz = 0.4f;
+            float d = tx*bx + ty*by + tz*bz;
+            tx -= d*bx; ty -= d*by; tz -= d*bz;
+            float T = 60.0f + (float)i * 0.4f;
+            float k = 1.0f / (T * DG_L_GIMBAL);
+            float sx = (by*tz - bz*ty) * k;
+            float sy = (bz*tx - bx*tz) * k;
+            float sz = (bx*ty - by*tx) * k;
+            // what the nozzle then produces: tau = -L*T*(b x s)
+            float gx = -DG_L_GIMBAL * T * (by*sz - bz*sy);
+            float gy = -DG_L_GIMBAL * T * (bz*sx - bx*sz);
+            float gz = -DG_L_GIMBAL * T * (bx*sy - by*sx);
+            float e = sqrtf((gx-tx)*(gx-tx) + (gy-ty)*(gy-ty) + (gz-tz)*(gz-tz));
+            float n = sqrtf(tx*tx + ty*ty + tz*tz);
+            if (n > 1e-6f && e / n > worst_inv) worst_inv = e / n;
+        }
+        check("dynamic inversion is exact, not linearised", worst_inv, 0.0f, 1e-4f);
+    }
+
+    // -----------------------------------------------------------------
+    printf("\n6. Structural invariants\n");
     dg_init();
     checks++;
     if (dg_thrust_ref(-0.1f) != 0.0f || dg_thrust_ref(1.5f) != 0.0f) {
@@ -121,16 +204,35 @@ int main(void)
     if (!mono) { failures++; printf("  [FAIL] miss(p) is not monotone — the root find is invalid\n"); }
     else printf("  [PASS] miss(p) monotone increasing (root find well posed)\n");
 
-    // the amortised solver must reach the same answer as the direct one
+    // Hold the vehicle at a fixed state at the ignition altitude, run the loop
+    // through ignition and into the burn, and check what it commands.
+    //
+    // nav.t MUST advance here. Ignition is triggered on altitude but the motor is
+    // only declared lit one mean igniter delay later, on the clock, so a test that
+    // holds the clock still never leaves the coast — and every servo check below
+    // would then pass on a parked actuator.
     dg_init();
     dg_arm(6.0f, -40.0f);
-    // Hold the vehicle at a fixed state at the ignition altitude and let the
-    // amortised solver converge. 30 ticks is 150 ms — one and a half replan
-    // periods — and must be enough for a solve that costs ~8 projections.
-    dg_nav_t nav = {18.7f, 6.0f, -45.0f, -0.10f, 0.0f, 10.0f, true};
+    // The body axis is tilted 0.15 rad the WRONG way — toward +x, while the
+    // guidance wants a tilt toward -x to kill the +6 m/s drift. That leaves a real
+    // error for the loop to work on. Crossrange is deliberately zero.
+    dg_nav_t nav = {18.7f, 6.0f, 0.0f, -45.0f,
+                    0.1494381f, 0.0f, 0.9887711f,
+                    0.0f, 0.0f, 0.0f, 10.0f, true};
     dg_out_t out;
-    for (int i = 0; i < 40; i++) { dg_step_attitude(&nav, &out); dg_step_planner(&nav); }
-    float tau_now = 40.0f * DG_CTRL_DT / DG_BURN_T;
+    const int N_TICK = 160;                      // 0.8 s: 0.2 s to light, 0.6 s burning
+    for (int i = 0; i < N_TICK; i++) {
+        dg_step_attitude(&nav, &out);
+        dg_step_planner(&nav);
+        nav.t += DG_CTRL_DT;
+    }
+    checks++;
+    if (out.phase != DG_PHASE_BURN) {
+        failures++; printf("  [FAIL] never reached the burn phase (phase %d)\n", (int)out.phase);
+    } else printf("  [PASS] reached the burn phase, thrust estimate %.1f N\n", out.thrust_est);
+
+    float t_lit = 0.5f * (DG_IGN_DELAY_LO + DG_IGN_DELAY_HI);
+    float tau_now = ((float)N_TICK * DG_CTRL_DT - t_lit) / DG_BURN_T;
     float direct = dg_solve_p_full(nav.h, nav.vx, nav.vz, tau_now, 3.0f, out.clamp);
     checks++;
     if (out.p_plan < 0.0f || out.p_plan > 4.0f) {
@@ -144,13 +246,67 @@ int main(void)
                out.p_plan, direct);
     }
 
-    // servo must stay inside travel and quantisation
+    // both servos must stay inside travel and on the quantisation grid
+    // and it must actually be doing something, or the checks below prove nothing
     checks++;
-    bool servo_ok = fabsf(out.servo_deg) <= DG_SERVO_MAX_DEG + 1e-4f;
-    float q = out.servo_deg / DG_SERVO_QUANT;
-    servo_ok = servo_ok && fabsf(q - roundf(q)) < 1e-3f;
-    if (!servo_ok) { failures++; printf("  [FAIL] servo %.4f violates travel or quantisation\n", out.servo_deg); }
-    else printf("  [PASS] servo %.3f deg within travel and on the quantisation grid\n", out.servo_deg);
+    if (fabsf(out.servo1_deg) < 0.5f) {
+        failures++;
+        printf("  [FAIL] servo 1 idle at %.3f deg with a 0.15 rad attitude error\n",
+               out.servo1_deg);
+    } else {
+        printf("  [PASS] servo 1 working: %.3f deg against the attitude error\n",
+               out.servo1_deg);
+    }
+
+    checks++;
+    bool servo_ok = true;
+    const float sv[2] = { out.servo1_deg, out.servo2_deg };
+    for (int i = 0; i < 2; i++) {
+        float q = sv[i] / DG_SERVO_QUANT;
+        servo_ok = servo_ok && fabsf(sv[i]) <= DG_SERVO_MAX_DEG + 1e-4f
+                            && fabsf(q - roundf(q)) < 1e-3f;
+    }
+    if (!servo_ok) {
+        failures++;
+        printf("  [FAIL] servos %.4f / %.4f violate travel or quantisation\n",
+               out.servo1_deg, out.servo2_deg);
+    } else {
+        printf("  [PASS] servos %.3f / %.3f deg within travel and on the grid\n",
+               out.servo1_deg, out.servo2_deg);
+    }
+
+    // the y channel must stay quiet when nothing asks it to move: this flight has
+    // no crossrange velocity and no crossrange tilt, so servo 2 has no work to do
+    checks++;
+    if (fabsf(out.servo2_deg) > DG_SERVO_QUANT + 1e-4f) {
+        failures++;
+        printf("  [FAIL] y channel moved %.3f deg with no y-axis demand\n", out.servo2_deg);
+    } else {
+        printf("  [PASS] y channel quiet (%.3f deg) with no crossrange demand\n",
+               out.servo2_deg);
+    }
+
+    // a roll rate must be ignored, not turned into a deflection
+    {
+        dg_nav_t spun = nav;
+        spun.wx = nav.bx * 3.0f;      // 3 rad/s purely about the body axis
+        spun.wy = nav.by * 3.0f;
+        spun.wz = nav.bz * 3.0f;
+        dg_out_t o2;
+        dg_step_attitude(&spun, &o2);
+        dg_nav_t still = nav;
+        dg_out_t o3;
+        dg_step_attitude(&still, &o3);
+        checks++;
+        float d = fmaxf(fabsf(o2.servo1_deg - o3.servo1_deg),
+                        fabsf(o2.servo2_deg - o3.servo2_deg));
+        if (d > DG_SERVO_QUANT + 1e-4f) {
+            failures++;
+            printf("  [FAIL] a pure roll rate changed the servos by %.3f deg\n", d);
+        } else {
+            printf("  [PASS] a pure roll rate is projected out (%.3f deg change)\n", d);
+        }
+    }
 
     // clamp must stay inside its range
     checks++;
@@ -162,18 +318,23 @@ int main(void)
     // before ignition the servo must be parked: no thrust means no authority
     dg_init();
     dg_arm(6.0f, -40.0f);
-    dg_nav_t coast = {70.0f, 6.0f, -42.0f, 0.25f, 0.4f, 1.0f, true};
+    dg_nav_t coast = {70.0f, 6.0f, 2.0f, -42.0f,
+                      0.2474040f, 0.0616284f, 0.9669876f,
+                      0.1f, 0.4f, 0.0f, 1.0f, true};
     dg_step_attitude(&coast, &out);
     checks++;
-    if (out.servo_deg != 0.0f) {
-        failures++; printf("  [FAIL] servo commanded %.3f deg during the coast\n", out.servo_deg);
-    } else printf("  [PASS] servo parked during the coast (gimbal has no authority)\n");
+    if (out.servo1_deg != 0.0f || out.servo2_deg != 0.0f) {
+        failures++;
+        printf("  [FAIL] servos commanded %.3f / %.3f deg during the coast\n",
+               out.servo1_deg, out.servo2_deg);
+    } else printf("  [PASS] both servos parked during the coast (no authority)\n");
 
     // invalid nav must not command anything
-    dg_nav_t bad = {20.0f, 6.0f, -40.0f, 0.1f, 0.0f, 12.0f, false};
+    dg_nav_t bad = {20.0f, 6.0f, 1.0f, -40.0f, 0.1f, 0.0f, 0.995f,
+                    0.0f, 0.0f, 0.0f, 12.0f, false};
     dg_step_attitude(&bad, &out);
     checks++;
-    if (out.servo_deg != 0.0f || out.ignite) {
+    if (out.servo1_deg != 0.0f || out.servo2_deg != 0.0f || out.ignite) {
         failures++; printf("  [FAIL] invalid nav still produced commands\n");
     } else printf("  [PASS] invalid nav produces no servo motion and no ignition\n");
 

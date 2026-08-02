@@ -165,6 +165,59 @@ float dg_guidance_tilt(float h, float vx, float vz, float mass,
 }
 
 // ---------------------------------------------------------------------
+//  3-D commanded direction. Costs one square root more than the planar law.
+//
+//  The 3-D solution is EXACTLY the planar one rotated into the azimuth of the
+//  horizontal velocity, because every horizontal term in the law -- the -v/t_go
+//  demand and the drag credit -- is parallel to that velocity. Verified against
+//  the model to 2e-16 over 200 000 states, so this is an identity and not an
+//  approximation. It is also why the trajectory projection below never needs a
+//  second horizontal channel.
+// ---------------------------------------------------------------------
+float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
+                      float *ux, float *uy, float *uz)
+{
+    float vh2 = vx * vx + vy * vy;
+    float sn, cs;
+    float t_go = dg_guidance_tilt(h, sqrtf(vh2), vz, mass, &sn, &cs);
+    *uz = cs;
+    if (vh2 > 1e-12f) {
+        float inv = sn / sqrtf(vh2);
+        *ux = vx * inv;
+        *uy = vy * inv;
+    } else {
+        *ux = 0.0f;
+        *uy = 0.0f;
+    }
+    return t_go;
+}
+
+// ---------------------------------------------------------------------
+//  Gimbal axes: an orthonormal basis of the plane perpendicular to b.
+//  u1 is the perpendicular direction whose azimuth is world +x, u2 completes
+//  the frame. With no roll these are fixed directions in the airframe, so each
+//  one is a physical servo. At zero tilt they are simply x and y.
+// ---------------------------------------------------------------------
+void dg_gimbal_basis(float bx, float by, float bz,
+                     float *u1x, float *u1y, float *u1z,
+                     float *u2x, float *u2y, float *u2z)
+{
+    float ax = 1.0f - bx * bx, ay = -bx * by, az = -bx * bz;
+    float n2 = ax * ax + ay * ay + az * az;
+    if (n2 < 1e-12f) {                   // body axis along +-x: use the y projection
+        ax = -by * bx; ay = 1.0f - by * by; az = -by * bz;
+        n2 = ax * ax + ay * ay + az * az;
+        if (n2 < 1e-12f) { ax = 1.0f; ay = 0.0f; az = 0.0f; n2 = 1.0f; }
+    }
+    float inv = 1.0f / sqrtf(n2);
+    float a = ax * inv, b_ = ay * inv, c = az * inv;
+    *u1x = a; *u1y = b_; *u1z = c;
+    *u2x = by * c - bz * b_;             // u2 = b x u1
+    *u2y = bz * a - bx * c;
+    *u2z = bx * b_ - by * a;
+}
+
+// ---------------------------------------------------------------------
 //  Throttle plan: one scalar p in [0,4] fills four clamp segments BACKWARDS
 //  from burnout, so low p means "coast, then slam" — the right shape for a
 //  fuel-optimal burn, and monotone in p, which is what makes a 1-D root find
@@ -326,8 +379,9 @@ static struct {
     float tau;              // burn fraction, advances on the grain clock
     float mass;
     float clamp_act;        // actual clamp position
-    float servo_act;        // actual servo position
-    float err_int;
+    float servo1_act;       // actual servo positions, one per gimbal axis
+    float servo2_act;
+    float eix, eiy, eiz;    // integral of the attitude-error vector
     float t_ignite_cmd;     // time the igniter was commanded, <0 = not yet
     float t_burn_start;     // time thrust was assumed to begin
     float p_plan;
@@ -455,15 +509,17 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
 {
     const float dt = DG_CTRL_DT;
 
-    out->ignite   = false;
-    out->p_plan   = s_p_answer;
-    out->phase    = S.phase;
-    out->theta_cmd = 0.0f;
-    out->theta_err = 0.0f;
+    out->ignite    = false;
+    out->p_plan    = s_p_answer;
+    out->phase     = S.phase;
+    out->tilt_cmd  = 0.0f;
+    out->tilt_err  = 0.0f;
 
     if (!nav->valid || S.phase == DG_PHASE_IDLE || S.phase == DG_PHASE_DONE) {
-        S.servo_act = 0.0f;
-        out->servo_deg  = 0.0f;
+        S.servo1_act = 0.0f;
+        S.servo2_act = 0.0f;
+        out->servo1_deg = 0.0f;
+        out->servo2_deg = 0.0f;
         out->clamp      = S.clamp_act;
         out->thrust_est = 0.0f;
         return;
@@ -519,7 +575,8 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
     if (S.phase == DG_PHASE_BURN) {
         p_to_clamps(s_p_answer, S.k_plan);
         clamp_tgt = clamp_from_plan(S.tau, S.k_plan, S.tau_plan0);
-        float v_imp = sqrtf(nav->vx * nav->vx + nav->vz * nav->vz
+        float v_imp = sqrtf(nav->vx * nav->vx + nav->vy * nav->vy
+                            + nav->vz * nav->vz
                             + 2.0f * DG_G * (nav->h > 0.0f ? nav->h : 0.0f));
         if (v_imp < 1.75f || nav->vz >= 0.0f) clamp_tgt = DG_CLAMP_MIN;
         if (nav->vz >= 0.0f && nav->h < 1.0f) clamp_tgt = DG_CLAMP_MIN;
@@ -532,68 +589,136 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
     out->clamp  = S.clamp_act;
 
     // ---------------- attitude ----------------
-    // Before ignition the gimbal produces NO torque, so the servo is parked.
+    // Before ignition the gimbal produces NO torque, so both servos are parked.
     // Any apparent "tracking error" during the coast is not a control failure:
     // there is nothing to control with.
     if (S.phase != DG_PHASE_BURN || thrust_est < 1.0f) {
-        S.servo_act = 0.0f;
-        out->servo_deg = 0.0f;
+        S.servo1_act = 0.0f;
+        S.servo2_act = 0.0f;
+        out->servo1_deg = 0.0f;
+        out->servo2_deg = 0.0f;
         return;
     }
 
-    float sn_c, cs_c;
-    dg_guidance_tilt(nav->h, nav->vx, nav->vz, S.mass, &sn_c, &cs_c);
+    // Normalise the reported body axis: a fusion filter's unit vector drifts off
+    // the sphere, and every cross product below assumes |b| = 1.
+    float bx = nav->bx, by = nav->by, bz = nav->bz;
+    float bn2 = bx * bx + by * by + bz * bz;
+    if (bn2 < 1e-6f) { bx = 0.0f; by = 0.0f; bz = 1.0f; }
+    else if (fabsf(bn2 - 1.0f) > 1e-4f) {
+        float bi = 1.0f / sqrtf(bn2);
+        bx *= bi; by *= bi; bz *= bi;
+    }
 
-    // theta_err WITHOUT atan2: sin(cmd - theta) = sin_c*cos(th) - cos_c*sin(th)
-    float sn_t = sinf(nav->theta), cs_t = cosf(nav->theta);
-    float sin_err = sn_c * cs_t - cs_c * sn_t;
-    float theta_err = fast_asinf(clampf(sin_err, -0.30f, 0.30f));
-    if (sin_err >  0.30f) theta_err =  0.3047f;   // saturate gracefully
-    if (sin_err < -0.30f) theta_err = -0.3047f;
-    out->theta_cmd = atan2f(sn_c, cs_c);          // telemetry only, not in the loop
-    out->theta_err = theta_err;
+    // Strip the roll rate. This vehicle cannot rotate about its own axis under
+    // control, so feeding a measured roll rate into the loop would ask the gimbal
+    // for a torque it physically cannot make -- and the inversion would answer
+    // with a deflection that does something else instead.
+    float wx = nav->wx, wy = nav->wy, wz = nav->wz;
+    float w_dot_b = wx * bx + wy * by + wz * bz;
+    wx -= w_dot_b * bx;
+    wy -= w_dot_b * by;
+    wz -= w_dot_b * bz;
+
+    float ucx, ucy, ucz;
+    dg_guidance_dir(nav->h, nav->vx, nav->vy, nav->vz, S.mass, &ucx, &ucy, &ucz);
+    out->tilt_cmd = acosf(clampf(ucz, -1.0f, 1.0f));      // telemetry only
+
+    float u1x, u1y, u1z, u2x, u2y, u2z;
+    dg_gimbal_basis(bx, by, bz, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+
+    // Attitude error as a ROTATION VECTOR: e = b x u_cmd points along the axis
+    // that closes the error and has magnitude sin(error). This is the vector form
+    // of the planar sin(cmd - theta), and it needs no atan2, no wrapping and no
+    // Euler angles. It is perpendicular to b by construction, so the loop can
+    // never command a roll it cannot produce.
+    float ex = by * ucz - bz * ucy;
+    float ey = bz * ucx - bx * ucz;
+    float ez = bx * ucy - by * ucx;
+    float e_sin2 = ex * ex + ey * ey + ez * ez;
+    if (e_sin2 > 0.09f) {                         // beyond ~17 deg, saturate
+        float sc = 0.3f / sqrtf(e_sin2);          // gracefully -- the planar law
+        ex *= sc; ey *= sc; ez *= sc;             // clamped at the same 0.30
+        e_sin2 = 0.09f;
+    }
+    // rescale sin(error) to the angle: asin(x)/x = 1 + x^2/6 over this range
+    float e_corr = 1.0f + e_sin2 * (1.0f / 6.0f);
+    ex *= e_corr; ey *= e_corr; ez *= e_corr;
+    out->tilt_err = sqrtf(e_sin2) * e_corr;
 
     // Cascade: outer attitude P -> rate command, inner rate P -> angular accel.
     // Closing this gives wn^2 = k_rate*k_th and 2*zeta*wn = k_rate, so the two
-    // knobs are a bandwidth and a damping ratio.
+    // knobs are a bandwidth and a damping ratio. Both channels use the SAME
+    // pair: the transverse inertia is identical about either axis, so there is
+    // nothing to tune separately.
     const float k_rate = 2.0f * DG_ZETA * DG_OMEGA_N;
     const float k_th   = DG_OMEGA_N / (2.0f * DG_ZETA);
 
-    S.err_int = clampf(S.err_int + theta_err * dt, -0.25f, 0.25f);
-    float om_cmd  = k_th * theta_err + DG_KI_ATT * S.err_int;
-    float om_err  = om_cmd - nav->omega;          // GYRO, not a differenced angle
-    float alpha   = k_rate * om_err;
-
-    float I_pitch = S.mass * (DG_L_BODY * DG_L_BODY * (1.0f / 12.0f));
-    float tau_req = I_pitch * alpha;
-
-    // cancel the weathercocking torque the fins generate at angle of attack
-    float v2 = nav->vx * nav->vx + nav->vz * nav->vz;
-    if (v2 > 1.0f) {
-        float q = 0.5f * DG_RHO * v2;
-        // sin(aoa) = sin(flight path - theta), again without atan2
-        float v  = sqrtf(v2);
-        float fx = -nav->vx / v, fz = -nav->vz / v;   // relative wind direction
-        float sin_aoa = fx * cs_t - fz * sn_t;
-        tau_req -= q * DG_AREA * DG_CN_ALPHA * sin_aoa * DG_L_CP;
+    S.eix += ex * dt;
+    S.eiy += ey * dt;
+    S.eiz += ez * dt;
+    float ei2 = S.eix * S.eix + S.eiy * S.eiy + S.eiz * S.eiz;
+    if (ei2 > 0.0625f) {                          // magnitude limit, 0.25 rad.s
+        float sc = 0.25f / sqrtf(ei2);
+        S.eix *= sc; S.eiy *= sc; S.eiz *= sc;
     }
 
-    // Dynamic inversion. The torque a nozzle angle produces is linear in
-    // thrust, and thrust sweeps ~230x over a burn. Inverting the actuator is
-    // what makes one fixed gain pair valid throughout.
-    float t_inv = thrust_est > 25.0f ? thrust_est : 25.0f;
-    float sin_d = clampf(-tau_req / (t_inv * DG_L_GIMBAL), -0.0872f, 0.0872f);
-    float servo_cmd = fast_asinf(sin_d) * (180.0f / (float)M_PI) * DG_TVC_RATIO;
+    float I_pitch = S.mass * (DG_L_BODY * DG_L_BODY * (1.0f / 12.0f));
+    float g_ir = I_pitch * k_rate;
+    float trx  = g_ir * (k_th * ex + DG_KI_ATT * S.eix - wx);
+    float trqy = g_ir * (k_th * ey + DG_KI_ATT * S.eiy - wy);
+    float trqz = g_ir * (k_th * ez + DG_KI_ATT * S.eiz - wz);
 
-    servo_cmd = clampf(servo_cmd, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG);
-    servo_cmd = roundf(servo_cmd / DG_SERVO_QUANT) * DG_SERVO_QUANT;
+    // Cancel the weathercocking torque the fins generate at angle of attack.
+    // tau_aero = L_CP * (b x F_normal), F_normal = q*A*CNA*(a_hat - (a_hat.b)b),
+    // so the whole feedforward collapses to one cross product -- and, unlike an
+    // atan2 formulation, it has no azimuth to go singular when the vehicle is
+    // exactly aligned with the airflow.
+    float v2 = nav->vx * nav->vx + nav->vy * nav->vy + nav->vz * nav->vz;
+    if (v2 > 1.0f) {
+        float v = sqrtf(v2);
+        float ahx = -nav->vx / v, ahy = -nav->vy / v, ahz = -nav->vz / v;
+        float kf = 0.5f * DG_RHO * v2 * DG_AREA * DG_CN_ALPHA * DG_L_CP;
+        trx  -= kf * (by * ahz - bz * ahy);
+        trqy -= kf * (bz * ahx - bx * ahz);
+        trqz -= kf * (bx * ahy - by * ahx);
+    }
+
+    // Dynamic inversion, in vector form. The gimbal produces
+    //     tau = -L * T * (b x s)
+    // with s the nozzle deflection, perpendicular to b -- which inverts EXACTLY
+    // to s = (b x tau) / (L * T). No linearisation; the round trip is exact to
+    // 1e-14. Thrust sweeps ~230x over a burn, and inverting it is what makes one
+    // fixed gain pair valid throughout.
+    float t_inv = thrust_est > 25.0f ? thrust_est : 25.0f;
+    float ti = 1.0f / (t_inv * DG_L_GIMBAL);
+    float sx = (by * trqz - bz * trqy) * ti;
+    float sy = (bz * trx  - bx * trqz) * ti;
+    float sz = (bx * trqy - by * trx)  * ti;
+
+    // Project onto the two gimbal axes. The basis is orthonormal, so these are
+    // the sines of the two nozzle angles exactly.
+    float sd1 = clampf(sx * u1x + sy * u1y + sz * u1z, -0.0872f, 0.0872f);
+    float sd2 = clampf(sx * u2x + sy * u2y + sz * u2z, -0.0872f, 0.0872f);
+    const float DEG = 180.0f / (float)M_PI;
+    float c1 = fast_asinf(sd1) * DEG * DG_TVC_RATIO;
+    float c2 = fast_asinf(sd2) * DEG * DG_TVC_RATIO;
+
+    c1 = roundf(clampf(c1, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG) / DG_SERVO_QUANT)
+         * DG_SERVO_QUANT;
+    c2 = roundf(clampf(c2, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG) / DG_SERVO_QUANT)
+         * DG_SERVO_QUANT;
 
     float ds = DG_SERVO_RATE * dt;
-    if      (servo_cmd - S.servo_act >  ds) S.servo_act += ds;
-    else if (S.servo_act - servo_cmd >  ds) S.servo_act -= ds;
-    else                                     S.servo_act  = servo_cmd;
+    if      (c1 - S.servo1_act >  ds) S.servo1_act += ds;
+    else if (S.servo1_act - c1 >  ds) S.servo1_act -= ds;
+    else                              S.servo1_act  = c1;
+    if      (c2 - S.servo2_act >  ds) S.servo2_act += ds;
+    else if (S.servo2_act - c2 >  ds) S.servo2_act -= ds;
+    else                              S.servo2_act  = c2;
 
-    out->servo_deg = S.servo_act;
+    out->servo1_deg = S.servo1_act;
+    out->servo2_deg = S.servo2_act;
 
     // touchdown / burnout latch
     if (nav->h <= 0.25f && nav->vz > -0.5f) S.phase = DG_PHASE_DONE;

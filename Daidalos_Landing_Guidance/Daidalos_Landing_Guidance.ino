@@ -12,8 +12,13 @@
 //  can be tested before it is flown.
 //
 //  What the guidance produces, twice per 10 ms tick:
-//    * a TVC servo angle    — where to point the nozzle
+//    * TWO TVC servo angles — where to point the nozzle, in 3-D
 //    * a thrust-clamp value — how much of the grain's thrust to keep
+//
+//  The gimbal has two axes. The third rotational degree of freedom, roll
+//  about the vehicle's own long axis, is NOT actuated and is assumed to
+//  stay at zero. See the note at the top of guidance.h before flying an
+//  airframe that rolls.
 //
 //  Core allocation:
 //    core 0  200 Hz attitude loop, ignition decision, actuators, telemetry
@@ -41,7 +46,8 @@
 // =====================================================================
 
 // ---- pins -----------------------------------------------------------
-static const uint8_t PIN_TVC     = 2;   // TVC servo signal
+static const uint8_t PIN_TVC1    = 2;   // TVC servo, x channel
+static const uint8_t PIN_TVC2    = 4;   // TVC servo, y channel
 static const uint8_t PIN_CLAMP   = 3;   // thrust-clamp servo signal
 static const uint8_t PIN_IGNITER = 6;   // igniter MOSFET gate (LOW = safe)
 static const uint8_t PIN_ARM     = 7;   // arming switch, LOW = armed (pull-up)
@@ -63,15 +69,21 @@ static const uint32_t SERVO_HZ    = 333;
 static const uint32_t SERVO_RANGE = 10000;          // PWM counts per period
 static const float    US_TO_COUNT = (float)SERVO_HZ * (float)SERVO_RANGE * 1e-6f;
 
-// TVC servo calibration. TVC_TRIM_US centres the NOZZLE, not the servo
-// horn — set it with the motor installed and the nozzle visibly straight.
-// TVC_SIGN makes a POSITIVE dg servo command tilt the vehicle toward +x.
-// Get this backwards and the loop is positive feedback: it will diverge in
-// well under a second. Verify by hand before flight: push the nose toward
-// +x and the nozzle must swing to push it back.
-static const float TVC_TRIM_US  = 1500.0f;
+// TVC servo calibration, PER AXIS. The trim centres the NOZZLE, not the servo
+// horn — set each with the motor installed and the nozzle visibly straight.
+// The sign makes a POSITIVE dg command deflect the nozzle the way guidance.cpp
+// assumes: axis 1 in the vertical plane containing world +x, axis 2 in the plane
+// containing world +y.
+//
+// Get either sign backwards and that channel is positive feedback: it diverges in
+// well under a second. Verify BOTH by hand before flight — push the nose toward
+// +x, axis 1 must swing to push it back; push it toward +y, axis 2 must. Testing
+// only one axis is how a sign error survives to the pad.
+static const float TVC1_TRIM_US   = 1500.0f;
+static const float TVC2_TRIM_US   = 1500.0f;
 static const float TVC_US_PER_DEG = 10.0f;          // typical for a 90 deg/1000 us servo
-static const float TVC_SIGN     = +1.0f;
+static const float TVC1_SIGN      = +1.0f;
+static const float TVC2_SIGN      = +1.0f;
 
 // Clamp servo calibration: pulse widths at fully diverted and fully open.
 static const float CLAMP_US_CLOSED = 1150.0f;       // clamp = DG_CLAMP_MIN
@@ -110,28 +122,38 @@ static const uint32_t NAV_HOLD_MS  = 250;           // give up
 // =====================================================================
 //  2. NAVIGATION LINK
 //
-//  Binary frame from the fusion processor, little-endian, 29 bytes:
+//  Binary frame from the fusion processor, little-endian, 49 bytes:
 //
 //    offset  size  field
 //    0       2     sync, 0xDA 0x1D
 //    2       1     flags: bit0 = solution valid
-//    3       4     h          m, above the pad
-//    7       4     vx         m/s, + downrange
-//    11      4     vz         m/s, NEGATIVE while descending
-//    15      4     theta_deg  deg from vertical, + leaning toward +x
-//    19      4     omega_dps  deg/s, d(theta)/dt, straight off the GYRO
-//    23      4     t_ms       u32 milliseconds, monotonic
-//    27      2     CRC-16/CCITT-FALSE over bytes 2..26
+//    3       4     h              m, above the pad
+//    7       4     vx             m/s, world +x
+//    11      4     vy             m/s, world +y
+//    15      4     vz             m/s, NEGATIVE while descending
+//    19      12    bx, by, bz     body-axis UNIT VECTOR, world frame
+//    31      12    wx, wy, wz     rad/s, world frame, straight off the GYRO
+//    43      4     t_ms           u32 milliseconds, monotonic
+//    47      2     CRC-16/CCITT-FALSE over bytes 2..46
 //
-//  omega must be the measured rate. Differencing the attitude estimate
-//  instead is the single most damaging thing that can be done to this
-//  loop — in simulation it drops the landing rate from 72.6 % to 6.9 %,
-//  because differentiated estimator noise saturates the servo.
+//  ATTITUDE IS A UNIT VECTOR, not Euler angles. b is the direction thrust
+//  pushes the vehicle — roughly up during the descent. A fusion filter
+//  carrying a quaternion produces it in one rotation, and it has no
+//  convention to get backwards, no wrap and no gimbal lock. w is the
+//  angular velocity in the SAME world frame; rotate the gyro out of body
+//  coordinates with the same quaternion. Its component along b is the roll
+//  rate, which this vehicle cannot control and which the guidance
+//  projects out.
+//
+//  w must be the MEASURED rate. Differencing the attitude estimate instead
+//  is the single most damaging thing that can be done to this loop — in
+//  simulation it drops the landing rate from 75.6 % to 1.3 %, because
+//  differentiated estimator noise saturates the servos.
 // =====================================================================
 
 static const uint8_t  NAV_SYNC0 = 0xDA;
 static const uint8_t  NAV_SYNC1 = 0x1D;
-static const uint8_t  NAV_PAYLOAD = 25;    // flags..t_ms
+static const uint8_t  NAV_PAYLOAD = 45;    // flags..t_ms
 static const uint8_t  NAV_FRAME   = NAV_PAYLOAD + 4;
 
 static uint16_t crc16_ccitt(const uint8_t *p, uint8_t n)
@@ -159,7 +181,9 @@ static uint32_t s_rx_ok  = 0;
 static uint32_t s_rx_bad = 0;
 
 struct nav_rx_t {
-    float    h, vx, vz, theta, omega;
+    float    h, vx, vy, vz;
+    float    bx, by, bz;
+    float    wx, wy, wz;
     uint32_t t_ms;
     bool     valid;
 };
@@ -180,16 +204,21 @@ static bool nav_poll(nav_rx_t *out)
         if (s_rx_n < NAV_FRAME) continue;
         s_rx_n = 0;
 
-        uint16_t want = (uint16_t)s_rx[27] | ((uint16_t)s_rx[28] << 8);
+        uint16_t want = (uint16_t)s_rx[47] | ((uint16_t)s_rx[48] << 8);
         if (crc16_ccitt(&s_rx[2], NAV_PAYLOAD) != want) { s_rx_bad++; continue; }
 
         out->valid = (s_rx[2] & 0x01) != 0;
         out->h     = rd_f32(&s_rx[3]);
         out->vx    = rd_f32(&s_rx[7]);
-        out->vz    = rd_f32(&s_rx[11]);
-        out->theta = rd_f32(&s_rx[15]) * (float)DEG_TO_RAD;
-        out->omega = rd_f32(&s_rx[19]) * (float)DEG_TO_RAD;
-        memcpy(&out->t_ms, &s_rx[23], 4);
+        out->vy    = rd_f32(&s_rx[11]);
+        out->vz    = rd_f32(&s_rx[15]);
+        out->bx    = rd_f32(&s_rx[19]);
+        out->by    = rd_f32(&s_rx[23]);
+        out->bz    = rd_f32(&s_rx[27]);
+        out->wx    = rd_f32(&s_rx[31]);
+        out->wy    = rd_f32(&s_rx[35]);
+        out->wz    = rd_f32(&s_rx[39]);
+        memcpy(&out->t_ms, &s_rx[43], 4);
         s_rx_ok++;
         got = true;                              // keep draining: use the newest
     }
@@ -200,11 +229,16 @@ static bool nav_poll(nav_rx_t *out)
 // flight envelope is treated as a link fault rather than as a state.
 static bool nav_sane(const nav_rx_t *n)
 {
-    return isfinite(n->h) && isfinite(n->vx) && isfinite(n->vz)
-        && isfinite(n->theta) && isfinite(n->omega)
+    float bn = n->bx * n->bx + n->by * n->by + n->bz * n->bz;
+    float wn = n->wx * n->wx + n->wy * n->wy + n->wz * n->wz;
+    return isfinite(n->h) && isfinite(n->vx) && isfinite(n->vy) && isfinite(n->vz)
+        && isfinite(bn) && isfinite(wn)
         && n->h > -5.0f && n->h < 500.0f
-        && fabsf(n->vx) < 120.0f && fabsf(n->vz) < 160.0f
-        && fabsf(n->theta) < 1.6f && fabsf(n->omega) < 20.0f;
+        && fabsf(n->vx) < 120.0f && fabsf(n->vy) < 120.0f && fabsf(n->vz) < 160.0f
+        // b must be a unit vector pointing up: a sender that forgot to normalise,
+        // or that has the vehicle inverted, is a link fault and not a state
+        && bn > 0.9f && bn < 1.1f && n->bz > 0.03f
+        && wn < 400.0f;
 }
 
 // =====================================================================
@@ -248,9 +282,10 @@ static inline void pulse_us(uint8_t pin, float us)
     analogWrite(pin, (int)(us * US_TO_COUNT + 0.5f));
 }
 
-static inline void tvc_write(float servo_deg)
+static inline void tvc_write(float s1_deg, float s2_deg)
 {
-    pulse_us(PIN_TVC, TVC_TRIM_US + TVC_SIGN * servo_deg * TVC_US_PER_DEG);
+    pulse_us(PIN_TVC1, TVC1_TRIM_US + TVC1_SIGN * s1_deg * TVC_US_PER_DEG);
+    pulse_us(PIN_TVC2, TVC2_TRIM_US + TVC2_SIGN * s2_deg * TVC_US_PER_DEG);
 }
 
 static inline void clamp_write(float k)
@@ -285,13 +320,19 @@ static uint32_t  s_plan_calls  = 0;
 static void nav_extrapolate(dg_nav_t *n, float dt, float thrust, float mass)
 {
     float a = (mass > 0.1f) ? thrust / mass : 0.0f;
-    float ax = a * sinf(n->theta);
-    float az = a * cosf(n->theta) - DG_G;
-    n->h     += n->vz * dt + 0.5f * az * dt * dt;
-    n->vx    += ax * dt;
-    n->vz    += az * dt;
-    n->theta += n->omega * dt;
-    n->t     += dt;
+    float az = a * n->bz - DG_G;
+    n->h  += n->vz * dt + 0.5f * az * dt * dt;
+    n->vx += a * n->bx * dt;
+    n->vy += a * n->by * dt;
+    n->vz += az * dt;
+    // the body axis is carried by the rate: db/dt = w x b, then renormalised so
+    // it stays a unit vector however long the gap runs
+    float nx = n->bx + (n->wy * n->bz - n->wz * n->by) * dt;
+    float ny = n->by + (n->wz * n->bx - n->wx * n->bz) * dt;
+    float nz = n->bz + (n->wx * n->by - n->wy * n->bx) * dt;
+    float inv = 1.0f / sqrtf(nx * nx + ny * ny + nz * nz);
+    n->bx = nx * inv; n->by = ny * inv; n->bz = nz * inv;
+    n->t += dt;
 }
 
 // =====================================================================
@@ -311,10 +352,29 @@ static bool self_test(void)
         Serial.println("POST thrust_ref out of range not zero"); ok = false;
     }
 
-    // guidance law: no horizontal error must command no tilt
-    float sn, cs;
-    dg_guidance_tilt(30.0f, 0.0f, -40.0f, 3.0f, &sn, &cs);
-    if (fabsf(sn) > 1e-4f) { DG_PRINT("POST tilt bias %.5f\n", sn); ok = false; }
+    // guidance law: no horizontal error must command no tilt, and the two
+    // horizontal channels must behave identically -- a swapped or mis-signed
+    // axis shows up here and nowhere else until the vehicle is in the air
+    float ux, uy, uz;
+    dg_guidance_dir(30.0f, 0.0f, 0.0f, -40.0f, 3.0f, &ux, &uy, &uz);
+    if (fabsf(ux) > 1e-4f || fabsf(uy) > 1e-4f) {
+        DG_PRINT("POST tilt bias %.5f %.5f\n", ux, uy); ok = false;
+    }
+    float ax, ay, az2, bx2, by2, bz2;
+    dg_guidance_dir(30.0f, 8.0f, 0.0f, -40.0f, 3.0f, &ax, &ay, &az2);
+    dg_guidance_dir(30.0f, 0.0f, 8.0f, -40.0f, 3.0f, &bx2, &by2, &bz2);
+    if (fabsf(ax - by2) > 1e-5f || fabsf(ay) > 1e-6f || fabsf(bx2) > 1e-6f
+        || fabsf(az2 - bz2) > 1e-6f) {
+        DG_PRINT("POST horizontal channels not symmetric\n"); ok = false;
+    }
+    // gimbal basis must be orthonormal, or the two servo commands are wrong
+    float u1x, u1y, u1z, u2x, u2y, u2z;
+    dg_gimbal_basis(0.12f, 0.05f, 0.99f, &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
+    float dotp = u1x * u2x + u1y * u2y + u1z * u2z;
+    float n1 = u1x * u1x + u1y * u1y + u1z * u1z;
+    if (fabsf(dotp) > 1e-4f || fabsf(n1 - 1.0f) > 1e-4f) {
+        DG_PRINT("POST gimbal basis dot %.6f norm %.6f\n", dotp, n1); ok = false;
+    }
 
     // ignition table monotone and inside the arming altitude
     float prev = 0.0f;
@@ -345,9 +405,10 @@ void setup()
 
     analogWriteFreq(SERVO_HZ);
     analogWriteRange(SERVO_RANGE);
-    pinMode(PIN_TVC, OUTPUT);
+    pinMode(PIN_TVC1, OUTPUT);
+    pinMode(PIN_TVC2, OUTPUT);
     pinMode(PIN_CLAMP, OUTPUT);
-    tvc_write(0.0f);
+    tvc_write(0.0f, 0.0f);
     clamp_write(0.6f);                     // mid travel: neither extreme on the pad
 
     NAV_PORT.setTX(PIN_NAV_TX);
@@ -357,8 +418,8 @@ void setup()
     dg_init();
     bool post = self_test();
     DG_PRINT("\nDaidalos landing guidance — POST %s\n", post ? "PASS" : "FAIL");
-    Serial.println("t_ms,phase,h,vx,vz,theta,omega,theta_cmd,err,servo,clamp,"
-                   "thrust,p,rx_ok,rx_bad,loop_us,overrun,plan");
+    Serial.println("t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,"
+                   "servo1,servo2,clamp,thrust,p,rx_ok,rx_bad,loop_us,overrun,plan");
 
     if (!post) {                           // refuse to fly, and say so
         for (;;) { digitalWrite(PIN_LED, millis() % 200 < 100); delay(10); }
@@ -390,11 +451,10 @@ void loop()
         fresh = false;
     }
     if (fresh) {
-        s_nav.h     = rx.h;
-        s_nav.vx    = rx.vx;
-        s_nav.vz    = rx.vz;
-        s_nav.theta = rx.theta;
-        s_nav.omega = rx.omega;
+        s_nav.h  = rx.h;
+        s_nav.vx = rx.vx;  s_nav.vy = rx.vy;  s_nav.vz = rx.vz;
+        s_nav.bx = rx.bx;  s_nav.by = rx.by;  s_nav.bz = rx.bz;
+        s_nav.wx = rx.wx;  s_nav.wy = rx.wy;  s_nav.wz = rx.wz;
         s_nav.t     = (float)rx.t_ms * 1e-3f;
         s_nav.valid = rx.valid;
         s_nav_us    = micros();
@@ -450,7 +510,7 @@ void loop()
 
     // ---- actuators ----------------------------------------------------
     if (s_have_nav) {
-        tvc_write(s_out.servo_deg);
+        tvc_write(s_out.servo1_deg, s_out.servo2_deg);
         clamp_write(s_out.clamp);
     }
     digitalWrite(PIN_LED, s_out.phase == DG_PHASE_BURN ? HIGH
@@ -461,14 +521,20 @@ void loop()
     // control tick. printf is the single most expensive call in this loop.
     if (millis() >= next_tlm) {
         next_tlm = millis() + 1000 / TELEM_HZ;
-        DG_PRINT("%lu,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.1f,%.2f,"
-                      "%lu,%lu,%lu,%lu,%lu\n",
+        float bzc = s_nav.bz > 1.0f ? 1.0f : (s_nav.bz < -1.0f ? -1.0f : s_nav.bz);
+        float tilt = acosf(bzc) * (float)RAD_TO_DEG;
+        float wmag = sqrtf(s_nav.wx * s_nav.wx + s_nav.wy * s_nav.wy
+                           + s_nav.wz * s_nav.wz) * (float)RAD_TO_DEG;
+        DG_PRINT("%lu,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.3f,"
+                      "%.1f,%.2f,%lu,%lu,%lu,%lu,%lu\n",
                       (unsigned long)millis(), (int)s_out.phase,
-                      s_nav.h, s_nav.vx, s_nav.vz,
-                      s_nav.theta * (float)RAD_TO_DEG, s_nav.omega * (float)RAD_TO_DEG,
-                      s_out.theta_cmd * (float)RAD_TO_DEG,
-                      s_out.theta_err * (float)RAD_TO_DEG,
-                      s_out.servo_deg, s_out.clamp, s_out.thrust_est, s_out.p_plan,
+                      s_nav.h, s_nav.vx, s_nav.vy, s_nav.vz,
+                      tilt,
+                      s_out.tilt_cmd * (float)RAD_TO_DEG,
+                      s_out.tilt_err * (float)RAD_TO_DEG,
+                      wmag,
+                      s_out.servo1_deg, s_out.servo2_deg,
+                      s_out.clamp, s_out.thrust_est, s_out.p_plan,
                       (unsigned long)s_rx_ok, (unsigned long)s_rx_bad,
                       (unsigned long)s_loop_max_us,
                       (unsigned long)s_overruns, (unsigned long)s_plan_calls);

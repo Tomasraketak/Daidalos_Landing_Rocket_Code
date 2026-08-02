@@ -15,6 +15,7 @@ drift away from the simulation they came from.
 """
 import argparse
 import importlib.util
+import math
 import os
 import sys
 
@@ -87,13 +88,18 @@ def main():
     w("")
 
     # ---- 2. guidance tilt ----------------------------------------------
+    # The guidance law is planar even in 3-D: the commanded direction is the
+    # planar solution rotated into the azimuth of the horizontal velocity. So
+    # these vectors are taken with the crossrange channel zeroed, and the flight
+    # code's own test checks the rotation separately.
     rows = []
     for h in TILT_H:
         for vx in TILT_VX:
             for vz in TILT_VZ:
-                th, _ = m.guidance_tilt(h, vx, vz, 3.0, m.CD_AXIAL,
-                                        DRAGCOMP, POS_CTL, 0.0, AX_BIAS)
-                rows.append((h, vx, vz, th))
+                ux, _uy, uz, _t = m.guidance_dir(h, vx, 0.0, vz, 3.0, m.CD_AXIAL,
+                                                 DRAGCOMP, POS_CTL, 0.0, 0.0,
+                                                 AX_BIAS, 0.0)
+                rows.append((h, vx, vz, math.atan2(ux, uz)))
     w(f"#define N_TILT {len(rows)}")
     w("static const float G_TILT[][4] = {")
     for h, vx, vz, th in rows:

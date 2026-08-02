@@ -3,7 +3,7 @@
 Flight code for a TVC model rocket that lands itself on a solid motor. It answers
 two questions, two hundred times a second:
 
-- **where to point the nozzle** — the TVC servo angle
+- **where to point the nozzle** — two TVC servo angles, in 3-D
 - **how much thrust to keep** — the thrust-clamp command
 
 Everything else (sensor fusion, recovery, telemetry downlink) lives elsewhere. This
@@ -41,7 +41,7 @@ rather than saving it. Two consequences drive the whole design:
 | body | 1.40 m long, 105 mm diameter |
 | guidance entry | 85 m altitude |
 | entry envelope | \|Vz\| 20–45 m/s (see below), \|Vx\| 0–15 m/s |
-| TVC travel | ±10° servo, 2:1 to the nozzle |
+| TVC | two axes, ±10° servo each, 2:1 to the nozzle |
 
 ---
 
@@ -52,7 +52,7 @@ Daidalos_Landing_Guidance/
   Daidalos_Landing_Guidance.ino   I/O shell: pins, timing, link, failsafes
   guidance.h  guidance.cpp        the algorithm — no Arduino dependency
 test/
-  host_test.cpp                   108 numerical checks against the model
+  host_test.cpp                   119 numerical checks against the model
   golden_vectors.h                reference values from the simulation
   gen_golden.py                   regenerates them from lander_v2.py
   stub/                           fake Arduino headers, for the syntax check
@@ -83,7 +83,8 @@ running at 200 Hz, which is real phase lag at a 9 rad/s bandwidth.
 
 | pin | signal | notes |
 |---|---|---|
-| GP2 | TVC servo | 333 Hz pulse train |
+| GP2 | TVC servo, **axis 1 (x)** | 333 Hz pulse train |
+| GP4 | TVC servo, **axis 2 (y)** | 333 Hz |
 | GP3 | thrust-clamp servo | 333 Hz |
 | GP6 | igniter MOSFET gate | LOW = safe; drives a gate, never the igniter directly |
 | GP7 | arm switch | LOW = armed, internal pull-up |
@@ -98,7 +99,7 @@ crash, and the burn is only 1.7 s long.
 
 ## The navigation link
 
-The fusion processor sends a 29-byte little-endian frame. Anything faster than 200 Hz is
+The fusion processor sends a 49-byte little-endian frame. Anything faster than 200 Hz is
 fine — the control loop always uses the newest frame it has.
 
 | offset | size | field | |
@@ -106,47 +107,77 @@ fine — the control loop always uses the newest frame it has.
 | 0 | 2 | sync | `0xDA 0x1D` |
 | 2 | 1 | flags | bit 0 = solution valid |
 | 3 | 4 | `h` | m above the pad |
-| 7 | 4 | `vx` | m/s, + downrange |
-| 11 | 4 | `vz` | m/s, **negative while descending** |
-| 15 | 4 | `theta` | deg from vertical, + leaning toward +x |
-| 19 | 4 | `omega` | deg/s, **straight off the gyro** |
-| 23 | 4 | `t_ms` | uint32 ms, monotonic |
-| 27 | 2 | CRC-16/CCITT-FALSE | over bytes 2..26 |
+| 7 | 4 | `vx` | m/s, world +x |
+| 11 | 4 | `vy` | m/s, world +y |
+| 15 | 4 | `vz` | m/s, **negative while descending** |
+| 19 | 12 | `bx, by, bz` | body-axis **unit vector**, world frame |
+| 31 | 12 | `wx, wy, wz` | rad/s, world frame, **straight off the gyro** |
+| 43 | 4 | `t_ms` | uint32 ms, monotonic |
+| 47 | 2 | CRC-16/CCITT-FALSE | over bytes 2..46 |
 
 Encoder for the sending side:
 
 ```c
-static void nav_send(float h, float vx, float vz, float theta_deg,
-                     float omega_dps, uint32_t t_ms, bool valid)
+static void nav_send(const float pv[4],      // h, vx, vy, vz
+                     const float b[3],       // body-axis unit vector
+                     const float w[3],       // rad/s, world frame
+                     uint32_t t_ms, bool valid)
 {
-    uint8_t b[29];
-    b[0] = 0xDA; b[1] = 0x1D; b[2] = valid ? 1 : 0;
-    memcpy(&b[3],  &h,         4);
-    memcpy(&b[7],  &vx,        4);
-    memcpy(&b[11], &vz,        4);
-    memcpy(&b[15], &theta_deg, 4);
-    memcpy(&b[19], &omega_dps, 4);
-    memcpy(&b[23], &t_ms,      4);
-    uint16_t crc = crc16_ccitt(&b[2], 25);      // same routine as the .ino
-    b[27] = crc & 0xFF; b[28] = crc >> 8;
-    NAV_PORT.write(b, sizeof b);
+    uint8_t f[49];
+    f[0] = 0xDA; f[1] = 0x1D; f[2] = valid ? 1 : 0;
+    memcpy(&f[3],  pv,   16);
+    memcpy(&f[19], b,    12);
+    memcpy(&f[31], w,    12);
+    memcpy(&f[43], &t_ms, 4);
+    uint16_t crc = crc16_ccitt(&f[2], 45);      // same routine as the .ino
+    f[47] = crc & 0xFF; f[48] = crc >> 8;
+    NAV_PORT.write(f, sizeof f);
 }
 ```
 
-### `omega` must be the measured rate
+### Attitude is a unit vector, not Euler angles
 
-Not `(theta - theta_prev)/dt`. This is the single most consequential line in the whole
-system. Differencing a fused attitude estimate feeds estimator noise into the derivative
+`b` is the direction **thrust pushes the vehicle** — the tail-to-nose axis reversed, so it
+points roughly up during the descent. From a quaternion it is one rotation:
+
+```c
+// body axis expressed in body coordinates, rotated into the world
+float b[3];  quat_rotate(q, BODY_AXIS, b);
+float w[3];  quat_rotate(q, gyro_body, w);      // same q, same frame
+```
+
+Three reasons this beats sending angles. It has no convention to get backwards; it has no
+wrap and no gimbal lock; and it saves the flight computer two trig calls per tick, which more
+than pays for the entire second gimbal axis. If you can only send Euler angles, the loop still
+works — it just costs 240 cycles more, which is irrelevant at 0.03 % duty.
+
+Send `b` normalised. The guidance renormalises defensively, and rejects the frame outright if
+`|b|` is more than 5 % off or `bz ≤ 0.03` — a vehicle that far over is a link fault, not a
+state.
+
+### `w` must be the measured rate
+
+Not `(attitude - previous attitude)/dt`. This is the single most consequential line in the
+whole system. Differencing a fused attitude estimate feeds estimator noise into the derivative
 term; at 200 Hz, 0.1° of noise becomes ~0.35 rad/s of phantom rate, which after the servo
-scaling saturates the actuator. In simulation, under the flight sensor budget, that one
-choice is the difference between a **6.9 %** and a **72.6 %** landing rate — from tumbling
-to flying.
+scaling saturates the actuators. In simulation, under the flight sensor budget, that one choice
+is the difference between a **1.3 %** and a **75.6 %** landing rate — from tumbling to flying.
+It is worse in 3-D than in the plane, because the noise now enters both channels independently
+and the attitude gate is on the total tilt.
+
+The component of `w` along `b` is the roll rate. Send it anyway — the guidance projects it out,
+because a two-axis gimbal cannot produce a torque about the body axis and feeding one in asks
+for something impossible.
 
 ### Sign conventions
 
-`theta` is measured from vertical toward +x, and `vx` is positive in the same direction.
-A vehicle leaning downrange has positive `theta`. Get this backwards and the attitude loop
-becomes positive feedback.
+World frame, z up, origin at the pad. `vx`/`vy` are positive along world +x/+y. Servo **axis 1**
+deflects the nozzle in the vertical plane containing world **+x**, **axis 2** in the plane
+containing **+y**. With no roll those are fixed directions in the airframe, which is exactly
+what makes the mapping a constant.
+
+Get either servo sign backwards and that channel is positive feedback. Test **both** — see the
+pre-flight list at the end.
 
 ---
 
@@ -167,11 +198,19 @@ accuracy at the top of the envelope comes from.
 
 **Burn.** Two loops:
 
-- *Attitude*, 200 Hz on core 0. Cascaded outer-attitude-P / inner-rate-P, parameterised by
-  a bandwidth ω_n = 9 rad/s and damping ζ = 1.0, with the fin weathercocking torque
-  cancelled by feedforward. The commanded torque is then converted to a nozzle angle by
-  **dynamic inversion**, `sin δ = −τ/(T·L)`. Thrust sweeps about 230× over a burn; without
-  inverting it the loop gain sweeps with it and no single gain pair works throughout.
+- *Attitude*, 200 Hz on core 0, entirely in vector form. The error is `e = b × û` — the
+  rotation that closes the gap between the body axis and the commanded thrust direction. That
+  is the vector version of the planar `sin(θ_cmd − θ)`: no `atan2`, no wrapping, no gimbal
+  lock, and perpendicular to `b` by construction, so the loop can never command a roll it has
+  no way to produce. Cascaded outer-attitude-P / inner-rate-P at bandwidth ω_n = 9 rad/s and
+  damping ζ = 1.0, with the fin weathercocking torque cancelled by feedforward. Both channels
+  share one gain pair — the transverse inertia is identical about either axis.
+
+  The commanded torque becomes a nozzle deflection by **dynamic inversion**,
+  `s = (b × τ)/(L·T)`, which is exact rather than a linearisation (round trip verified to
+  1e-14). Its components along the two gimbal axes are the two servo commands. Thrust sweeps
+  about 230× over a burn; without inverting it the loop gain sweeps with it and no single gain
+  pair works throughout.
 - *Planner*, core 1. A receding-horizon search for the throttle profile that brings the
   vehicle to rest at the pad. The plan is one scalar `p ∈ [0,4]` that fills four clamp
   segments backwards from burnout — "coast, then slam" — chosen so the projected miss
@@ -179,9 +218,17 @@ accuracy at the top of the envelope comes from.
   false position (Illinois), warm-started from the previous answer.
 
 The tilt command itself is the zero-effort-velocity law, `t_go = 2h/|vz|`,
-`a_x = −v_x/t_go`, `a_z = |v_z|/t_go + g`, credited with the drag that is already
-decelerating the vehicle so it stops over-tilting, and limited to
-`min(45°, 3h + 5°)` so it cannot ask for a large tilt near the ground.
+`a_h = −v_h/t_go`, `a_z = |v_z|/t_go + g`, credited with the drag that is already
+decelerating the vehicle so it stops over-tilting, and limited to a **cone** of
+`min(45°, 3h + 5°)` so it cannot ask for a large tilt near the ground — the same limit in
+every azimuth.
+
+**That law stays planar in 3-D, and it is why the second axis is nearly free.** Both
+horizontal terms — the ZEV demand and the drag credit — are anti-parallel to the horizontal
+velocity, so its direction never changes along a projected trajectory. The 3-D command is
+exactly the planar solution rotated into that azimuth, verified as an identity to 2e-16 over
+200 000 states. So the trajectory projection stays two-dimensional, the planner is untouched,
+and the guidance call costs one extra `sqrtf`.
 
 ---
 
@@ -201,11 +248,31 @@ rule; that keeps the warning meaningful everywhere it matters.
 | 64-entry uniform thrust table | O(1) lookup instead of a 13-point scan. It spans [τ_ign, 1]; the 11 ms ignition ramp below that is evaluated exactly, because no uniform grid can resample a near-vertical rise |
 | ignition altitudes precomputed | the model's `find_ignition` solve costs ~46 ms and must never run in flight |
 | **amortised** root find | one trajectory projection per 200 Hz call, converging in ~35 ms, instead of a whole solve as a multi-millisecond spike every 100 ms |
+| attitude as a unit vector, error as `b × û` | no Euler angles anywhere in the loop, so no `atan2`, no wrapping, no gimbal lock — and no `sinf`/`cosf` to turn an angle back into a direction |
+| `asin(x)/x ≈ 1 + x²/6` on the error vector | one multiply-add rescales the whole vector, instead of three `asinf` calls |
+| exact vector dynamic inversion | `s = (b × τ)/(L·T)`; one cross product replaces a per-axis formulation, and it is not a linearisation |
 | no malloc, no recursion, no unbounded loops | every loop in the flight path has a compile-time bound |
 
-Measured cost of this structure: **~0.8 % of one core** for the planner plus ~0.05 % for
-the attitude loop. The `loop_us` and `overrun` telemetry columns report the real figures
-on your board — check them before trusting the estimate.
+Measured cost of this structure: **~0.5 % of one core** for the planner plus ~0.03 % for the
+attitude loop. The `loop_us` and `overrun` telemetry columns report the real figures on your
+board — check them before trusting the estimate.
+
+### What the second gimbal axis costs
+
+Nothing in the expensive half, and *negative* cycles in the cheap half.
+
+The planner is untouched: its trajectory projection stays two-dimensional, for the reason
+given under the guidance law. The attitude loop does roughly twice the arithmetic — a gimbal
+basis, three cross products, a roll-rate projection, two servo outputs — but drops the two
+`sinf`/`cosf` calls the planar version needed to turn a reported angle into a direction,
+because the attitude now arrives as a vector. Net: **365 cycles → 215.**
+
+| item | cost of the second axis |
+|---|---|
+| trajectory projection, planner, root find | zero |
+| ignition-altitude table | zero — still 1-D in \|Vz₀\| |
+| guidance direction | one extra `sqrtf` |
+| attitude loop | −150 cycles |
 
 ### Concurrency
 
@@ -240,15 +307,25 @@ crash, and the grain finishes burning either way.
 
 ```
 cd test
-make          # 108 numerical checks against the simulation
+make          # 119 numerical checks against the simulation
 make syntax   # compiles the .ino against stub Arduino headers
 make check    # both
 ```
 
 `make` compiles `guidance.cpp` **unchanged** and compares it to golden vectors generated
-from the Python model: the motor curve, 72 guidance-tilt cases, 8 root-find states, the
-ignition table, and structural invariants (monotonicity of the miss function, servo travel
-and quantisation, clamp range, servo parked during the coast, no commands on invalid nav).
+from the Python model: the motor curve, 72 guidance-tilt cases, 8 root-find states and the
+ignition table. On top of that it checks the properties that make the 3-D form correct —
+
+- the 3-D law **reduces exactly** to the planar law when the crossrange channel is zero;
+- the command is **isotropic**: rotating the horizontal velocity rotates the command with it;
+- the gimbal basis is **orthonormal and perpendicular** to the body axis, and a tilt purely
+  toward +y leaves axis 1 on world x, which is what makes the two servos independent;
+- the **dynamic inversion round-trips exactly** — the deflection it solves for produces the
+  torque that was asked for;
+- a **pure roll rate is projected out** and does not move either servo;
+
+— and the structural invariants: monotonicity of the miss function, servo travel and
+quantisation, clamp range, both servos parked during the coast, no commands on invalid nav.
 
 Regenerate the vectors after any change to the model:
 
@@ -259,8 +336,13 @@ make golden MODEL=../../Landing-Rocket-Sim/lander_v2.py
 `gen_golden.py` *imports* the model rather than re-implementing it, so the vectors cannot
 drift away from the simulation they came from.
 
-Current status: **108 checks, 0 failures.** Worst guidance-tilt error over 72 cases is
-0.00005 rad (0.003°).
+Current status: **119 checks, 0 failures.** Worst guidance-tilt error over 72 cases is
+0.00005 rad (0.003°); the reduction, isotropy, orthonormality and inversion checks all pass
+at machine precision.
+
+The golden vectors were **bit-identical before and after the 3-D upgrade**, which is the
+regression that matters: it says the planar law, the projection, the solver and the ignition
+table all came through the rewrite untouched.
 
 `make syntax` will not catch a wrong pin or an inverted servo — it catches the class of
 mistake that otherwise only appears with a board in front of you: a typo, a wrong argument
@@ -273,34 +355,44 @@ type, a rename in `guidance.h` the sketch was not updated for.
 CSV on USB at 20 Hz:
 
 ```
-t_ms,phase,h,vx,vz,theta,omega,theta_cmd,err,servo,clamp,thrust,p,rx_ok,rx_bad,loop_us,overrun,plan
+t_ms,phase,h,vx,vy,vz,tilt,tilt_cmd,tilt_err,wmag,servo1,servo2,clamp,thrust,p,
+rx_ok,rx_bad,loop_us,overrun,plan
 ```
 
-`phase` is 0 idle, 1 coast, 2 burn, 3 done. `loop_us` is the worst control-loop execution
-time seen so far and `overrun` counts missed 200 Hz slots — both should stay near zero.
-`plan` counts planner iterations; if it stops advancing, core 1 has died.
+`phase` is 0 idle, 1 coast, 2 burn, 3 done. `tilt` is the angle from vertical in degrees and
+`tilt_err` the total angle between commanded and actual body axis, so both are azimuth-free.
+`loop_us` is the worst control-loop execution time seen so far and `overrun` counts missed
+200 Hz slots — both should stay near zero. `plan` counts planner iterations; if it stops
+advancing, core 1 has died.
 
 ---
 
 ## Expected performance
 
-From 2880 Monte-Carlo scenarios per configuration in the simulation, with common random
-numbers. Gates: |vz| < 3 m/s, |vx| < 0.75 m/s, |θ| < 10°, |ω| < 60 °/s at touchdown.
+From 2880 three-dimensional Monte-Carlo scenarios per configuration in the simulation, with
+common random numbers. Gates: |vz| < 3 m/s, horizontal **speed** < 0.75 m/s, **tilt** < 10°,
+|ω| < 60 °/s at touchdown — each on a magnitude, so they apply in any azimuth.
 
 | entry \|Vz\| at 85 m | design dispersions | full dispersions |
 |---|---|---|
-| 20–45 m/s | 99.4–100 % | 87–94 % |
-| 50 m/s | 88.9 % | 83.6 % |
-| 55 m/s | 72.5 % | 69.4 % |
+| 20–45 m/s | 99.4–100 % | 91–98 % |
+| 50 m/s | 91.4 % | 85.8 % |
+| 55 m/s | 66.1 % | 65.8 % |
 
 *Design* dispersions are igniter delay U(0.1, 0.3) s plus grain variation (1 % impulse,
 2 % burn rate). *Full* adds 3 m/s wind with gusts, mass and Cd spread, 0.30° nozzle
-misalignment, and the flight sensor budget.
+misalignment, and the flight sensor budget. Entry azimuth and wind azimuth are drawn
+independently per flight.
 
 **Keep entry below ~45 m/s at 85 m.** Above that the vehicle runs out of grain before it
 runs out of velocity — a sizing problem, not a guidance one. The ΔV budget makes this
-concrete: of ~94 m/s the grain delivers, clamp waste takes 22–41 m/s and gravity 17 m/s,
+concrete: of ~94 m/s the grain delivers, clamp waste takes 22–41 m/s and gravity 18 m/s,
 while **steering costs 0.6 m/s**. Perfect attitude control would recover almost nothing.
+
+**Also keep entry drift below ~12 m/s in wind.** Horizontal entry speed looks free under
+design dispersions (93–96 % flat from 0 to 15 m/s) but falls to **79 %** at 15 m/s under full
+ones, because entry and wind azimuths are independent — the vehicle can be asked to kill a
+large drift in one direction while the wind pushes it in another.
 
 ---
 
@@ -320,8 +412,13 @@ Suggested order:
 2. Feed recorded or synthetic nav frames. Confirm ignition triggers at the expected
    altitude and that `loop_us` and `overrun` stay where you expect.
 3. Deflect the airframe by hand with the loop running and a dummy thrust estimate.
-   **The nozzle must swing to oppose the motion.** If it follows instead, `TVC_SIGN` is
-   wrong and the vehicle will diverge in under a second.
+   **The nozzle must swing to oppose the motion — test BOTH axes.** Push the nose toward
+   +x and axis 1 must push back; push it toward +y and axis 2 must. If either follows
+   instead, that `TVC*_SIGN` is wrong and the vehicle will diverge in under a second.
+   Testing one axis and assuming the other is how a sign error reaches the pad.
+3b. Rotate the airframe about its own long axis and confirm it stays where you put it. This
+   code assumes roll is zero and cannot correct it; a rolling body also turns the two servo
+   axes underneath the controller.
 4. Static fire with the clamp servo connected and the TVC locked, to calibrate
    `CLAMP_US_CLOSED` / `CLAMP_US_OPEN` against measured thrust.
 5. Only then fly it, over a range, with the usual model-rocketry safety practice for
