@@ -63,12 +63,35 @@
 //  Everything in this file. Unlike guidance.cpp there are no golden
 //  vectors here. The two things that most need a bench before they need a
 //  sky are in section 6 (the body-to-pad rotation, where a convention
-//  mismatch silently mirrors every attitude) and section 7 (the vertical
-//  filter gains). Section 11 self-tests what can be self-tested.
+//  mismatch silently mirrors every attitude) and section 7 (the filter
+//  tuning). Section 10 self-tests what can be self-tested, which now
+//  includes the horizontal channel, the innovation gate, and the
+//  agreement between the rotation matrix and the quaternion.
+//
+//  ---------------------------------------------------------------------
+//  THE ESTIMATOR IS A KALMAN FILTER, NOT A COMPLEMENTARY FILTER
+//  ---------------------------------------------------------------------
+//  Section 7 holds three 3-state Kalman filters, one per pad-ENU axis,
+//  each estimating position, velocity and accelerometer bias. It replaced
+//  a third-order complementary filter on the vertical channel plus dead
+//  reckoning with a fixed-gain GPS velocity nudge on the horizontal.
+//
+//  The short version of why is that the old horizontal channel had no
+//  position state at all, so the local x/y this board now ships could not
+//  have been produced by it, and its fixed gains could not weight a GPS
+//  fix by how good that fix actually was. The long version, including
+//  what was kept, is at the top of section 7.
+//
+//  Section 6 changed with it: world-frame acceleration is now obtained by
+//  rotating BODY-frame linear acceleration with this file's own matrix,
+//  rather than by taking the fusion library's world frame and relabelling
+//  its axes. That relabelling was mirrored in East/West. See the note
+//  above the call.
 // =====================================================================
 
 #include "../common/ariadna_link.h"
 #include "../common/ariadna_uart_dma.h"
+#include "../common/ariadna_kf.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -125,7 +148,12 @@ static const uint8_t PIN_MASTER_RX     = D7;
 // end, so PIN_GPS_TX goes to the module's RX.
 static const uint8_t PIN_GPS_TX        = D11;
 static const uint8_t PIN_GPS_RX        = D12;
-static const uint32_t GPS_BAUD         = 9600;   // LK76 default
+static const uint32_t GPS_BAUD         = 9600;   // LK76 factory default
+// The rate gps_configure() moves the module to. 5 Hz of GGA + RMC is
+// roughly 750 byte/s, which does not fit inside 9600 baud with any margin
+// once the receiver adds a leading talker ID and a checksum to each
+// sentence — so the baud rate has to come up before the fix rate can.
+static const uint32_t GPS_FAST_BAUD    = 115200;
 
 SerialPIO GpsPort(PIN_GPS_TX, PIN_GPS_RX, 256);
 
@@ -541,83 +569,221 @@ static inline void rotate(const float R[3][3], const float v[3], float out[3])
     out[2] = R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2];
 }
 
+/**
+ * The SAME rotation as build_rotation(), expressed as a quaternion.
+ *
+ * The Navigation MCU and the ground station both want the attitude as a
+ * quaternion — no wrap-around, no discontinuity, and interpolable. It is
+ * built here from the same three angles that build the matrix, rather
+ * than taken from the fusion library's own quaternion, for one reason:
+ *
+ *   THE LIBRARY'S WORLD FRAME IS NOT PAD-ENU. AdvancedTriFusion builds
+ *   its world frame as Rz(+heading) with heading a CLOCKWISE compass
+ *   bearing, while pad-ENU azimuth runs COUNTER-CLOCKWISE from East. The
+ *   two agree along the body's +X axis and come out MIRRORED for +Y. A
+ *   quaternion taken straight from the library would therefore disagree
+ *   with the u vector sitting next to it in the same packet, in a way
+ *   that looks fine on a bench pointed North and mirrors East/West
+ *   everywhere else.
+ *
+ * Deriving both from one angle triple makes that class of mismatch
+ * impossible, and self_test() asserts it every boot by rotating a test
+ * vector through the matrix and the quaternion and comparing.
+ *
+ * KNOWN LIMITATION, and the reason this comment is long. Going through
+ * Euler angles inherits their singularity: a Z-Y-X triple is degenerate
+ * at pitch = +/-90 deg, where heading stops being observable. On this
+ * vehicle that is passed through TRANSIENTLY during the nose-over, not
+ * dwelt in — standing on the pad and descending nose-first are both
+ * pitch ~ 0 with roll near 0 and 180 respectively, which is well away
+ * from it. The landing burn, the only phase where attitude is in a
+ * control loop, is entirely in the safe region.
+ *
+ * The real fix is to take the library's quaternion and apply a fixed
+ * frame correction instead of round-tripping through angles. That needs
+ * the library's internal convention pinned down on a bench first, which
+ * is why it is not being guessed at here.
+ */
+static void build_quaternion(float roll_deg, float pitch_deg, float heading_deg,
+                             float q[4])
+{
+    // Half angles of the same Z-Y-X sequence build_rotation() applies.
+    const float hy = 0.5f * (90.0f - heading_deg) * (float)DEG_TO_RAD;
+    const float hp = 0.5f * pitch_deg * (float)DEG_TO_RAD;
+    const float hr = 0.5f * roll_deg  * (float)DEG_TO_RAD;
+
+    const float cy = cosf(hy), sy = sinf(hy);
+    const float cp = cosf(hp), sp = sinf(hp);
+    const float cr = cosf(hr), sr = sinf(hr);
+
+    q[0] = cy * cp * cr + sy * sp * sr;   // w
+    q[1] = cy * cp * sr - sy * sp * cr;   // x
+    q[2] = cy * sp * cr + sy * cp * sr;   // y
+    q[3] = sy * cp * cr - cy * sp * sr;   // z
+
+    // Normalise. The trig above is exact in theory and drifts in single
+    // precision; the Navigation MCU range-checks the norm of what it
+    // receives, so a drifting one would show up there as a rejected frame.
+    float n2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (n2 > 1e-12f) {
+        const float inv = 1.0f / sqrtf(n2);
+        q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv;
+    } else {
+        q[0] = 1.0f; q[1] = q[2] = q[3] = 0.0f;
+    }
+}
+
+/** Rotate a body vector into the pad frame with a quaternion. Self-test only. */
+static void rotate_q(const float q[4], const float v[3], float out[3])
+{
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    const float tx = 2.0f * (y * v[2] - z * v[1]);
+    const float ty = 2.0f * (z * v[0] - x * v[2]);
+    const float tz = 2.0f * (x * v[1] - y * v[0]);
+
+    out[0] = v[0] + w * tx + (y * tz - z * ty);
+    out[1] = v[1] + w * ty + (z * tx - x * tz);
+    out[2] = v[2] + w * tz + (x * ty - y * tx);
+}
+
 // =====================================================================
 //  7. THE ESTIMATOR
 //
-//  ---------------------------------------------------------------------
-//  Vertical channel: a third-order complementary filter
-//  ---------------------------------------------------------------------
-//  Three states — altitude, vertical velocity, accelerometer bias — driven
-//  by the accelerometer and corrected by the barometer:
+//  Three independent 3-state Kalman filters, one per pad-ENU axis, each
+//  holding
 //
-//      h_dot  = vz + K1 * e
-//      vz_dot = a  - b + K2 * e
-//      b_dot  =         -K3 * e          e = h_baro - h
+//      x = [ position, velocity, accelerometer bias ]
 //
-//  With a triple pole at -w, K1 = 3w, K2 = 3w^2, K3 = w^3. One number to
-//  tune, and it means something physical: below w the barometer is
-//  believed, above it the accelerometer is.
-//
-//  The bias state is the reason this is third order rather than second.
-//  An accelerometer bias of 0.05 m/s^2 — well inside the ICM42688P's spec
-//  after a warm-up — integrates to 2.5 m/s of phantom velocity over a
-//  10 second descent. The guidance law divides by vertical speed to get
-//  time-to-go, so that error goes straight into the ignition altitude.
-//  Estimating the bias costs one state and removes the whole term.
-//
-//  BARO_TRUST during the burn: the landing motor's plume raises static
-//  pressure around the airframe, so the barometer reads LOW — it thinks
-//  the vehicle is higher than it is, exactly when altitude matters most.
-//  The filter therefore drops its barometer bandwidth once the burn
-//  starts and coasts on the accelerometer, whose bias it has spent the
-//  whole descent learning. This is the single most important line in the
-//  vertical channel and it is why the bias state earns its keep.
+//  driven by world-frame acceleration and corrected by the barometer
+//  (vertical), GPS position and velocity (horizontal), and zero-velocity
+//  updates while the vehicle is still on the pad.
 //
 //  ---------------------------------------------------------------------
-//  Horizontal channel
+//  WHY THIS REPLACED THE COMPLEMENTARY FILTER
 //  ---------------------------------------------------------------------
-//  Dead reckoning on world-frame acceleration, corrected toward GPS
-//  velocity whenever a fix arrives. GPS at 5-10 Hz cannot see the dynamics
-//  of a landing burn, so it is used as a slow anchor, not as a
-//  measurement: the correction gain is small and the accelerometer carries
-//  the short term.
+//  The previous estimator was a third-order complementary filter on the
+//  vertical channel and, on the horizontal, dead reckoning with a fixed
+//  0.15 gain toward GPS velocity and a 20 s leak toward zero. It was
+//  sound for what it did. Four things it could not do:
 //
-//  With no GPS at all the horizontal velocity leaks toward zero on a long
-//  time constant. That is a deliberate lie — it is better for the guidance
-//  to under-correct a drift it cannot see than to chase an integrator that
-//  is running away.
+//   1. IT HAD NO HORIZONTAL POSITION AT ALL. Not a tuning weakness — the
+//      state simply did not exist, so the local x/y this packet now
+//      carries could not have been filled in.
+//
+//   2. Fixed gains cannot weight a measurement by how good it is. GPS
+//      horizontal accuracy swings by an order of magnitude with HDOP and
+//      satellite count; one gain is right at one HDOP and wrong at every
+//      other. A Kalman gain is computed from the measurement's variance
+//      every time, which is the entire reason to pay for the covariance.
+//
+//   3. There was no outlier rejection, so one multipath fix went straight
+//      into the state. There is now an innovation gate, with a
+//      re-anchoring escape hatch for the case where the filter — not the
+//      GPS — is the thing that is wrong.
+//
+//   4. The leak toward zero was a documented lie, and it biased velocity
+//      low precisely during a long descent. With GPS position and
+//      velocity both fused and a bias state per axis, the integrator has
+//      a real anchor and the lie is not needed.
+//
+//  The vertical channel keeps everything that was RIGHT about the old
+//  one: pad-referenced barometry (below), a bias state, and dropping
+//  trust in the barometer during the burn.
+//
+//  ---------------------------------------------------------------------
+//  WHY THREE 3-STATE FILTERS AND NOT ONE 9-STATE FILTER
+//  ---------------------------------------------------------------------
+//  Because attitude is supplied externally by the fusion library, the
+//  9-state system matrix is exactly block diagonal per axis, the process
+//  noise is diagonal, and every measurement touches exactly one axis. A
+//  block-diagonal covariance therefore STAYS block diagonal forever, so
+//  three 3x3 filters are mathematically identical to one 9x9 filter at
+//  roughly a ninth of the arithmetic. An exact factorisation, not an
+//  approximation.
+//
+//  The consequence worth stating: every measurement is scalar and
+//  observes one state directly, so H is a unit row and the update
+//  collapses to a handful of multiply-adds. THERE IS NO MATRIX INVERSION
+//  ANYWHERE IN THIS FILE.
+//
+//  ---------------------------------------------------------------------
+//  WHAT THE BIAS STATE ACTUALLY ABSORBS
+//  ---------------------------------------------------------------------
+//  More than its name suggests. It soaks up anything that looks like a
+//  constant acceleration offset in the pad frame: true accelerometer
+//  bias, an error in the local gravity constant, and — dominating both —
+//  a small residual TILT error, which projects gravity onto the
+//  horizontal axes. One degree of tilt error injects 0.17 m/s^2 of
+//  phantom horizontal acceleration, far more than the ICM42688P's own
+//  bias, which is why estimating this matters more than the datasheet
+//  figure implies.
+//
+//  Vertically it is the same argument the old filter made: 0.05 m/s^2 of
+//  bias integrates to 2.5 m/s of phantom velocity over a 10 s descent,
+//  and the guidance law divides by vertical speed to get time-to-go.
+//
+//  ---------------------------------------------------------------------
+//  THE PLUME, AND WHY IT IS AN R AND NOT A BANDWIDTH
+//  ---------------------------------------------------------------------
+//  The landing motor's plume raises static pressure around the airframe,
+//  so the barometer reads LOW — it thinks the vehicle is higher than it
+//  is, exactly when altitude matters most. The old filter handled this by
+//  dropping its barometer bandwidth during the burn. This one inflates
+//  the barometer's measurement variance instead.
+//
+//  Same intent, better mechanism. Inflating R says the thing that is
+//  actually true — "this measurement is now bad" — and lets the filter
+//  work out the consequences itself, including how much to trust the
+//  altitude it already has and how fast to let the bias state drift.
+//  Lowering a bandwidth asserts the answer instead of the evidence, and
+//  it does nothing to stop a plume-corrupted sample from being gated in
+//  as though it were good.
 // =====================================================================
+
 class Estimator {
 public:
     void begin(void)
     {
-        _h = _vz = _bias = 0.0f;
-        _vx = _vy = 0.0f;
-        _since_corr = 0.0f;
+        reset_states();
         _pad_pressure = 0.0f;
         _have_pad_ref = false;
-        _baro_w       = BARO_W_NOMINAL;
-        _quality      = 0;
+        _have_origin  = false;
+        _origin_lat   = 0;
+        _origin_lon   = 0;
+        _m_per_rad_lat = 6367000.0f;
+        _m_per_rad_lon = 6367000.0f;
+        _baro_var     = BARO_SIGMA * BARO_SIGMA;
+        _gps_rejects  = 0;
+        _baro_rejects = 0;
+        _last_gps_ms  = 0;
+        _zupt         = false;
     }
 
     /**
      * Capture the pad reference. Called on the ground, at arming.
      *
-     * Everything downstream is altitude ABOVE THE PAD, so this is what
+     * Everything downstream is measured FROM THE PAD, so this is what
      * makes the guidance module's 85 m entry altitude mean the right
      * thing. Without it the vehicle would be flying against sea level.
+     *
+     * `fix` sets the horizontal origin at the same instant. If there is
+     * no GPS fix the vertical channel still works — that is the whole
+     * point of referencing pressure rather than position — and the
+     * horizontal origin is picked up later, on the first good fix.
      */
-    void set_pad_reference(float pressure_pa)
+    void set_pad_reference(float pressure_pa, const GpsFix *fix)
     {
         if (!(pressure_pa > 30000.0f && pressure_pa < 110000.0f)) return;
         _pad_pressure = pressure_pa;
         _have_pad_ref = true;
-        _h = _vz = _bias = 0.0f;
-        _vx = _vy = 0.0f;
-        _since_corr = 0.0f;
+        reset_states();
+
+        if (fix && fix->valid && fix->fix >= 3 && fix->sats >= GPS_MIN_SATS)
+            set_origin(fix->lat_1e7, fix->lon_1e7);
     }
 
-    bool have_pad_reference(void) const { return _have_pad_ref; }
+    bool  have_pad_reference(void) const { return _have_pad_ref; }
+    bool  have_origin(void)       const { return _have_origin; }
     float pad_pressure(void)      const { return _pad_pressure; }
 
     /**
@@ -626,7 +792,8 @@ public:
      * The barometric formula referenced to the pad rather than to sea
      * level. Ratio form, so the pad temperature and the absolute pressure
      * both cancel — only the RATIO matters, which is what makes this
-     * robust to a barometer with an offset.
+     * robust to a barometer with an offset, and it is why this survived
+     * the move to a Kalman filter unchanged.
      */
     float baro_altitude(float pressure_pa) const
     {
@@ -634,93 +801,218 @@ public:
         return 44330.0f * (1.0f - powf(pressure_pa / _pad_pressure, 0.1902949f));
     }
 
-    /** Raise or lower how much the barometer is believed. */
+    /**
+     * Barometer trust. `trusted` false means the burn is running and the
+     * plume is corrupting static pressure — see the note above on why
+     * this inflates a variance instead of moving a pole.
+     */
     void set_baro_trust(bool trusted)
     {
-        _baro_w = trusted ? BARO_W_NOMINAL : BARO_W_BURN;
+        const float s = trusted ? BARO_SIGMA : BARO_SIGMA_BURN;
+        _baro_var = s * s;
     }
 
     /**
-     * One filter step.
-     *
-     * az_world is world-frame vertical acceleration with gravity ALREADY
-     * REMOVED, in m/s^2, positive up — that is what the fusion library's
-     * getGlobalLinearAcceleration() produces.
+     * One prediction step. a_* is pad-ENU acceleration in m/s^2 with
+     * gravity already removed, az positive up.
      */
-    void step(float dt, float ax_world, float ay_world, float az_world,
-              float h_baro, bool baro_fresh)
+    void predict(float dt, float ax, float ay, float az)
     {
-        if (dt <= 0.0f || dt > 0.1f) return;      // a stalled tick, not a state
+        if (dt <= 0.0f || dt > 0.1f) return;    // a stalled tick, not a state
 
-        // --- vertical: predict ------------------------------------------
-        const float a_corr = az_world - _bias;
-        _h  += _vz * dt + 0.5f * a_corr * dt * dt;
-        _vz += a_corr * dt;
+        ariadna_kf_predict(&_kx, ax, dt, ACC_PSD_HORZ, ACC_BIAS_RW);
+        ariadna_kf_predict(&_ky, ay, dt, ACC_PSD_HORZ, ACC_BIAS_RW);
+        ariadna_kf_predict(&_kz, az, dt, ACC_PSD_VERT, ACC_BIAS_RW);
 
-        // --- vertical: correct ------------------------------------------
-        //
-        // ONLY on a genuinely new barometer sample, and with the time since
-        // the previous one — not the prediction step.
-        //
-        // This distinction is the whole reason the parameter is called
-        // `baro_fresh` rather than `baro_ok`. The predictor runs at 240 Hz;
-        // the barometer produces a sample at about 50 Hz. Applying the
-        // correction on every predict step would feed the same measurement
-        // in roughly five times, which multiplies the effective correction
-        // gain by five and moves the filter's crossover well above the
-        // bandwidth it was tuned for. The filter would still converge — it
-        // would just be a different filter than the one `_baro_w` claims.
-        _since_corr += dt;
-
-        if (baro_fresh) {
-            // The correction integrates over the interval since the LAST
-            // correction, not over one prediction step. Using the predict
-            // dt here would scale every gain by the ratio of the two rates
-            // and quietly detune the filter by a factor of five.
-            const float cdt = (_since_corr > 0.5f) ? 0.5f : _since_corr;
-            _since_corr = 0.0f;
-
-            const float dt = cdt;      // shadows deliberately: the gains below
-                                       // are all per correction interval
-            const float w  = _baro_w;
-            const float K1 = 3.0f * w;
-            const float K2 = 3.0f * w * w;
-            const float K3 = w * w * w;
-
-            const float e = h_baro - _h;
-            _h    += K1 * e * dt;
-            _vz   += K2 * e * dt;
-            _bias -= K3 * e * dt;
-
-            // Anti-windup. A bias larger than this is not a bias, it is a
-            // broken accelerometer, and letting the filter absorb it would
-            // hide the fault instead of reporting it.
-            if (_bias >  BIAS_LIMIT) _bias =  BIAS_LIMIT;
-            if (_bias < -BIAS_LIMIT) _bias = -BIAS_LIMIT;
-        }
-
-        // --- horizontal: dead reckon ------------------------------------
-        _vx += ax_world * dt;
-        _vy += ay_world * dt;
-
-        // Leak toward zero when GPS cannot anchor it. See the note above:
-        // an unanchored integrator is worse than a slow one.
-        const float leak = expf(-dt / HORIZ_LEAK_TAU);
-        _vx *= leak;
-        _vy *= leak;
-
-        if (_quality < 255) _quality++;
+        ariadna_kf_clamp_bias(&_kx, BIAS_LIMIT);
+        ariadna_kf_clamp_bias(&_ky, BIAS_LIMIT);
+        ariadna_kf_clamp_bias(&_kz, BIAS_LIMIT);
     }
 
-    /** Fold in a GPS velocity fix. Slow anchor, not a measurement. */
-    void fuse_gps_velocity(float ve, float vn, uint8_t hdop_x10)
+    /**
+     * Barometric altitude correction. Vertical position only.
+     *
+     * The re-anchor is not optional here, and it matters more than the
+     * GPS one. The barometer is the ONLY absolute altitude reference this
+     * vehicle has, and the guidance law flies altitude — so a vertical
+     * channel that has drifted far enough to gate the barometer out is a
+     * channel that will gate it out forever, dead reckoning on an
+     * accelerometer all the way to the ground while reporting a
+     * confident, wrong height.
+     *
+     * So a run of consecutive rejections is taken to mean the filter is
+     * wrong rather than the sensor, exactly as on the GPS path. At the
+     * barometer's 50 Hz, BARO_MAX_REJECTS is a little under a second of
+     * disagreement before the filter gives way.
+     *
+     * The threshold is deliberately far longer than any real transient.
+     * A gust, a door, or the vehicle's own wake moves the barometer for a
+     * few samples, not for fifty, and those are what the gate is there to
+     * absorb.
+     */
+    void fuse_baro(float h_baro)
     {
-        // Weight by HDOP: a 0.8 fix is worth believing, a 4.0 fix is not.
-        float k = GPS_VEL_GAIN * (10.0f / (float)(hdop_x10 > 5 ? hdop_x10 : 5));
-        if (k > GPS_VEL_GAIN) k = GPS_VEL_GAIN;
+        if (!_have_pad_ref) return;
 
-        _vx += k * (ve - _vx);
-        _vy += k * (vn - _vy);
+        if (ariadna_kf_correct(&_kz, 0, h_baro, _baro_var, GATE_SIGMA)) {
+            _baro_rejects = 0;
+            return;
+        }
+
+        if (++_baro_rejects >= BARO_MAX_REJECTS) {
+            // Re-anchor on the barometer, keeping velocity and re-opening
+            // the covariance so the next samples can pull it the rest of
+            // the way instead of being gated out in turn. The bias state
+            // is deliberately reset with it: a divergence this large
+            // means whatever it had learned was part of the problem.
+            ariadna_kf_reset(&_kz, h_baro, _kz.x[1],
+                             sqrtf(_baro_var) * 3.0f, 5.0f, BIAS_LIMIT);
+            _baro_rejects = 0;
+        }
+    }
+
+    /**
+     * Fold in a GPS fix: horizontal position, then horizontal velocity.
+     *
+     * `age_s` is how old the fix is by the time it gets here — receiver
+     * processing, time on the wire, and the wait for an estimator slot.
+     * Both measurements are extrapolated forward over it, position by the
+     * filter's velocity and velocity by the measured acceleration. An
+     * uncompensated 150 ms lag at 40 m/s of descent is 6 m of position
+     * error that the filter would otherwise have to interpret as real
+     * motion.
+     *
+     * accel_g is the measured specific force, which de-weights the fix
+     * when the vehicle is being thrown around — that is both when latency
+     * hurts most and when the receiver's tracking loops are under the
+     * most stress.
+     */
+    void fuse_gps(const GpsFix &fix, float age_s, float ax, float ay,
+                  float accel_g, uint32_t now_ms)
+    {
+        if (!fix.valid || fix.fix < 3)              return;
+        if (fix.sats < GPS_MIN_SATS)                return;
+
+        const float hdop = hdop_of(fix);
+        if (hdop > GPS_MAX_HDOP)                    return;
+
+        if (!_have_origin) {
+            set_origin(fix.lat_1e7, fix.lon_1e7);
+            _last_gps_ms = now_ms;
+            return;
+        }
+
+        if (age_s < 0.0f)  age_s = 0.0f;
+        if (age_s > 1.0f)  age_s = 1.0f;
+
+        const float mult = accel_trust(accel_g);
+
+        // --- position ---------------------------------------------------
+        // The lat/lon difference is taken in INTEGER 1e-7 degrees, which
+        // is exact: an int32 subtraction cannot round. This is the one
+        // place a geodetic filter normally has to reach for double —
+        // at 50 deg latitude a float holds only ~4e-6 deg of absolute
+        // longitude, about 0.4 m of quantisation — and carrying the fix
+        // as scaled integers removes the need entirely. The RP2350
+        // emulates double in software, so this is worth the arithmetic.
+        const int32_t dlat = fix.lat_1e7 - _origin_lat;
+        const int32_t dlon = fix.lon_1e7 - _origin_lon;
+
+        float zy = (float)dlat * 1e-7f * (float)DEG_TO_RAD * _m_per_rad_lat;
+        float zx = (float)dlon * 1e-7f * (float)DEG_TO_RAD * _m_per_rad_lon;
+
+        zx += _kx.x[1] * age_s;
+        zy += _ky.x[1] * age_s;
+
+        const float sig_p = GPS_UERE_M * hdop * mult;
+        const float R_pos = sig_p * sig_p;
+
+        const bool ok_x = ariadna_kf_correct(&_kx, 0, zx, R_pos, GATE_SIGMA);
+        const bool ok_y = ariadna_kf_correct(&_ky, 0, zy, R_pos, GATE_SIGMA);
+
+        if (ok_x && ok_y) {
+            _gps_rejects = 0;
+        } else if (++_gps_rejects >= GPS_MAX_REJECTS) {
+            // Repeated rejections mean the filter drifted away from
+            // reality, not that the GPS started lying. Re-anchor on it
+            // and re-open the covariance so the next fixes can pull it
+            // back rather than being gated out in turn.
+            ariadna_kf_reset(&_kx, zx, _kx.x[1], sig_p, 5.0f, BIAS_LIMIT);
+            ariadna_kf_reset(&_ky, zy, _ky.x[1], sig_p, 5.0f, BIAS_LIMIT);
+            _gps_rejects = 0;
+        }
+
+        // --- velocity ---------------------------------------------------
+        // Doppler-derived, and independent of the inertial drift it is
+        // correcting, which makes it the stronger of the two GPS
+        // measurements even though its sigma looks small.
+        const float sig_v = GPS_VEL_SIGMA * hdop * mult;
+        const float R_vel = sig_v * sig_v;
+        ariadna_kf_correct(&_kx, 1, fix.vel_e + ax * age_s, R_vel, GATE_SIGMA);
+        ariadna_kf_correct(&_ky, 1, fix.vel_n + ay * age_s, R_vel, GATE_SIGMA);
+
+        _last_gps_ms = now_ms;
+    }
+
+    /**
+     * Zero-velocity update. PRE-LAUNCH ONLY — see the caller.
+     *
+     * Standing still is the only condition under which accelerometer bias
+     * is directly observable, so a few seconds of this on the pad is worth
+     * more to the bias states than the whole rest of the flight.
+     *
+     * Applied with no innovation gate, because a filter that has diverged
+     * is exactly the case this exists to rescue.
+     */
+    void fuse_zupt(void)
+    {
+        const float R = ZUPT_VEL_SIGMA * ZUPT_VEL_SIGMA;
+        ariadna_kf_correct(&_kx, 1, 0.0f, R, 0.0f);
+        ariadna_kf_correct(&_ky, 1, 0.0f, R, 0.0f);
+        ariadna_kf_correct(&_kz, 1, 0.0f, R, 0.0f);
+        _zupt = true;
+    }
+
+    void clear_zupt(void) { _zupt = false; }
+    bool zupt(void) const { return _zupt; }
+
+    /**
+     * Weak horizontal speed prior. Applied at about 1 Hz whenever GPS has
+     * gone stale.
+     *
+     * WHY THIS EXISTS, AND WHY IT IS NOT THE OLD LEAK. The previous
+     * estimator multiplied horizontal velocity by exp(-dt/20 s) on every
+     * step, unconditionally. That bounded the dead-reckoning drift, and
+     * it was described in its own comment as a deliberate lie — because
+     * it also bled away REAL velocity, by about 40 % over a ten-second
+     * descent, biasing the one horizontal quantity the guidance law
+     * actually flies.
+     *
+     * This says something true instead: the vehicle cannot be travelling
+     * horizontally at HORIZ_PRIOR_SIGMA. It is a genuine prior, not a
+     * fudge, and because it goes in as a measurement the Kalman gain
+     * decides how much notice to take of it:
+     *
+     *   * with the filter converged (P_vv ~ 1), K is about 1/2500 and a
+     *     once-a-second application is worth nothing at all — real
+     *     velocity is left alone, which is exactly what the old leak got
+     *     wrong;
+     *   * after a long outage, P_vv grows to the same order as R, K
+     *     approaches a half, and the prior starts holding the estimate
+     *     inside the envelope.
+     *
+     * So it is silent precisely when the filter knows what it is doing,
+     * and firm precisely when it does not. The failure it prevents is not
+     * a subtle one: an unbounded horizontal velocity eventually exceeds
+     * the Navigation MCU's sanity limits, at which point that board
+     * rejects the WHOLE nav_state — throwing away a perfectly good
+     * altitude and attitude with it, and parking the TVC.
+     */
+    void fuse_horizontal_prior(void)
+    {
+        const float R = HORIZ_PRIOR_SIGMA * HORIZ_PRIOR_SIGMA;
+        ariadna_kf_correct(&_kx, 1, 0.0f, R, 0.0f);
+        ariadna_kf_correct(&_ky, 1, 0.0f, R, 0.0f);
     }
 
     /**
@@ -728,12 +1020,14 @@ public:
      *
      * The hook the lidar and the UWB will use. Deliberately written now,
      * against the RangeFix the future drivers already return, so that
-     * bringing either online does not require touching the filter.
+     * bringing either online does not require touching the filter — with
+     * a Kalman filter it really is one ariadna_kf_correct() call, because the
+     * sensor's own sigma is already the R the update wants.
      *
      * A range sensor is a far better altimeter than a barometer below
-     * about 10 m, and it does not care about the plume — so when this goes
-     * live it should also raise the burn-time trust that set_baro_trust()
-     * currently lowers.
+     * about 10 m, and it does not care about the plume — so when this
+     * goes live it should also relax the burn-time inflation that
+     * set_baro_trust() currently applies.
      */
     void fuse_range(const RangeFix &r)
     {
@@ -741,34 +1035,241 @@ public:
         (void)r;      // NOT IMPLEMENTED — no sensor produces a valid fix yet
     }
 
-    float h(void)    const { return _h; }
-    float vz(void)   const { return _vz; }
-    float vx(void)   const { return _vx; }
-    float vy(void)   const { return _vy; }
-    float bias(void) const { return _bias; }
-    uint8_t quality(void) const { return _quality; }
+    // --- outputs -------------------------------------------------------
+    float px(void) const { return _kx.x[0]; }
+    float py(void) const { return _ky.x[0]; }
+    float pz(void) const { return _kz.x[0]; }
+    float vx(void) const { return _kx.x[1]; }
+    float vy(void) const { return _ky.x[1]; }
+    float vz(void) const { return _kz.x[1]; }
+    float bias_x(void) const { return _kx.x[2]; }
+    float bias_y(void) const { return _ky.x[2]; }
+    float bias_z(void) const { return _kz.x[2]; }
+
+    float sigma_pos_h(void) const
+    {
+        return 0.5f * (ariadna_kf_sigma(&_kx, 0) + ariadna_kf_sigma(&_ky, 0));
+    }
+    float sigma_vel_h(void) const
+    {
+        return 0.5f * (ariadna_kf_sigma(&_kx, 1) + ariadna_kf_sigma(&_ky, 1));
+    }
+    float sigma_pos_v(void) const { return ariadna_kf_sigma(&_kz, 0); }
+
+    bool gps_aided(uint32_t now_ms) const
+    {
+        return _last_gps_ms != 0 && (uint32_t)(now_ms - _last_gps_ms) < 3000u;
+    }
+
+    /**
+     * Estimator self-confidence, 0..255.
+     *
+     * Derived from the filter's own covariance rather than counted up
+     * from boot. The old version incremented once per step until it hit
+     * 255, which measured how long the board had been powered on and
+     * nothing else — it read "full confidence" for a filter that had
+     * never seen a measurement. This reads what the filter actually
+     * believes: 255 at or below QUALITY_BEST_M of horizontal 1-sigma,
+     * falling to 0 at QUALITY_WORST_M, and it drops on its own during a
+     * GPS outage.
+     */
+    uint8_t quality(void) const
+    {
+        if (!_have_pad_ref) return 0;
+
+        const float s = sigma_pos_h();
+        if (s <= QUALITY_BEST_M)  return 255;
+        if (s >= QUALITY_WORST_M) return 0;
+
+        const float f = (QUALITY_WORST_M - s) / (QUALITY_WORST_M - QUALITY_BEST_M);
+        return (uint8_t)(f * 255.0f);
+    }
+
+    // --- tuning, all exposed so the self test can reason about them ----
+    //
+    // ACC_PSD is the acceleration noise DENSITY driving velocity, in
+    // m/s^2 per sqrt(Hz). The ICM42688P itself is around 0.0007. These
+    // are nearly three orders larger ON PURPOSE, because what actually
+    // perturbs the velocity estimate is residual attitude error and
+    // airframe vibration, not sensor noise — and a solid motor on the
+    // same frame produces a great deal of both. Raise them if the filter
+    // lags real motion; lower them if the output is jittery between
+    // fixes.
+    static constexpr float ACC_PSD_HORZ   = 0.5f;    // m/s^2/sqrt(Hz)
+    static constexpr float ACC_PSD_VERT   = 0.6f;    // also absorbs baro noise
+    static constexpr float ACC_BIAS_RW    = 0.004f;  // m/s^2/sqrt(s)
+    static constexpr float BIAS_LIMIT     = 1.5f;    // m/s^2, as before
+
+    // BARO_SIGMA is set from the ATMOSPHERE, not from the BMP580's noise
+    // figure. Per sample the sensor contributes centimetres at OSR x16.
+    // What does not average down is the air — gusts, the vehicle's own
+    // wake, ground effect near the pad — which is correlated over
+    // seconds. Quoting the sensor's number here would make the filter
+    // over-confident in altitude and slow to accept any correction.
+    static constexpr float BARO_SIGMA      = 0.5f;   // m
+    // During the burn, the plume. Twenty-five metres is not a
+    // measurement, it is a formal way of saying "ignore this until the
+    // motor is out", while still letting a truly enormous discrepancy
+    // pull the filter back.
+    static constexpr float BARO_SIGMA_BURN = 25.0f;  // m
+
+    static constexpr float GPS_UERE_M     = 2.5f;    // m per unit HDOP
+    static constexpr float GPS_VEL_SIGMA  = 0.3f;    // m/s at HDOP 1
+    static constexpr float GPS_MAX_HDOP   = 6.0f;
+    static constexpr uint8_t GPS_MIN_SATS = 4;
+    // A rocket lives at high g by design, so the knee sits far above the
+    // 2 g that suits a car. Below it the fix is taken at face value.
+    static constexpr float GPS_ACCEL_KNEE_G = 4.0f;
+    static constexpr float GPS_ACCEL_SLOPE  = 1.0f;
+    static constexpr float GPS_ACCEL_MAX    = 8.0f;
+
+    static constexpr float GATE_SIGMA      = 4.0f;
+    static constexpr uint8_t GPS_MAX_REJECTS  = 12;
+    static constexpr uint8_t BARO_MAX_REJECTS = 40;   // ~0.8 s at 50 Hz
+    static constexpr float ZUPT_VEL_SIGMA  = 0.02f;  // m/s
+
+    // The horizontal speed this vehicle is asserted not to exceed. Well
+    // outside the 0-15 m/s design entry envelope, so it never argues with
+    // a real trajectory — it only catches an estimate that has stopped
+    // being one. See fuse_horizontal_prior().
+    static constexpr float HORIZ_PRIOR_SIGMA = 50.0f;  // m/s
+
+    static constexpr float QUALITY_BEST_M  = 1.0f;
+    static constexpr float QUALITY_WORST_M = 25.0f;
 
 private:
-    // Barometer bandwidth, rad/s. Nominal is a compromise between baro
-    // noise (which wants it low) and accelerometer drift (which wants it
-    // high). BURN is deliberately near-deaf: see the plume note above.
-    static constexpr float BARO_W_NOMINAL  = 2.0f;
-    static constexpr float BARO_W_BURN     = 0.3f;
-    static constexpr float BIAS_LIMIT      = 1.5f;    // m/s^2
-    static constexpr float HORIZ_LEAK_TAU  = 20.0f;   // s
-    static constexpr float GPS_VEL_GAIN    = 0.15f;
+    void reset_states(void)
+    {
+        // Horizontal starts wide open: with no GPS fix yet the position
+        // is genuinely unknown, and saying so lets the first fix snap it
+        // into place instead of being gated out as an outlier.
+        ariadna_kf_reset(&_kx, 0.0f, 0.0f, 100.0f, 2.0f, 0.5f);
+        ariadna_kf_reset(&_ky, 0.0f, 0.0f, 100.0f, 2.0f, 0.5f);
+        // Vertical starts well known: the pad reference was just taken,
+        // so the vehicle is at 0 m by definition and the barometer works
+        // from that instant.
+        ariadna_kf_reset(&_kz, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f);
+        _gps_rejects  = 0;
+        _baro_rejects = 0;
+        _zupt = false;
+    }
 
-    float   _h = 0.0f, _vz = 0.0f, _bias = 0.0f;
-    float   _vx = 0.0f, _vy = 0.0f;
-    float   _since_corr = 0.0f;   // seconds of prediction since the last
-                                  // barometer correction
-    float   _pad_pressure = 0.0f;
-    bool    _have_pad_ref = false;
-    float   _baro_w = BARO_W_NOMINAL;
-    uint8_t _quality = 0;
+    static float hdop_of(const GpsFix &f)
+    {
+        const float h = (float)f.hdop_x10 * 0.1f;
+        return h < 0.8f ? 0.8f : h;      // no receiver is better than this
+    }
+
+    static float accel_trust(float accel_g)
+    {
+        if (accel_g <= GPS_ACCEL_KNEE_G) return 1.0f;
+        const float m = 1.0f + GPS_ACCEL_SLOPE * (accel_g - GPS_ACCEL_KNEE_G);
+        return (m > GPS_ACCEL_MAX) ? GPS_ACCEL_MAX : m;
+    }
+
+    /**
+     * Fix the local tangent plane at the pad.
+     *
+     * The radii of curvature are computed ONCE, here, rather than a full
+     * geodetic projection per fix. Over the few kilometres this vehicle
+     * can reach, a tangent plane built from them is accurate to well
+     * under a metre, and it costs two transcendental calls at arming
+     * instead of several on every fix.
+     */
+    void set_origin(int32_t lat_1e7, int32_t lon_1e7)
+    {
+        _origin_lat = lat_1e7;
+        _origin_lon = lon_1e7;
+
+        const float lat = (float)lat_1e7 * 1e-7f * (float)DEG_TO_RAD;
+        const float s   = sinf(lat);
+        const float e2  = 6.69437999014e-3f;
+        const float w   = 1.0f - e2 * s * s;
+        const float a   = 6378137.0f;
+        const float rw  = sqrtf(w);
+
+        _m_per_rad_lon = (a / rw) * cosf(lat);          // prime vertical x cos
+        _m_per_rad_lat = (a * (1.0f - e2)) / (w * rw);  // meridian
+        _have_origin   = true;
+    }
+
+    ariadna_kf_t   _kx, _ky, _kz;          // East, North, Up
+
+    float    _pad_pressure = 0.0f;
+    bool     _have_pad_ref = false;
+
+    bool     _have_origin  = false;
+    int32_t  _origin_lat   = 0;
+    int32_t  _origin_lon   = 0;
+    float    _m_per_rad_lat = 6367000.0f;
+    float    _m_per_rad_lon = 6367000.0f;
+
+    float    _baro_var    = BARO_SIGMA * BARO_SIGMA;
+    uint8_t  _gps_rejects  = 0;
+    uint8_t  _baro_rejects = 0;
+    uint32_t _last_gps_ms = 0;
+    bool     _zupt        = false;
 };
 
 static Estimator s_est;
+
+/**
+ * How old a GPS fix is before this board ever sees it.
+ *
+ * The receiver computes a solution, then formats and clocks out an NMEA
+ * sentence; only then does core 1 parse it. This constant covers the part
+ * that happens before the timestamp is taken. The rest — the wait for an
+ * estimator slot, and the cross-core handover — is measured from the
+ * timestamp and added on top at the call site.
+ *
+ * 0.10 to 0.25 s is typical of a consumer receiver. Getting it roughly
+ * right matters more than getting it exactly right: at a 40 m/s descent
+ * an uncompensated 150 ms is 6 m of position error, and any value in the
+ * right range removes most of it.
+ */
+static const float GPS_LATENCY_S = 0.15f;
+
+/** Measured specific force magnitude, in g. Includes gravity. */
+static float accel_magnitude_g(void)
+{
+    TriSenseDataSnapshot snap;
+    if (!sensor.getSnapshot(snap)) return 1.0f;    // assume 1 g rather than 0
+    const float g2 = snap.accelX * snap.accelX +
+                     snap.accelY * snap.accelY +
+                     snap.accelZ * snap.accelZ;
+    return sqrtf(g2) * (1.0f / 9.80665f);          // library reports m/s^2
+}
+
+/**
+ * Standstill detector for the zero-velocity update.
+ *
+ * Specific force within a small tolerance of 1 g AND a quiet gyro, held
+ * for long enough that a momentary coincidence does not trigger it.
+ *
+ * Read the ZUPT gating note at the call site before reusing this: on its
+ * own, "1 g and not rotating" does NOT mean stationary.
+ */
+static bool motion_is_quiet(float accel_g, uint32_t now_ms)
+{
+    static const float    ZUPT_ACC_TOL_G    = 0.04f;
+    static const float    ZUPT_GYRO_TOL_DPS = 2.0f;
+    static const uint32_t ZUPT_HOLD_MS      = 300;
+
+    static uint32_t quiet_since_ms = 0;
+
+    const float gsum = fabsf((float)fusion.lastGx) +
+                       fabsf((float)fusion.lastGy) +
+                       fabsf((float)fusion.lastGz);
+
+    if (fabsf(accel_g - 1.0f) < ZUPT_ACC_TOL_G && gsum < ZUPT_GYRO_TOL_DPS) {
+        if (quiet_since_ms == 0) quiet_since_ms = now_ms ? now_ms : 1;
+    } else {
+        quiet_since_ms = 0;
+    }
+
+    return quiet_since_ms != 0 &&
+           (uint32_t)(now_ms - quiet_since_ms) >= ZUPT_HOLD_MS;
+}
 
 // =====================================================================
 //  8. LINK
@@ -943,11 +1444,45 @@ static bool self_test(void)
         }
     }
 
+    // --- quaternion agrees with the matrix -------------------------------
+    // These two are built from the same angles by different arithmetic and
+    // are shipped side by side in every packet. If they ever disagree, one
+    // of the two things the Navigation MCU reads is a lie, so it is
+    // checked rather than assumed. A test vector off every axis catches a
+    // sign error that a symmetric one would hide.
+    {
+        const float v[3] = { 0.37f, -0.61f, 0.70f };
+        const float angles[3][3] = {
+            {  0.0f,   0.0f,   0.0f },
+            { 23.0f, -17.0f, 200.0f },
+            {-11.0f,  40.0f,  95.0f }
+        };
+        for (int i = 0; i < 3; i++) {
+            float Rq[3][3], qq[4], a[3], b[3];
+            build_rotation(angles[i][0], angles[i][1], angles[i][2], Rq);
+            build_quaternion(angles[i][0], angles[i][1], angles[i][2], qq);
+            rotate(Rq, v, a);
+            rotate_q(qq, v, b);
+            for (int k = 0; k < 3; k++) {
+                if (fabsf(a[k] - b[k]) > 1e-3f) {
+                    POS_PRINT("POST quat/matrix case %d axis %d: %.4f vs %.4f\n",
+                              i, k, a[k], b[k]);
+                    ok = false;
+                }
+            }
+            float n2 = qq[0]*qq[0] + qq[1]*qq[1] + qq[2]*qq[2] + qq[3]*qq[3];
+            if (fabsf(n2 - 1.0f) > 1e-4f) {
+                POS_PRINT("POST quat norm %.5f\n", n2);
+                ok = false;
+            }
+        }
+    }
+
     // --- barometric conversion ------------------------------------------
     {
         Estimator e;
         e.begin();
-        e.set_pad_reference(100000.0f);
+        e.set_pad_reference(100000.0f, nullptr);
         if (fabsf(e.baro_altitude(100000.0f)) > 0.05f) {
             POS_PRINT("POST baro at pad %.3f m\n", e.baro_altitude(100000.0f));
             ok = false;
@@ -966,30 +1501,159 @@ static bool self_test(void)
         }
     }
 
-    // --- vertical filter converges --------------------------------------
-    // Hold a constant barometric altitude with a biased accelerometer and
-    // check that the filter finds both the altitude and the bias. If this
-    // fails the gains are wrong, not the sensors.
+    // --- vertical filter learns the bias on the pad ----------------------
+    //
+    // The pad configuration exactly: sitting still at zero altitude, the
+    // barometer agreeing, ZUPT running, and an accelerometer reading a
+    // constant 0.4 m/s^2 that is not there. Twenty seconds later the
+    // filter must have attributed all of it to bias and none of it to
+    // motion.
+    //
+    // It is worth understanding why ZUPT is in this test rather than left
+    // out for simplicity. With only the barometer, position is the sole
+    // measurement, and a constant bias and a slowly growing velocity
+    // explain a position error almost equally well — the two states are
+    // barely separable, and the same run takes over two minutes to reach
+    // this accuracy. A velocity measurement breaks the degeneracy
+    // directly, which is what makes standstill the one condition where
+    // accelerometer bias is genuinely observable. This test would pass
+    // eventually without ZUPT; the vehicle would not wait.
     {
         Estimator e;
         e.begin();
-        e.set_pad_reference(100000.0f);
-        const float dt = 1.0f / (float)ESTIMATOR_HZ;
+        e.set_pad_reference(100000.0f, nullptr);
+        const float dt    = 1.0f / (float)ESTIMATOR_HZ;
         const int   every = (int)(ESTIMATOR_HZ / BARO_HZ);
-        for (int i = 0; i < (int)ESTIMATOR_HZ * 20; i++)
-            // Correction only on a fresh sample, exactly as in flight.
-            e.step(dt, 0.0f, 0.0f, 0.4f, 100.0f, (i % every) == 0);
+        for (int i = 0; i < (int)ESTIMATOR_HZ * 20; i++) {
+            e.predict(dt, 0.0f, 0.0f, 0.4f);
+            if ((i % every) == 0) {
+                e.fuse_baro(0.0f);      // on the pad, so the datum is 0
+                e.fuse_zupt();
+            }
+        }
 
-        if (fabsf(e.h() - 100.0f) > 1.0f) {
-            POS_PRINT("POST filter h %.2f want 100\n", e.h());
+        if (fabsf(e.pz()) > 0.5f) {
+            POS_PRINT("POST filter pz %.2f want 0\n", e.pz());
             ok = false;
         }
-        if (fabsf(e.vz()) > 0.5f) {
-            POS_PRINT("POST filter vz %.2f want 0\n", e.vz());
+        if (fabsf(e.vz()) > 0.05f) {
+            POS_PRINT("POST filter vz %.3f want 0\n", e.vz());
             ok = false;
         }
-        if (fabsf(e.bias() - 0.4f) > 0.1f) {
-            POS_PRINT("POST filter bias %.3f want 0.4\n", e.bias());
+        if (fabsf(e.bias_z() - 0.4f) > 0.1f) {
+            POS_PRINT("POST filter bias %.3f want 0.4\n", e.bias_z());
+            ok = false;
+        }
+    }
+
+    // --- the barometer re-anchor breaks a gate lockout -------------------
+    //
+    // A vertical channel that has drifted far enough to gate the
+    // barometer out would otherwise stay drifted forever, dead reckoning
+    // to the ground on a confident wrong altitude. Force exactly that
+    // and confirm the filter gives way to the sensor.
+    {
+        Estimator e;
+        e.begin();
+        e.set_pad_reference(100000.0f, nullptr);
+
+        // 200 m of disagreement is far outside any gate.
+        const int every = (int)(ESTIMATOR_HZ / BARO_HZ);
+        for (int i = 0; i < (int)ESTIMATOR_HZ * 3; i++) {
+            e.predict(1.0f / (float)ESTIMATOR_HZ, 0.0f, 0.0f, 0.0f);
+            if ((i % every) == 0) e.fuse_baro(200.0f);
+        }
+
+        if (fabsf(e.pz() - 200.0f) > 5.0f) {
+            POS_PRINT("POST baro re-anchor failed: pz %.2f want 200\n", e.pz());
+            ok = false;
+        }
+    }
+
+    // --- horizontal channel holds a GPS position -------------------------
+    // The capability the old estimator did not have at all, so it is worth
+    // checking that it exists rather than only that it is well tuned.
+    // Origin at the pad, then a fix 50 m East and 20 m North held steady:
+    // the filter must converge on it and stay there.
+    {
+        Estimator e;
+        e.begin();
+
+        GpsFix pad;
+        memset(&pad, 0, sizeof(pad));
+        pad.lat_1e7 = 500000000;      // 50 deg N, 14 deg E
+        pad.lon_1e7 = 140000000;
+        pad.sats = 9; pad.fix = 3; pad.hdop_x10 = 10; pad.valid = true;
+        e.set_pad_reference(100000.0f, &pad);
+
+        if (!e.have_origin()) {
+            Serial.println("POST horizontal origin not captured");
+            ok = false;
+        }
+
+        // 50 m East, 20 m North of the origin, in 1e-7 degree steps. At
+        // 50 deg latitude a degree of longitude is ~71.7 km and a degree
+        // of latitude ~111.2 km.
+        GpsFix f = pad;
+        f.lon_1e7 = pad.lon_1e7 + (int32_t)(50.0f / 71700.0f * 1e7f);
+        f.lat_1e7 = pad.lat_1e7 + (int32_t)(20.0f / 111200.0f * 1e7f);
+
+        const float dt = 1.0f / (float)ESTIMATOR_HZ;
+        for (int i = 0; i < (int)ESTIMATOR_HZ * 10; i++) {
+            e.predict(dt, 0.0f, 0.0f, 0.0f);
+            if ((i % (int)(ESTIMATOR_HZ / 5)) == 0)      // 5 Hz of fixes
+                e.fuse_gps(f, 0.0f, 0.0f, 0.0f, 1.0f, (uint32_t)(i * 1000 / ESTIMATOR_HZ));
+        }
+
+        // Two metres of tolerance on a GPS-derived position is generous by
+        // design: this checks the sign, the axis assignment and the scale,
+        // not the receiver.
+        if (fabsf(e.px() - 50.0f) > 2.0f || fabsf(e.py() - 20.0f) > 2.0f) {
+            POS_PRINT("POST horizontal px %.2f py %.2f want 50 20\n",
+                      e.px(), e.py());
+            ok = false;
+        }
+        // Stationary target: the velocity estimate must not run away.
+        if (fabsf(e.vx()) > 1.0f || fabsf(e.vy()) > 1.0f) {
+            POS_PRINT("POST horizontal vx %.2f vy %.2f want 0\n", e.vx(), e.vy());
+            ok = false;
+        }
+        // And the filter must have become confident about it.
+        if (!(e.sigma_pos_h() < 5.0f) || e.quality() == 0) {
+            POS_PRINT("POST horizontal sigma %.2f quality %d\n",
+                      e.sigma_pos_h(), (int)e.quality());
+            ok = false;
+        }
+    }
+
+    // --- the innovation gate actually rejects ----------------------------
+    // A converged filter must not swallow a fix hundreds of metres away.
+    // This is the multipath case, and it is the one that would otherwise
+    // put a step into the position the guidance law flies to.
+    {
+        Estimator e;
+        e.begin();
+
+        GpsFix pad;
+        memset(&pad, 0, sizeof(pad));
+        pad.lat_1e7 = 500000000;
+        pad.lon_1e7 = 140000000;
+        pad.sats = 9; pad.fix = 3; pad.hdop_x10 = 10; pad.valid = true;
+        e.set_pad_reference(100000.0f, &pad);
+
+        const float dt = 1.0f / (float)ESTIMATOR_HZ;
+        for (int i = 0; i < (int)ESTIMATOR_HZ * 10; i++) {
+            e.predict(dt, 0.0f, 0.0f, 0.0f);
+            if ((i % (int)(ESTIMATOR_HZ / 5)) == 0)
+                e.fuse_gps(pad, 0.0f, 0.0f, 0.0f, 1.0f, (uint32_t)(i * 1000 / ESTIMATOR_HZ));
+        }
+
+        GpsFix bad = pad;
+        bad.lon_1e7 += (int32_t)(300.0f / 71700.0f * 1e7f);   // 300 m jump
+        e.fuse_gps(bad, 0.0f, 0.0f, 0.0f, 1.0f, 100000u);
+
+        if (fabsf(e.px()) > 10.0f) {
+            POS_PRINT("POST gate let a 300 m jump through: px %.2f\n", e.px());
             ok = false;
         }
     }
@@ -1073,6 +1737,7 @@ void loop()
     static float    h_baro      = 0.0f;
     static uint32_t last_step_us = 0;
     static uint32_t last_gps_ms  = 0;
+    static uint32_t last_prior_ms = 0;
     static uint32_t next_status_ms = 0;
 
     const uint32_t period = (uint32_t)(1000000UL / ESTIMATOR_HZ);
@@ -1091,8 +1756,16 @@ void loop()
     if (s_req_pad_ref) {
         s_req_pad_ref = false;
         float p = sensor.readPressure();
-        s_est.set_pad_reference(p);
-        POS_PRINT("# pad reference %.1f Pa\n", p);
+        // The horizontal origin is captured from the same command, so the
+        // pad is the origin of BOTH channels and px/py mean "metres from
+        // the pad" rather than "metres from wherever the first fix
+        // happened to land". Without a fix yet, the vertical reference is
+        // still taken and the origin is picked up on the first good one.
+        GpsFix g;
+        const bool have = gps_acquire(&g);
+        s_est.set_pad_reference(p, have ? &g : nullptr);
+        POS_PRINT("# pad reference %.1f Pa, origin %s\n",
+                  p, s_est.have_origin() ? "set" : "pending GPS");
     }
     if (s_req_cal_gyro) {
         s_req_cal_gyro = false;
@@ -1109,8 +1782,16 @@ void loop()
     if (fused) s_sensor_ok |= ARIADNA_SENS_IMU;
 
     // ---- barometer ------------------------------------------------------
-    // baro_fresh is true for exactly ONE estimator step per sample. The
-    // correction consumes it; see Estimator::step().
+    // baro_fresh is true for exactly ONE estimator step per sample.
+    //
+    // This still matters with a Kalman filter, for a sharper reason than
+    // it did with the complementary one. The predictor runs at 240 Hz and
+    // the barometer produces a sample at 50 Hz; correcting on every step
+    // would feed the SAME measurement in five times, and the filter would
+    // count each as independent evidence. It would not merely be
+    // mistuned — it would end up roughly sqrt(5) times more confident in
+    // its altitude than the sensor justifies, and quietly reject the GPS
+    // corrections that disagree.
     bool baro_fresh = false;
     if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
@@ -1128,8 +1809,9 @@ void loop()
     float roll, pitch, heading;
     fusion.getOrientationDegrees(roll, pitch, heading);
 
-    float R[3][3], u[3];
+    float R[3][3], u[3], q[4];
     build_rotation(roll, pitch, heading, R);
+    build_quaternion(roll, pitch, heading, q);
     rotate(R, BODY_THRUST_AXIS, u);
 
     // Gyro rates, straight from the sensor, rotated into the pad frame.
@@ -1142,33 +1824,100 @@ void loop()
     rotate(R, g_body, w);
 
     // ---- acceleration ----------------------------------------------------
-    // World frame, gravity removed, m/s^2. The library's world frame is
-    // built from the same heading convention as build_rotation(), so its X
-    // is North and Y is East; the estimator wants ENU, hence the swap.
-    // BENCH THIS with the board tilted along one axis at a time.
-    float an, ae, aup;
-    fusion.getGlobalLinearAcceleration(an, ae, aup, ACCEL_UNIT_MS2);
-    const float ax_world = ae;      // East
-    const float ay_world = an;      // North
+    //
+    // BODY-frame linear acceleration, rotated into pad-ENU by the SAME
+    // matrix that produced u and w above.
+    //
+    // This used to call getGlobalLinearAcceleration() and relabel its X
+    // as North and Y as East. That was wrong, and wrong in the quietest
+    // possible way. The library builds its world frame as Rz(+heading)
+    // with heading a clockwise compass bearing, while pad-ENU azimuth
+    // runs counter-clockwise from East — the two agree along the body's
+    // +X axis and are MIRRORED for +Y. A bench test with the board
+    // pointed North, or tilted along +X only, passes either way; every
+    // other heading fed the horizontal channel an East component of the
+    // wrong sign.
+    //
+    // getLinearAcceleration() is yaw-independent by construction: the
+    // gravity vector it removes is the third row of the rotation matrix,
+    // a function of roll and pitch only. So it is safe to take from the
+    // library and rotate here, which also means this file now performs
+    // exactly ONE body-to-pad rotation and everything on the wire is
+    // consistent with it.
+    float ab[3];
+    fusion.getLinearAcceleration(ab[0], ab[1], ab[2], ACCEL_UNIT_MS2);
+    float a_pad[3];
+    rotate(R, ab, a_pad);
 
     // ---- filter step ------------------------------------------------------
     uint32_t step_now = micros();
     float dt = (float)(step_now - last_step_us) * 1e-6f;
     last_step_us = step_now;
-    s_est.step(dt, ax_world, ay_world, aup, h_baro, baro_fresh);
 
-    // The plume corrupts the barometer during the burn. The Master tells us
-    // when that is; until then the barometer is the altitude reference.
+    // The plume corrupts the barometer during the burn. The Master tells
+    // us when that is; until then the barometer is the altitude
+    // reference. Set BEFORE the correction, not after, or the first
+    // sample of the burn goes in at full weight.
     s_est.set_baro_trust(!(s_have_master &&
                            s_master.state == ARIADNA_STATE_GUIDANCE));
 
+    s_est.predict(dt, a_pad[0], a_pad[1], a_pad[2]);
+    if (baro_fresh) s_est.fuse_baro(h_baro);
+
     // ---- GPS -------------------------------------------------------------
+    // Position and velocity both, with the fix aged forward to now. The
+    // old estimator fused velocity only, at a fixed gain; there was no
+    // horizontal position state for the position to correct.
     GpsFix gps;
     bool have_gps = gps_acquire(&gps);
+    const uint32_t now_ms = millis();
+    const float amag_g = accel_magnitude_g();
+
     if (have_gps && gps.valid && gps.t_ms != last_gps_ms) {
         last_gps_ms = gps.t_ms;
-        s_est.fuse_gps_velocity(gps.vel_e, gps.vel_n, gps.hdop_x10);
+        const float age_s = (float)(uint32_t)(now_ms - gps.t_ms) * 1e-3f
+                          + GPS_LATENCY_S;
+        s_est.fuse_gps(gps, age_s, a_pad[0], a_pad[1], amag_g, now_ms);
         s_sensor_ok |= ARIADNA_SENS_GPS;
+    }
+
+    // ---- zero-velocity update, ON THE PAD ONLY ----------------------------
+    //
+    // Standing still is the only condition under which accelerometer bias
+    // is directly observable, so the minutes spent on the pad are where
+    // the bias states are actually learned. It is the cheapest and most
+    // effective thing in this filter.
+    //
+    // IT IS ALSO THE MOST DANGEROUS, WHICH IS WHY IT IS GATED ON THE
+    // MISSION STATE AND NOT ON THE MOTION TEST ALONE. A vehicle in
+    // steady-state descent at terminal velocity — drag balancing weight —
+    // reads exactly 1 g with a quiet gyro. That is indistinguishable from
+    // sitting on the pad by any test this board can make from its own
+    // sensors, and applying a ZUPT there would pin the velocity estimate
+    // to zero during the descent: the guidance law divides by vertical
+    // speed, so it would compute an infinite time-to-go and never light
+    // the motor.
+    //
+    // So the motion test only ever runs while the Master says the vehicle
+    // has not left the pad. Before the Master is heard from at all, the
+    // state is unknown and the answer is no.
+    const bool on_pad = s_have_master &&
+                        (s_master.state == ARIADNA_STATE_BOOT  ||
+                         s_master.state == ARIADNA_STATE_IDLE  ||
+                         s_master.state == ARIADNA_STATE_ARMED ||
+                         s_master.state == ARIADNA_STATE_TEST);
+
+    if (on_pad && motion_is_quiet(amag_g, now_ms)) s_est.fuse_zupt();
+    else                                           s_est.clear_zupt();
+
+    // ---- horizontal speed prior, ~1 Hz while GPS is stale ----------------
+    // Keeps a dead-reckoned horizontal velocity inside the physical
+    // envelope without touching it while the filter is still confident.
+    // See Estimator::fuse_horizontal_prior() for why this is not the leak
+    // it replaced.
+    if (!s_est.gps_aided(now_ms) && (uint32_t)(now_ms - last_prior_ms) >= 1000u) {
+        last_prior_ms = now_ms;
+        s_est.fuse_horizontal_prior();
     }
 
     // ---- future sensors ---------------------------------------------------
@@ -1189,20 +1938,23 @@ void loop()
     ariadna_nav_state_t st;
     memset(&st, 0, sizeof(st));
     st.t_ms  = millis();
-    st.h     = s_est.h();
-    st.vx    = s_est.vx();
-    st.vy    = s_est.vy();
-    st.vz    = s_est.vz();
+    st.px    = s_est.px();  st.py = s_est.py();  st.pz = s_est.pz();
+    st.vx    = s_est.vx();  st.vy = s_est.vy();  st.vz = s_est.vz();
+
+    // Acceleration goes out with the filter's ESTIMATED BIAS REMOVED, not
+    // as it came off the rotation. That is the number the vehicle is
+    // actually being accelerated by, and it is what the Navigation MCU's
+    // dead reckoner should integrate across a link gap — handing it the
+    // biased version would make it reproduce the very error the bias
+    // state exists to take out.
+    st.ax    = a_pad[0] - s_est.bias_x();
+    st.ay    = a_pad[1] - s_est.bias_y();
+    st.az    = a_pad[2] - s_est.bias_z();
+
+    st.qw    = q[0];  st.qx = q[1];  st.qy = q[2];  st.qz = q[3];
     st.ux    = u[0];  st.uy = u[1];  st.uz = u[2];
     st.wx    = w[0];  st.wy = w[1];  st.wz = w[2];
-
-    TriSenseDataSnapshot snap;
-    if (sensor.getSnapshot(snap)) {
-        float g2 = snap.accelX * snap.accelX +
-                   snap.accelY * snap.accelY +
-                   snap.accelZ * snap.accelZ;
-        st.accel_mag = sqrtf(g2) * (1.0f / 9.80665f);   // library gives m/s^2
-    }
+    st.accel_mag = amag_g;
 
     st.quality = s_est.quality();
     st.flags   = 0;
@@ -1211,6 +1963,9 @@ void loop()
     if (s_sensor_ok & ARIADNA_SENS_MAG)  st.flags |= ARIADNA_NAV_MAG_OK;
     if (have_gps && gps.valid && gps.fix >= 3) st.flags |= ARIADNA_NAV_GPS_FIX;
     if (s_est.have_pad_reference())      st.flags |= ARIADNA_NAV_PAD_REF;
+    if (s_est.have_origin())             st.flags |= ARIADNA_NAV_POS_ORIGIN;
+    if (s_est.gps_aided(now_ms))         st.flags |= ARIADNA_NAV_GPS_AIDED;
+    if (s_est.zupt())                    st.flags |= ARIADNA_NAV_ZUPT;
 
     // VALID is what unlocks control on the Navigation MCU, so it demands
     // everything the guidance law actually depends on: an attitude, a
@@ -1243,6 +1998,8 @@ void loop()
         ps.pitch        = pitch;
         ps.yaw          = heading;
         ps.temp_c       = sensor.readTemperature();
+        ps.sigma_pos_h  = s_est.sigma_pos_h();
+        ps.sigma_vel_h  = s_est.sigma_vel_h();
         ps.sensor_ok    = s_sensor_ok;
         ps.imu_overflow = (uint16_t)sensor.imu.getFIFOOverflowCount();
         ps.cal_state    = s_cal_state;
@@ -1271,13 +2028,125 @@ void loop()
 //  what lets the DMA transmit ring be a single-producer structure with no
 //  lock in it.
 // =====================================================================
+/**
+ * Send a PCAS command as "$<body>*<checksum>\r\n".
+ *
+ * The checksum is computed here rather than written out in the constants,
+ * so a new command can be added without hand-calculating one — which is
+ * the kind of arithmetic that is easy to get wrong and impossible to
+ * notice, because a bad checksum makes the receiver ignore the sentence
+ * silently.
+ */
+static void gps_send(const char *body)
+{
+    uint8_t cs = 0;
+    for (const char *p = body; *p; ++p) cs ^= (uint8_t)*p;
+    char tail[6];
+    snprintf(tail, sizeof(tail), "*%02X\r\n", cs);
+    GpsPort.print('$');
+    GpsPort.print(body);
+    GpsPort.print(tail);
+    GpsPort.flush();
+}
+
+/** True if plausible NMEA arrives at the currently open baud within `ms`. */
+static bool gps_listening(uint32_t ms)
+{
+    NmeaParser probe;
+    probe.begin();
+    uint8_t sentences = 0;
+    const uint32_t t0 = millis();
+    while ((uint32_t)(millis() - t0) < ms) {
+        while (GpsPort.available()) {
+            if (probe.feed((char)GpsPort.read()) && ++sentences >= 2) return true;
+        }
+    }
+    return false;
+}
+
+static void gps_open(uint32_t baud)
+{
+    GpsPort.end();
+    GpsPort.begin(baud);
+    delay(50);
+}
+
+/**
+ * Bring the receiver up at a useful rate.
+ *
+ * WHY THIS EXISTS. The module boots at 9600 baud emitting 1 Hz. One fix
+ * per second is close to worthless to this filter: the vehicle descends
+ * at up to 45 m/s, so consecutive fixes are 45 m apart and the whole
+ * descent from the guidance entry altitude is covered by about two of
+ * them. At 5 Hz the same descent gets ten, which is the difference
+ * between GPS anchoring the horizontal channel and merely decorating it.
+ *
+ * Three steps, each with a way back:
+ *
+ *   1. Try 115200 first — the module keeps its baud across an MCU reset,
+ *      so after the first boot it is probably already there.
+ *   2. Otherwise 9600, ask for 115200, reopen and confirm. If the switch
+ *      does not take, stay at 9600 and drop to 1 Hz rather than saturate
+ *      a link that cannot carry 5 Hz.
+ *   3. Trim the sentence set to GGA and RMC, which is everything the
+ *      parser reads. If the firmware does not accept that field layout
+ *      and goes quiet, put the default set back rather than leave the
+ *      receiver mute.
+ *
+ * Every branch ends with a talking receiver. A silent GPS is survivable
+ * here — the landing burn is flown on the barometer and the IMU — but it
+ * costs the horizontal channel its only absolute reference, so it is
+ * worth this much care to avoid.
+ */
+static void gps_configure(void)
+{
+    // PCAS command bodies. Field order for PCAS03 is
+    // GGA,GLL,GSA,GSV,RMC,VTG,ZDA,ANT,DHV,LPS,res,res,UTC,GST,res,res,res,TIM
+    static const char *PCAS_BAUD_115200  = "PCAS01,5";
+    static const char *PCAS_RATE_1HZ     = "PCAS02,1000";
+    static const char *PCAS_RATE_5HZ     = "PCAS02,200";
+    static const char *PCAS_NMEA_MINIMAL = "PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0,,,,0";
+    static const char *PCAS_NMEA_DEFAULT = "PCAS03,1,1,1,1,1,1,0,0,0,0,,,0,0,,,,0";
+
+    gps_open(GPS_FAST_BAUD);
+    if (!gps_listening(1500)) {
+        gps_open(GPS_BAUD);
+        if (!gps_listening(1500)) {
+            POS_PRINT("# GPS silent at %lu and %lu - check TX/RX and antenna\n",
+                      (unsigned long)GPS_BAUD, (unsigned long)GPS_FAST_BAUD);
+            return;
+        }
+        gps_send(PCAS_BAUD_115200);
+        delay(200);
+        gps_open(GPS_FAST_BAUD);
+        if (!gps_listening(1500)) {
+            gps_open(GPS_BAUD);
+            gps_send(PCAS_RATE_1HZ);
+            POS_PRINT("# GPS stayed at %lu, 1 Hz\n", (unsigned long)GPS_BAUD);
+            return;
+        }
+    }
+
+    gps_send(PCAS_RATE_5HZ);
+    delay(100);
+    gps_send(PCAS_NMEA_MINIMAL);
+    delay(150);
+    if (!gps_listening(2000)) {
+        gps_send(PCAS_NMEA_DEFAULT);
+        delay(150);
+        POS_PRINT("# GPS rejected the trimmed sentence set, default restored\n");
+    }
+
+    POS_PRINT("# GPS at %lu baud, 5 Hz\n", (unsigned long)GPS_FAST_BAUD);
+}
+
 void setup1()
 {
     // The Master port is opened by core 0, which also owns the transmit
     // ring. Wait for it rather than racing it.
     while (!s_core0_ready) tight_loop_contents();
 
-    GpsPort.begin(GPS_BAUD);
+    gps_configure();
     s_nmea.begin();
 }
 

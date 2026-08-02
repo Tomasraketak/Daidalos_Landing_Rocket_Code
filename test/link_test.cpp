@@ -66,10 +66,10 @@ static void test_layout(void)
 {
     printf("layout\n");
 
-    check(sizeof(ariadna_nav_state_t)     == 52, "nav_state is 52 bytes");
+    check(sizeof(ariadna_nav_state_t)     == 88, "nav_state is 88 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
     check(sizeof(ariadna_nav_status_t)    == 48, "nav_status is 48 bytes");
-    check(sizeof(ariadna_pos_status_t)    == 60, "pos_status is 60 bytes");
+    check(sizeof(ariadna_pos_status_t)    == 68, "pos_status is 68 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
     check(sizeof(ariadna_tlm_t)           == 46, "telemetry is 46 bytes");
@@ -164,8 +164,10 @@ static void test_roundtrip(void)
     ariadna_nav_state_t tx;
     memset(&tx, 0, sizeof(tx));
     tx.t_ms  = 123456;
-    tx.h     = 84.75f;
+    tx.px    = -12.5f; tx.py = 33.25f; tx.pz = 84.75f;
     tx.vx    = 1.5f;  tx.vy = -2.25f;  tx.vz = -31.5f;
+    tx.ax    = 0.125f; tx.ay = -0.5f;  tx.az = -9.0f;
+    tx.qw    = 0.9990482f; tx.qx = 0.0436194f; tx.qy = 0.0f; tx.qz = 0.0f;
     tx.ux    = 0.0871557f; tx.uy = 0.0f; tx.uz = 0.9961947f;   // 5 deg tilt
     tx.wx    = 0.25f; tx.wy = -0.125f; tx.wz = 0.0f;
     tx.accel_mag = 1.02f;
@@ -191,7 +193,9 @@ static void test_roundtrip(void)
         check(ariadna_unpack(got[0].payload.data(), (uint8_t)got[0].payload.size(),
                              &out, sizeof(out)) == 1, "unpack accepts right size");
         check(memcmp(&tx, &out, sizeof(tx)) == 0, "payload survives the round trip");
-        check(out.h == 84.75f && out.vz == -31.5f, "floats are bit exact");
+        check(out.pz == 84.75f && out.vz == -31.5f, "floats are bit exact");
+        check(out.px == -12.5f && out.az == -9.0f && out.qw == 0.9990482f,
+              "position, acceleration and quaternion are bit exact");
         check(out.quality == 240, "trailing byte survives");
     }
 
@@ -548,6 +552,19 @@ static void test_link_budget(void)
     // 240 Hz against a 200 Hz loop.
     check(ARIADNA_NAV_STATE_HZ > ARIADNA_ACTUATOR_HZ,
           "nav state is produced faster than the control loop consumes it");
+
+    // A floor as well as a ratio. The full state — attitude quaternion,
+    // local position, velocity and world-frame acceleration — is required
+    // at 100 Hz minimum and specified at 240 Hz. Pinning the floor here
+    // means a future field that forces the rate down fails on a
+    // workstation instead of quietly halving the navigation bandwidth.
+    check(ARIADNA_NAV_STATE_HZ >= 100,
+          "nav state rate meets the 100 Hz floor");
+
+    // Headroom, not just fit. A packet that exactly fills the frame leaves
+    // nowhere to put the next field, and this one has grown twice.
+    check(sizeof(ariadna_nav_state_t) <= ARIADNA_PAYLOAD_MAX - 4,
+          "nav state leaves room to grow");
 
     // ---- LoRa ----------------------------------------------------------
     // ariadna_lora_airtime_us() is integer arithmetic on the target, so it

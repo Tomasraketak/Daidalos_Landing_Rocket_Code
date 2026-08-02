@@ -7,3 +7,4 @@ map_cache/
 *.uf2
 __pycache__/
 .DS_Store
+test/est_test

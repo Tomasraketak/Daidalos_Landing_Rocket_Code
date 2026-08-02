@@ -205,12 +205,21 @@ static inline bool nav_acquire(dg_nav_t *n)
 // flight envelope is treated as a link fault, not as a state.
 static bool state_sane(const ariadna_nav_state_t *s)
 {
-    if (!isfinite(s->h) || !isfinite(s->vx) || !isfinite(s->vy) ||
+    if (!isfinite(s->pz) || !isfinite(s->vx) || !isfinite(s->vy) ||
         !isfinite(s->vz) || !isfinite(s->ux) || !isfinite(s->uy) ||
         !isfinite(s->uz) || !isfinite(s->wx) || !isfinite(s->wy))
         return false;
 
-    if (s->h < -20.0f || s->h > 3000.0f)                     return false;
+    // px/py are checked for finiteness only. They are not in the control
+    // path — the guidance law flies velocity to zero, not position to a
+    // coordinate — so a wild horizontal position must not be allowed to
+    // reject a frame whose altitude and attitude are perfectly good.
+    if (!isfinite(s->px) || !isfinite(s->py))                return false;
+
+    if (!isfinite(s->ax) || !isfinite(s->ay) || !isfinite(s->az))
+        return false;
+
+    if (s->pz < -20.0f || s->pz > 3000.0f)                   return false;
     if (fabsf(s->vx) > 120.0f || fabsf(s->vy) > 120.0f)      return false;
     if (fabsf(s->vz) > 200.0f)                               return false;
     if (fabsf(s->wx) > 35.0f  || fabsf(s->wy) > 35.0f)       return false;
@@ -220,6 +229,14 @@ static bool state_sane(const ariadna_nav_state_t *s)
     // silently scale every tilt angle this board computes.
     float n2 = s->ux * s->ux + s->uy * s->uy + s->uz * s->uz;
     if (n2 < 0.90f || n2 > 1.10f)                            return false;
+
+    // Same test on the quaternion. It is not in the control path either,
+    // but it goes into the log and the ground navball, and a quaternion
+    // whose norm has drifted is the signature of a sender that has
+    // stopped normalising — which would eventually reach u as well.
+    float q2 = s->qw * s->qw + s->qx * s->qx +
+               s->qy * s->qy + s->qz * s->qz;
+    if (q2 < 0.90f || q2 > 1.10f)                            return false;
 
     return true;
 }
@@ -426,7 +443,7 @@ static float project_to_guidance_plane(const ariadna_nav_state_t *s,
     // In-plane horizontal velocity: the signed projection, not |vh|. When
     // the plane is frozen the vehicle can drift backwards along it, and
     // the sign is what tells the guidance law which way to lean.
-    out->h  = s->h;
+    out->h  = s->pz;
     out->vx = s->vx * ca + s->vy * sa;
     out->vz = s->vz;
 
@@ -621,7 +638,8 @@ static bool self_test(void)
         s_plane_az = 0.0f;
         s.vx = 10.0f; s.vy = 0.0f; s.vz = -30.0f;
         s.ux = 0.0f;  s.uy = 0.0f; s.uz = 1.0f;
-        s.h = 50.0f;  s.flags = ARIADNA_NAV_VALID;
+        s.pz = 50.0f; s.qw = 1.0f;   // identity attitude, so state_sane() would pass
+        s.flags = ARIADNA_NAV_VALID;
         float az = project_to_guidance_plane(&s, &n);
         if (fabsf(az) > 1e-3f || fabsf(n.vx - 10.0f) > 1e-3f ||
             fabsf(n.theta) > 1e-3f) {
