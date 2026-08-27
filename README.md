@@ -53,16 +53,22 @@ Daidalos_Landing_Guidance/
   Daidalos_Landing_Guidance.ino   I/O shell: pins, timing, link, failsafes
   guidance.h  guidance.cpp        the algorithm — no Arduino dependency
 Ariadna_V2/                       three-MCU flight computer built around it
+  PINOUT.md                       every pin of the whole avionics, one file
   common/ariadna_link.h           the inter-processor wire protocol
+  common/ariadna_kf.h             the navigation Kalman filter
+  common/ariadna_uwb.h            UWB multilateration, degrading gracefully
+  common/ariadna_rgb.h            the shared LED / buzzer annunciator engine
   Master_MCU/                     Pico 2 W — state machine, servos, log, LoRa
-  Position_MCU/                   XIAO RP2350 — sensor fusion
+  Position_MCU/                   XIAO RP2350 — sensor fusion, UWB tag
   Navigation_MCU/                 XIAO RP2350 — guidance, TVC, pyros
+  Uwb_Anchor/                     XIAO RP2350 ×4 — ground ranging beacons
   Ground_Station/                 Pico 2 — LoRa receiver
   Ground_Visualizer/              PyQt6 telemetry display
 test/
   host_test.cpp                   124 numerical checks against the model
   link_test.cpp                   checks on the Ariadna V2 link codec
   est_test.cpp                    checks on the navigation filter
+  uwb_test.cpp                    checks on the UWB multilateration
   check_py_format.py              pins the Python decoder to the C packet
   golden_vectors.h                reference values from the simulation
   gen_golden.py                   regenerates them from lander_v2.py
@@ -73,8 +79,12 @@ test/
 `Daidalos_Landing_Guidance/` is the single-board V1 computer: it takes a navigation
 solution in and puts servo commands out. `Ariadna_V2/` splits that job across three
 processors and adds the sensors, the mission state machine and the ground segment
-around it — flying the same guidance module, unchanged and byte-identical. See
-[`Ariadna_V2/README.md`](Ariadna_V2/README.md).
+around it — flying the same guidance module, unchanged and byte-identical. It also adds
+a **UWB constellation**: four DWM1000 anchors on the ground around the pad, fused with
+GPS, the barometer and the IMU in the same Kalman filter, which is what takes horizontal
+knowledge from GPS's ~2.5 m to a decimetre. See
+[`Ariadna_V2/README.md`](Ariadna_V2/README.md) for how each board spends its time, and
+[`Ariadna_V2/PINOUT.md`](Ariadna_V2/PINOUT.md) for every pin in the vehicle.
 
 **The algorithm is deliberately not in the `.ino`.** Anything inside a sketch can only be
 tested by flashing a board, and firmware that cannot be tested on a workstation ends up
@@ -338,6 +348,7 @@ crash, and the grain finishes burning either way.
 cd test
 make          # 124 numerical checks against the simulation
 make est      # the Ariadna V2 navigation filter
+make uwb      # the Ariadna V2 UWB multilateration, degraded cases included
 make link     # the Ariadna V2 link codec and transmit ring
 make sync     # the V2 copy of the guidance module has not drifted
 make pyfmt    # the Python ground station matches the C packet layout

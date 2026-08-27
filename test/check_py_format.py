@@ -9,7 +9,7 @@ can). link_test.cpp checks the C side. This checks the Python side against
 the same header, so the two cannot drift apart without a test failing.
 
 The failure this prevents is not a crash. A format string one field out of
-step still unpacks 48 bytes successfully; it just puts the battery voltage
+step still unpacks 49 bytes successfully; it just puts the battery voltage
 in the altitude box. That is the kind of bug you find during a flight.
 
 Run:  cd test && make pyfmt
@@ -82,14 +82,14 @@ def main():
 
     c_fmt = "<" + "".join(f[1] for f in tlm)
     c_size = sum(f[2] for f in tlm)
-    check(c_size == 46, f"ariadna_tlm_t is {c_size} bytes, expected 46")
+    check(c_size == 47, f"ariadna_tlm_t is {c_size} bytes, expected 47")
     check(struct.calcsize(c_fmt) == c_size,
           f"packed size {struct.calcsize(c_fmt)} != field sum {c_size}")
 
     # The ground station appends RSSI and SNR on the way to the laptop.
     c_gs_fmt = c_fmt + "bb"
-    check(struct.calcsize(c_gs_fmt) == 48,
-          f"gs serial packet is {struct.calcsize(c_gs_fmt)} bytes, expected 48")
+    check(struct.calcsize(c_gs_fmt) == 49,
+          f"gs serial packet is {struct.calcsize(c_gs_fmt)} bytes, expected 49")
 
     # ---- the Python side ------------------------------------------------
     m = re.search(r'^GS_FORMAT\s*=\s*(.+)$', vis, re.M)
@@ -100,8 +100,8 @@ def main():
     py_fmt = eval(m.group(1), {"__builtins__": {}}, {})
     check(py_fmt == c_gs_fmt,
           f"format mismatch\n      header: {c_gs_fmt}\n      python: {py_fmt}")
-    check(struct.calcsize(py_fmt) == 48,
-          f"python format is {struct.calcsize(py_fmt)} bytes, expected 48")
+    check(struct.calcsize(py_fmt) == 49,
+          f"python format is {struct.calcsize(py_fmt)} bytes, expected 49")
 
     # ---- field order ------------------------------------------------------
     # The format string alone cannot catch two same-typed fields being

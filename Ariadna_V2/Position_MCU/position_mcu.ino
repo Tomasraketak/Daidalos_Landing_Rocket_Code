@@ -64,9 +64,10 @@
 //  vectors here. The two things that most need a bench before they need a
 //  sky are in section 6 (the body-to-pad rotation, where a convention
 //  mismatch silently mirrors every attitude) and section 7 (the filter
-//  tuning). Section 10 self-tests what can be self-tested, which now
-//  includes the horizontal channel, the innovation gate, and the
-//  agreement between the rotation matrix and the quaternion.
+//  tuning). Section 11 self-tests what can be self-tested, which now
+//  includes the horizontal channel, the innovation gate, the UWB
+//  multilateration, and the agreement between the rotation matrix and
+//  the quaternion.
 //
 //  ---------------------------------------------------------------------
 //  THE ESTIMATOR IS A KALMAN FILTER, NOT A COMPLEMENTARY FILTER
@@ -92,6 +93,8 @@
 #include "../common/ariadna_link.h"
 #include "../common/ariadna_uart_dma.h"
 #include "../common/ariadna_kf.h"
+#include "../common/ariadna_uwb.h"
+#include "../common/ariadna_rgb.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -122,7 +125,12 @@ static const uint8_t PIN_I2C_SCL       = D5;
 // harness, which is not a bench jumper.
 static const uint32_t TRISENSE_SPI_HZ  = 10000000;
 
-// ---- FUTURE: UWB DWM1000, shares the SPI bus ---------------------------
+// ---- UWB DWM1000, shares the SPI bus with the IMU -----------------------
+//
+// D0 and D1 are the spreadsheet's "UART0 TX / RX" pins. They are NOT used
+// as a UART: the pinout sheet names the peripheral in its third column,
+// and the peripheral on those two pins is the DWM1000's interrupt and
+// reset lines. RST is driven open-drain — see UwbTag::begin().
 static const uint8_t PIN_UWB_INT       = D0;
 static const uint8_t PIN_UWB_RST       = D1;
 static const uint8_t PIN_UWB_CS        = D2;
@@ -201,17 +209,46 @@ static uint8_t  s_cal_state  = 0;
 static bool     s_post_pass  = false;
 
 // =====================================================================
-//  3. FUTURE SENSORS
+//  3. RANGE AND UWB SENSORS
 //
-//  Declared, wired into the pipeline, and deliberately inert.
+//  Two landing-phase sensors live here. Below about ten metres the
+//  barometer is being disturbed by the vehicle's own plume and GPS is
+//  worth very little, which is exactly where a lidar and a UWB
+//  constellation are worth a great deal.
 //
-//  Both of these are landing-phase sensors: below about 10 m the barometer
-//  is being disturbed by the vehicle's own plume and GPS altitude is worth
-//  little, which is exactly where a lidar and a UWB range are worth a lot.
-//  The estimator already has the hooks to blend them (see est_fuse_range),
-//  so bringing either online is a matter of filling in read() and setting
-//  the health bit — not of rewiring the data path.
+//    TF Luna lidar   NOT IMPLEMENTED. Declared, wired into the pipeline
+//                    and deliberately inert; see the class.
+//    DWM1000 UWB     IMPLEMENTED. Ranges to four surveyed ground anchors
+//                    and multilaterates a position in the pad frame,
+//                    which the estimator fuses alongside GPS.
 // =====================================================================
+
+// ---------------------------------------------------------------------
+//  Is the ranging library present?
+//
+//  The UWB stack needs arduino-dw1000 (thotro), which is not a
+//  dependency of anything else in this repository. If it is absent the
+//  whole UWB path compiles out and the board flies exactly as it did
+//  before — GPS, barometer, IMU — rather than failing to build. Set
+//  ARIADNA_UWB_ENABLED to 0 by hand to do the same thing deliberately,
+//  for instance to rule the radio out while chasing an SPI fault.
+// ---------------------------------------------------------------------
+#ifndef ARIADNA_UWB_ENABLED
+#  if defined(__has_include)
+#    if __has_include("DW1000Ranging.h")
+#      define ARIADNA_UWB_ENABLED 1
+#    else
+#      define ARIADNA_UWB_ENABLED 0
+#    endif
+#  else
+#    define ARIADNA_UWB_ENABLED 0
+#  endif
+#endif
+
+#if ARIADNA_UWB_ENABLED
+#  include <DW1000Ranging.h>
+#  include <DW1000.h>
+#endif
 
 /** One range measurement, from whichever sensor produced it. */
 struct RangeFix {
@@ -250,53 +287,433 @@ private:
     RangeFix _fix  = { 0.0f, 0.0f, 0, false };
 };
 
+// =====================================================================
+//  THE UWB CONSTELLATION
+//
+//  Four DWM1000 anchors stand on the ground around the pad; this board
+//  carries the tag. Each anchor answers a two-way ranging exchange, the
+//  tag gets four distances, and ariadna_uwb.h turns those into a
+//  position with an honest per-axis sigma which the Kalman filter treats
+//  exactly like a GPS fix — only about twenty times more accurate.
+//
+//  ---------------------------------------------------------------------
+//  WHY THIS IS WORTH THE TROUBLE
+//  ---------------------------------------------------------------------
+//  The vehicle is trying to land ON the pad, and the landing burn is
+//  flown from an estimate of where it is relative to that pad. GPS gives
+//  that to about 2.5 m in good conditions. Two and a half metres is the
+//  difference between landing on the pad and landing next to it, and no
+//  amount of guidance authority recovers a position error the estimator
+//  does not know it has. UWB two-way ranging gives 10-30 cm. That is the
+//  whole argument.
+//
+//  ---------------------------------------------------------------------
+//  SURVEYING THE ANCHORS — READ THIS BEFORE FLYING
+//  ---------------------------------------------------------------------
+//  The anchor coordinates below are in the PAD FRAME: metres East, metres
+//  North, metres up, measured from the point the vehicle lifts off from,
+//  which is the same origin the estimator's px/py/pz use.
+//
+//  These numbers are an INPUT, not an output. The solver has no way to
+//  discover that an anchor was moved two metres from where the table says
+//  it is; it will simply produce a position that is confidently wrong by
+//  about that much, and the filter will believe it in preference to the
+//  GPS, because the sigma it comes with is small. Measure the square with
+//  a tape, write the numbers here, and re-flash. The post-fit residual
+//  reported in the status packet is the check on that work: a survey
+//  error shows up as a residual that will not go below a few tens of
+//  centimetres no matter how good the radio conditions are.
+//
+//  Height matters least and is easiest to get wrong. All four anchors
+//  sitting on flat ground at the pad's own level means z = 0 for all of
+//  them, and that is the default below. If the ground slopes, measure it.
+//
+//  ---------------------------------------------------------------------
+//  THE SHORT ADDRESS, AND THE ONE ARGUMENT THAT MUST NOT BE DEFAULTED
+//  ---------------------------------------------------------------------
+//  The tag identifies which anchor a range came from by the anchor's
+//  16-bit short address. In the arduino-dw1000 library that address is
+//  RANDOMISED at startup unless startAsAnchor() is passed `false` as its
+//  third argument — a default that is fine for a demo and fatal here,
+//  because a random address matches no row in this table and every range
+//  is discarded.
+//
+//  With `false`, the short address is the FIRST TWO BYTES of the anchor's
+//  EUI, little-endian. So an anchor whose EUI begins "01:00:" answers to
+//  0x0001. That is the convention the anchor sketch in ../Uwb_Anchor uses
+//  and it is why the addresses below are 0x0001 to 0x0004.
+// =====================================================================
+
 /**
- * Decawave DWM1000 UWB, SPI, shares the bus with the IMU.
- *
- * NOT IMPLEMENTED. The intended use is ranging to anchors around the pad
- * for a horizontal position fix an order of magnitude better than GPS,
- * which is what turns "lands somewhere near the pad" into "lands on it".
- *
- * Note for whoever implements this: the DWM1000 wants a 2 MHz SPI clock
- * until it is configured, while the ICM42688P is being driven at 10 MHz on
- * the same bus. Use SPISettings per transaction, and do not assume the
- * clock the other device left behind.
+ * A range older than this is not evidence about where the vehicle is
+ * NOW. At 45 m/s of descent, 300 ms is thirteen metres — far beyond what
+ * a decimetre-class sensor is for, so a stale anchor is dropped rather
+ * than extrapolated.
  */
-class UwbDWM1000 {
+static const uint32_t UWB_RANGE_MAX_AGE_MS = 300;
+
+/** Rate the multilateration itself runs at. Ranges arrive far slower. */
+static const uint32_t UWB_SOLVE_HZ = 25;
+
+/**
+ * Surveyed anchor positions, pad-ENU metres. THE DEFAULT IS A 40 m
+ * SQUARE CENTRED ON THE PAD — replace it with your tape measure.
+ *
+ * A square is close to the best geometry available on flat ground: the
+ * two horizontal axes are equally well observed and the solution is
+ * insensitive to any one anchor. A line is the worst, and three anchors
+ * in a rough line is a common accident when the fourth is placed in a
+ * hurry. Spread them.
+ */
+static ariadna_uwb_anchor_t s_uwb_anchors[ARIADNA_UWB_MAX_ANCHORS] = {
+    // addr,  enabled, pad,   x,      y,     z
+    { 0x0001, 1, 0, -20.0f, -20.0f, 0.0f },
+    { 0x0002, 1, 0,  20.0f, -20.0f, 0.0f },
+    { 0x0003, 1, 0,  20.0f,  20.0f, 0.0f },
+    { 0x0004, 1, 0, -20.0f,  20.0f, 0.0f },
+    { 0x0000, 0, 0,   0.0f,   0.0f, 0.0f },
+    { 0x0000, 0, 0,   0.0f,   0.0f, 0.0f },
+    { 0x0000, 0, 0,   0.0f,   0.0f, 0.0f },
+    { 0x0000, 0, 0,   0.0f,   0.0f, 0.0f },
+};
+static const uint8_t UWB_ANCHOR_COUNT = 4;
+
+/**
+ * DWM1000 tag driver.
+ *
+ * ---------------------------------------------------------------------
+ * ROBUSTNESS IS THE WHOLE DESIGN, NOT A FEATURE OF IT
+ * ---------------------------------------------------------------------
+ * This is the only sensor in the vehicle whose availability depends on
+ * hardware that is not bolted to the vehicle. Anchors run off their own
+ * batteries, sit in the grass, and are line-of-sight devices pointed at
+ * something that is about to light a rocket motor between them. Assume
+ * they will fail, individually and together, at the worst moment.
+ *
+ * So every layer here is written to degrade rather than break:
+ *
+ *   * Each anchor has its OWN slot with its own timestamp. One that stops
+ *     answering ages out of the observation set on its own; nothing
+ *     needs to detect it, and the other three carry on unchanged.
+ *   * A range that is not finite, is negative, or jumps further than the
+ *     vehicle could have moved is dropped at the slot, before it can
+ *     reach the solver.
+ *   * The library's callbacks are static and take a device pointer that
+ *     CAN be null. Every one of them checks.
+ *   * A hardware fault at begin() leaves _ok false and every later call
+ *     becomes a cheap no-op. There is no path from a dead radio to a
+ *     stalled estimator.
+ *   * Nothing here allocates, blocks, or waits on the radio.
+ *
+ * ---------------------------------------------------------------------
+ * THE VOLTINOLABS HARDWARE WORKAROUNDS
+ * ---------------------------------------------------------------------
+ * Three of them, all from the working anchor example, all necessary on
+ * this board and all easy to lose in a refactor:
+ *
+ *   1. OPEN-DRAIN RESET. The DWM1000's RST is not a push-pull input.
+ *      Driving it high can damage the module, so it is pulled LOW to
+ *      reset and then released to a floating INPUT. The library is told
+ *      the reset pin is 255 precisely so that it never drives it itself.
+ *   2. EXPLICIT SPI PIN SELECTION. The RP2350 can put SPI on many pins
+ *      and the core's default is not this board's wiring.
+ *   3. NO ATTACHED INTERRUPT. The library's ISR path is not reliable on
+ *      this core; the IRQ line is polled instead, from poll() below.
+ *
+ * ---------------------------------------------------------------------
+ * SHARING THE SPI BUS WITH THE IMU
+ * ---------------------------------------------------------------------
+ * The ICM42688P is on the same three wires at 10 MHz. Both drivers use
+ * SPI transactions with their own SPISettings, so the clock and mode are
+ * re-established per transfer and neither can inherit the other's. What
+ * would break this is a driver that calls SPI.setClockDivider() once at
+ * startup and assumes it holds — neither of these does.
+ *
+ * Both devices are also driven from CORE 0 ONLY, which is what makes the
+ * bus safe without a lock. If you ever move UWB polling to core 1, you
+ * must add one.
+ */
+class UwbTag {
 public:
+    /**
+     * Bring the radio up. Returns false, harmlessly, if the library is
+     * absent or the module does not answer.
+     */
     bool begin(uint8_t cs, uint8_t rst, uint8_t irq)
     {
         _cs = cs; _rst = rst; _irq = irq;
-        pinMode(_cs,  OUTPUT); digitalWrite(_cs, HIGH);   // deselect: it
-        pinMode(_rst, OUTPUT); digitalWrite(_rst, HIGH);  // shares the IMU bus
-        pinMode(_irq, INPUT);
         _ok = false;
+        _fresh = 0;
+        _gen = 0;
+        for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) slot_clear(i);
+
+        // Deselect before anything else touches the bus: this device
+        // shares SPI with the IMU and a floating CS is a corrupted IMU
+        // transaction.
+        pinMode(_cs, OUTPUT);
+        digitalWrite(_cs, HIGH);
+
+#if ARIADNA_UWB_ENABLED
+        // --- workaround 1: open-drain reset ---------------------------
+        pinMode(_rst, OUTPUT);
+        digitalWrite(_rst, LOW);
+        delay(20);
+        pinMode(_rst, INPUT);        // release, do NOT drive high
+        delay(150);
+
+        // --- workaround 2: explicit SPI pins --------------------------
+        SPI.setSCK(PIN_SPI_SCK);
+        SPI.setRX(PIN_SPI_MISO);
+        SPI.setTX(PIN_SPI_MOSI);
+        SPI.begin();
+        pinMode(_irq, INPUT);
+
+        // 255 as the reset pin keeps the library away from RST entirely.
+        DW1000Ranging.initCommunication(255, _cs, _irq);
+
+        // --- workaround 3: no background interrupt --------------------
+        detachInterrupt(digitalPinToInterrupt(_irq));
+
+        DW1000Ranging.attachNewRange(&UwbTag::on_range);
+        DW1000Ranging.attachNewDevice(&UwbTag::on_device);
+        DW1000Ranging.attachInactiveDevice(&UwbTag::on_inactive);
+
+        // startAsTag's third argument is randomShortAddress. False, so
+        // the tag's own address is deterministic too — an anchor that
+        // logs who it ranged with then logs something meaningful.
+        DW1000Ranging.startAsTag((char *)UWB_TAG_EUI,
+                                 DW1000.MODE_LONGDATA_RANGE_ACCURACY, false);
+        _ok = true;
+#else
+        pinMode(_rst, INPUT);
+        pinMode(_irq, INPUT);
+#endif
+        s_self = this;
         return _ok;
     }
 
-    /** Horizontal position fix in the pad frame. */
-    bool position(float *x, float *y, float *sigma)
+    /**
+     * Service the ranging stack. Cheap, non-blocking, and safe to call
+     * as often as the loop can manage.
+     *
+     * CALL IT OFTEN. Two-way ranging is a request/response protocol, and
+     * its throughput is set by how promptly the tag answers. At the
+     * estimator's 240 Hz alone the constellation would range at a few
+     * hertz; polled from the idle path as well, it reaches the ten hertz
+     * per anchor the filter is tuned for. The internal throttle below is
+     * what makes the idle-path call safe — the RP2350 will otherwise
+     * hammer the DWM1000 harder than it can answer, which the module
+     * responds to by dropping exchanges.
+     */
+    void poll(void)
     {
-        (void)x; (void)y; (void)sigma;
-        return false;
+#if ARIADNA_UWB_ENABLED
+        if (!_ok) return;
+        const uint32_t now = micros();
+        if ((uint32_t)(now - _last_poll_us) < UWB_POLL_MIN_US) return;
+        _last_poll_us = now;
+
+        // Manual IRQ service, standing in for the attached interrupt.
+        if (digitalRead(_irq) == HIGH) DW1000.handleInterrupt();
+        DW1000Ranging.loop();
+#endif
     }
 
-    const RangeFix &range(void)
+    /**
+     * Build the observation set for the solver.
+     *
+     * Returns how many anchors are fresh. Every slot is written, so the
+     * caller never reads a stale observation for an anchor that has gone
+     * quiet — the `valid` flag is cleared explicitly rather than left
+     * over from last time.
+     */
+    uint8_t snapshot(ariadna_uwb_obs_t *obs, uint32_t now_ms) const
     {
-        _fix.valid = false;
-        return _fix;
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) {
+            obs[i].range_m = 0.0f;
+            obs[i].sigma_m = 0.0f;
+            obs[i].valid   = 0;
+            obs[i]._pad[0] = obs[i]._pad[1] = obs[i]._pad[2] = 0;
+
+            const Slot &s = _slot[i];
+            if (!s.have) continue;
+            if ((uint32_t)(now_ms - s.t_ms) > UWB_RANGE_MAX_AGE_MS) continue;
+
+            obs[i].range_m = s.range_m;
+            obs[i].sigma_m = s.sigma_m;
+            obs[i].valid   = 1;
+            n++;
+        }
+        return n;
     }
 
-    bool healthy(void) const { return _ok; }
+    bool     healthy(void)   const { return _ok && _fresh > 0; }
+    bool     present(void)   const { return _ok; }
+    uint32_t generation(void) const { return _gen; }
+    uint8_t  fresh(void)     const { return _fresh; }
+    uint32_t rejected(void)  const { return _rejected; }
+
+    /** Age out slots. Called once per solve, so `fresh` is never stale. */
+    void age(uint32_t now_ms)
+    {
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) {
+            if (!_slot[i].have) continue;
+            if ((uint32_t)(now_ms - _slot[i].t_ms) > UWB_RANGE_MAX_AGE_MS) {
+                _slot[i].have = false;      // keep last_range: a returning
+                continue;                   // anchor is not a new one
+            }
+            n++;
+        }
+        _fresh = n;
+    }
 
 private:
+    // The tag's own EUI. Only its first two bytes matter to the anchors,
+    // and only if they were started with a deterministic short address.
+    static constexpr const char *UWB_TAG_EUI = "AA:00:5B:D5:A9:9A:E2:9C";
+
+    // Minimum microseconds between two services of the ranging stack.
+    // The anchor example uses 300 us; this is the same number, expressed
+    // as a rate limit rather than a delay so that nothing ever blocks.
+    static const uint32_t UWB_POLL_MIN_US = 250;
+
+    // Ranging sigma. NOT the DWM1000 datasheet figure, which is about
+    // 10 cm in a laboratory. This is what a range is worth on a launch
+    // site with a metal airframe rotating between the antennas, and it is
+    // deliberately pessimistic: the cost of an over-large sigma is that
+    // the filter converges a little more slowly, while the cost of an
+    // over-small one is that it believes a reflection.
+    static constexpr float UWB_SIGMA_BASE_M = 0.25f;
+    // Ranging error grows with distance as the link margin falls.
+    static constexpr float UWB_SIGMA_PER_M  = 0.004f;
+
+    // A single range that disagrees with the previous one from the SAME
+    // anchor by more than this, sooner than the vehicle could have
+    // covered it, is a decode error or a reflection. The vehicle's own
+    // speed is bounded by ~100 m/s, so 15 m inside one ranging interval
+    // is not motion.
+    static constexpr float UWB_MAX_JUMP_M = 15.0f;
+
+    struct Slot {
+        float    range_m;
+        float    sigma_m;
+        float    last_range;     // survives a dropout, for the jump test
+        uint32_t t_ms;
+        uint32_t last_ms;
+        bool     have;
+    };
+
+    void slot_clear(uint8_t i)
+    {
+        _slot[i].range_m    = 0.0f;
+        _slot[i].sigma_m    = 0.0f;
+        _slot[i].last_range = 0.0f;
+        _slot[i].t_ms       = 0;
+        _slot[i].last_ms    = 0;
+        _slot[i].have       = false;
+    }
+
+    /**
+     * Accept one range into an anchor's slot.
+     *
+     * This is where a bad measurement is stopped. Everything downstream
+     * — the solver, the innovation gate, the filter — is cheaper and more
+     * honest if nonsense never gets past here.
+     */
+    void accept(uint16_t addr, float range_m, float rx_power_dbm)
+    {
+        const int slot = ariadna_uwb_find(s_uwb_anchors, UWB_ANCHOR_COUNT, addr);
+        if (slot < 0) { _rejected++; return; }     // not one of ours
+
+        if (!(range_m == range_m)) { _rejected++; return; }          // NaN
+        if (!(range_m > 0.05f && range_m < 300.0f)) { _rejected++; return; }
+
+        const uint32_t now = millis();
+        Slot &s = _slot[slot];
+
+        // Jump test, but only against a RECENT previous range. After a
+        // dropout the vehicle really may be somewhere else, and refusing
+        // to re-acquire an anchor that went quiet for a second would turn
+        // a momentary outage into a permanent one.
+        if (s.last_ms != 0 && (uint32_t)(now - s.last_ms) < 500u &&
+            fabsf(range_m - s.last_range) > UWB_MAX_JUMP_M) {
+            _rejected++;
+            s.last_range = range_m;    // but remember it: two agreeing
+            s.last_ms    = now;        // outliers are a real move
+            return;
+        }
+
+        float sigma = UWB_SIGMA_BASE_M + UWB_SIGMA_PER_M * range_m;
+        // A weak signal is a long or an obstructed path, and both make
+        // the range read long. Widen the sigma rather than guess a
+        // correction: the solver weights by it and the residual test
+        // catches what is left.
+        if (rx_power_dbm < -85.0f) sigma *= 2.0f;
+        else if (rx_power_dbm < -80.0f) sigma *= 1.4f;
+
+        s.range_m    = range_m;
+        s.sigma_m    = sigma;
+        s.t_ms       = now;
+        s.last_range = range_m;
+        s.last_ms    = now;
+        s.have       = true;
+        _gen++;
+    }
+
+    // --- library callbacks ---------------------------------------------
+    //
+    // The arduino-dw1000 API is C-style: it takes function pointers with
+    // no context, so the driver instance is reached through a file-scope
+    // pointer. There is exactly one tag on this board, which is what
+    // makes that acceptable. Every callback tolerates a null device
+    // pointer and a null instance — the library has been observed to call
+    // back during teardown.
+#if ARIADNA_UWB_ENABLED
+    static void on_range(void)
+    {
+        if (!s_self) return;
+        DW1000Device *d = DW1000Ranging.getDistantDevice();
+        if (!d) return;
+        s_self->accept(d->getShortAddress(), d->getRange(), d->getRXPower());
+    }
+
+    /** A new anchor answered. The slot machinery needs nothing from us. */
+    static void on_device(DW1000Device *d) { (void)d; }
+
+    /**
+     * An anchor stopped answering. Also nothing: the slot ages out on its
+     * own timestamp, which is the mechanism that has to work anyway when
+     * the library does not notice. Attached only so that the library does
+     * not fall back to its default handler, which prints to Serial from
+     * inside the ranging path.
+     */
+    static void on_inactive(DW1000Device *d) { (void)d; }
+#endif
+
     uint8_t  _cs = 0, _rst = 0, _irq = 0;
     bool     _ok = false;
-    RangeFix _fix = { 0.0f, 0.0f, 0, false };
+    uint8_t  _fresh = 0;
+    uint32_t _gen = 0;
+    uint32_t _rejected = 0;
+    uint32_t _last_poll_us = 0;
+    Slot     _slot[ARIADNA_UWB_MAX_ANCHORS];
+
+    static UwbTag *s_self;
 };
 
+UwbTag *UwbTag::s_self = nullptr;
+
 static LidarTFLuna s_lidar;
-static UwbDWM1000  s_uwb;
+static UwbTag      s_uwb;
+
+// The solver's limits, filled in at setup(). Held at file scope so the
+// self test can check them against the anchor geometry.
+static ariadna_uwb_cfg_t s_uwb_cfg;
+
+// The most recent solve, kept for the status packet and the console.
+static ariadna_uwb_fix_t s_uwb_fix;
 
 // =====================================================================
 //  4. GPS — LK76 NMEA parser
@@ -755,7 +1172,11 @@ public:
         _baro_var     = BARO_SIGMA * BARO_SIGMA;
         _gps_rejects  = 0;
         _baro_rejects = 0;
+        _uwb_rejects  = 0;
         _last_gps_ms  = 0;
+        _last_uwb_ms  = 0;
+        _uwb_sigma_h  = 0.0f;
+        _uwb_resid    = 0.0f;
         _zupt         = false;
     }
 
@@ -1018,11 +1439,11 @@ public:
     /**
      * FUTURE: fold in a direct range-to-ground measurement.
      *
-     * The hook the lidar and the UWB will use. Deliberately written now,
-     * against the RangeFix the future drivers already return, so that
-     * bringing either online does not require touching the filter — with
-     * a Kalman filter it really is one ariadna_kf_correct() call, because the
-     * sensor's own sigma is already the R the update wants.
+     * The hook the lidar will use. Deliberately written now, against the
+     * RangeFix the future driver already returns, so that bringing it
+     * online does not require touching the filter — with a Kalman filter
+     * it really is one ariadna_kf_correct() call, because the sensor's own
+     * sigma is already the R the update wants.
      *
      * A range sensor is a far better altimeter than a barometer below
      * about 10 m, and it does not care about the plume — so when this
@@ -1034,6 +1455,113 @@ public:
         if (!r.valid) return;
         (void)r;      // NOT IMPLEMENTED — no sensor produces a valid fix yet
     }
+
+    /**
+     * Fold in a UWB position fix.
+     *
+     * ------------------------------------------------------------------
+     * WHY THIS IS ALMOST THE SAME CODE AS fuse_gps(), AND WHY THAT IS THE
+     * POINT
+     * ------------------------------------------------------------------
+     * A UWB fix arrives here as a position with a per-axis sigma —
+     * exactly the shape of a GPS fix, and exactly the shape
+     * ariadna_kf_correct() consumes. Everything that makes UWB different
+     * (four anchors, a Gauss-Newton solve, a constellation that loses
+     * members) has already been dealt with in ariadna_uwb.h, and none of
+     * it reaches the filter. The filter sees a measurement and a
+     * variance, which is all a filter should ever see.
+     *
+     * That is what makes a partial constellation safe. A three-anchor
+     * horizontal-only fix, a two-anchor stretched one and a single-anchor
+     * line-of-sight hint all come through this same call; the difference
+     * between them is entirely in `use_*` and in the sigmas. There is no
+     * mode logic here to get wrong.
+     *
+     * ------------------------------------------------------------------
+     * THE THREE THINGS THIS DOES BEYOND CALLING THE FILTER
+     * ------------------------------------------------------------------
+     *  1. AGE COMPENSATION. Like GPS, though the numbers are far smaller:
+     *     a solve is at most a few tens of milliseconds old.
+     *  2. A SIGMA FLOOR. The solver's covariance is the covariance of the
+     *     RANGES it was given, and it does not know about a mis-surveyed
+     *     anchor, an antenna delay calibration that is 20 cm out, or the
+     *     tag's own mounting offset. UWB_SIGMA_FLOOR is the honest total
+     *     of what the geometry cannot see, and without it the filter
+     *     would trust UWB far past the point where UWB is right.
+     *  3. RE-ANCHORING, on the same argument as GPS and the barometer: a
+     *     run of consecutive rejections means the filter has drifted away
+     *     from a sensor that is telling the truth, and a gate that never
+     *     re-opens is a filter that has quietly stopped navigating.
+     *     Deliberately SHORTER than the GPS one, because UWB is the more
+     *     accurate of the two: if the two disagree persistently, the one
+     *     to believe is UWB.
+     */
+    void fuse_uwb(const ariadna_uwb_fix_t &f, float age_s, uint32_t now_ms)
+    {
+        if (f.mode == ARIADNA_UWB_SOL_NONE)   return;
+        if (!(f.use_x || f.use_y || f.use_z)) return;
+        if (age_s < 0.0f) age_s = 0.0f;
+        if (age_s > 0.5f) return;             // too old to be about now
+
+        bool any = false, rejected = false;
+
+        if (f.use_x) {
+            const float s = inflate(f.sigma_x);
+            const float z = f.x + _kx.x[1] * age_s;
+            any = true;
+            if (!ariadna_kf_correct(&_kx, 0, z, s * s, GATE_SIGMA)) rejected = true;
+        }
+        if (f.use_y) {
+            const float s = inflate(f.sigma_y);
+            const float z = f.y + _ky.x[1] * age_s;
+            any = true;
+            if (!ariadna_kf_correct(&_ky, 0, z, s * s, GATE_SIGMA)) rejected = true;
+        }
+        // The vertical is offered only when the anchor geometry actually
+        // observed it — which, with four anchors on flat ground, means at
+        // altitude and not near the pad. The barometer owns the vertical
+        // the rest of the time.
+        if (f.use_z) {
+            const float s = inflate(f.sigma_z);
+            const float z = f.z + _kz.x[1] * age_s;
+            any = true;
+            if (!ariadna_kf_correct(&_kz, 0, z, s * s, GATE_SIGMA)) rejected = true;
+        }
+        if (!any) return;
+
+        if (!rejected) {
+            _uwb_rejects = 0;
+            _last_uwb_ms = now_ms ? now_ms : 1;
+            _uwb_sigma_h = 0.5f * (inflate(f.sigma_x) + inflate(f.sigma_y));
+            _uwb_resid   = f.residual_rms;
+            return;
+        }
+
+        if (++_uwb_rejects >= UWB_MAX_REJECTS) {
+            if (f.use_x)
+                ariadna_kf_reset(&_kx, f.x, _kx.x[1], inflate(f.sigma_x) * 3.0f,
+                                 5.0f, BIAS_LIMIT);
+            if (f.use_y)
+                ariadna_kf_reset(&_ky, f.y, _ky.x[1], inflate(f.sigma_y) * 3.0f,
+                                 5.0f, BIAS_LIMIT);
+            // NOT the vertical. The barometer is the vertical channel's
+            // absolute reference and it has its own re-anchor; letting a
+            // weakly observed UWB height reset it as well would give two
+            // sensors authority over one state, which is how a filter
+            // ends up oscillating between two answers.
+            _uwb_rejects = 0;
+        }
+    }
+
+    /** True if a UWB fix was ACCEPTED recently, not merely produced. */
+    bool uwb_aided(uint32_t now_ms) const
+    {
+        return _last_uwb_ms != 0 && (uint32_t)(now_ms - _last_uwb_ms) < 1000u;
+    }
+
+    float uwb_sigma_h(void) const { return _uwb_sigma_h; }
+    float uwb_resid(void)   const { return _uwb_resid; }
+    uint8_t uwb_rejects(void) const { return _uwb_rejects; }
 
     // --- outputs -------------------------------------------------------
     float px(void) const { return _kx.x[0]; }
@@ -1137,6 +1665,17 @@ public:
     static constexpr float QUALITY_BEST_M  = 1.0f;
     static constexpr float QUALITY_WORST_M = 25.0f;
 
+    // --- UWB ------------------------------------------------------------
+    // Everything the solver's covariance cannot know about, added in
+    // quadrature: anchor survey error, antenna delay calibration, and the
+    // offset between the tag's antenna and the vehicle's centre of mass.
+    // Twelve centimetres is optimistic for a tape-measured square and
+    // pessimistic for a properly surveyed one; measure yours.
+    static constexpr float UWB_SIGMA_FLOOR = 0.12f;   // m
+    // Four consecutive rejected fixes is under a second at the solve
+    // rate. Shorter than GPS_MAX_REJECTS on purpose — see fuse_uwb().
+    static constexpr uint8_t UWB_MAX_REJECTS = 4;
+
 private:
     void reset_states(void)
     {
@@ -1151,6 +1690,7 @@ private:
         ariadna_kf_reset(&_kz, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f);
         _gps_rejects  = 0;
         _baro_rejects = 0;
+        _uwb_rejects  = 0;
         _zupt = false;
     }
 
@@ -1209,6 +1749,17 @@ private:
     uint8_t  _baro_rejects = 0;
     uint32_t _last_gps_ms = 0;
     bool     _zupt        = false;
+
+    uint8_t  _uwb_rejects = 0;
+    uint32_t _last_uwb_ms = 0;
+    float    _uwb_sigma_h = 0.0f;
+    float    _uwb_resid   = 0.0f;
+
+    /** Solver sigma, floored by what the solver cannot see. */
+    static float inflate(float sigma)
+    {
+        return sqrtf(sigma * sigma + UWB_SIGMA_FLOOR * UWB_SIGMA_FLOOR);
+    }
 };
 
 static Estimator s_est;
@@ -1333,7 +1884,83 @@ static void link_poll(void)
 }
 
 // =====================================================================
-//  9. SENSOR INITIALISATION
+//  9. ANNUNCIATOR
+//
+//  One WS2812 on the XIAO, saying what this board thinks of itself.
+//
+//  The Master's LED reports the MISSION state. This one reports the
+//  NAVIGATION state, and they are different questions: the mission can be
+//  perfectly ready to arm while the estimator has no pad reference, and
+//  nothing on the Master's LED would show it.
+//
+//  Read the colour, then count the flashes:
+//
+//    solid blue        booting
+//    red, 1 flash      self test failed, or the IMU is not talking
+//    red, 2 flashes    no barometer — the vertical channel has no
+//                      absolute reference and the vehicle cannot fly
+//    amber slow        alive, but no pad reference yet: the Master has
+//                      not sent SET_PAD_REF, so px/py/pz mean nothing
+//    magenta slow      pad reference taken, still waiting for a GPS fix
+//                      and with no UWB — dead reckoning only
+//    cyan slow         navigating on GPS
+//    green pulse       navigating on GPS, UWB constellation alive
+//    green solid       UWB fixes are being ACCEPTED by the filter. This
+//                      is the one to wait for before arming: it means
+//                      the vehicle knows where the pad is to a decimetre.
+//
+//  The distinction between the last two is the one worth understanding
+//  from behind the safety line. A pulsing green says the anchors are
+//  powered; a solid green says they are powered, surveyed correctly, and
+//  agreeing with the rest of the navigation solution.
+// =====================================================================
+static ariadna_rgb_t s_rgb;
+
+// Dim on purpose. This LED is read from a few metres away in daylight,
+// and full brightness on a WS2812 is both blinding at night and a
+// noticeable current draw next to the sensors it sits beside.
+static const uint8_t POS_RGB_BRIGHTNESS = 60;
+
+/**
+ * Choose the annunciator's message from the flags that were just built.
+ *
+ * Driven from the nav_state flags rather than from the estimator
+ * directly, so that what the LED says and what the vehicle transmits
+ * cannot disagree. If the LED is green, the packet said VALID.
+ */
+static void annunciate(uint16_t nav_flags, uint32_t now_ms)
+{
+    (void)now_ms;
+
+    if (!s_post_pass || !(nav_flags & ARIADNA_NAV_IMU_OK)) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_BLINK_N, 1);
+        return;
+    }
+    if (!(nav_flags & ARIADNA_NAV_BARO_OK)) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_BLINK_N, 2);
+        return;
+    }
+    if (!(nav_flags & ARIADNA_NAV_PAD_REF)) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER, ARIADNA_PAT_SLOW, 0);
+        return;
+    }
+    if (nav_flags & ARIADNA_NAV_UWB_AIDED) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN, ARIADNA_PAT_SOLID, 0);
+        return;
+    }
+    if (nav_flags & ARIADNA_NAV_UWB_OK) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN, ARIADNA_PAT_PULSE, 0);
+        return;
+    }
+    if (nav_flags & ARIADNA_NAV_GPS_AIDED) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_CYAN, ARIADNA_PAT_SLOW, 0);
+        return;
+    }
+    ariadna_rgb_set(&s_rgb, ARIADNA_C_MAGENTA, ARIADNA_PAT_SLOW, 0);
+}
+
+// =====================================================================
+//  10. SENSOR INITIALISATION
 // =====================================================================
 static bool sensors_begin(void)
 {
@@ -1404,7 +2031,7 @@ static bool sensors_begin(void)
 }
 
 // =====================================================================
-//  10. SELF TEST
+//  11. SELF TEST
 //
 //  What can honestly be checked without a bench: the arithmetic, and
 //  whether the sensors answered. The conventions cannot be checked here —
@@ -1685,11 +2312,93 @@ static bool self_test(void)
         }
     }
 
+    // --- UWB anchor table and multilateration ---------------------------
+    //
+    // Two different things are checked here and only one of them is
+    // arithmetic.
+    //
+    // The GEOMETRY check is the important one, and it is the only place
+    // in the system where a mis-entered anchor coordinate can be caught
+    // before flight. Two anchors at the same point, or an anchor left at
+    // the origin because a row was half-edited, produce a constellation
+    // that still ranges, still solves, and is confidently wrong. It costs
+    // nothing to notice on the pad and it cannot be noticed in the air.
+    //
+    // The SOLVER check runs the real multilateration on synthetic ranges
+    // from the real anchor table, so it fails if the table is degenerate
+    // even in ways the pairwise test does not name.
+    {
+        uint8_t n_en = 0;
+        for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) {
+            if (!s_uwb_anchors[i].enabled) continue;
+            n_en++;
+            for (uint8_t j = i + 1; j < ARIADNA_UWB_MAX_ANCHORS; j++) {
+                if (!s_uwb_anchors[j].enabled) continue;
+                if (s_uwb_anchors[i].addr == s_uwb_anchors[j].addr) {
+                    POS_PRINT("POST uwb duplicate address 0x%04X\n",
+                              (unsigned)s_uwb_anchors[i].addr);
+                    ok = false;
+                }
+                const float dx = s_uwb_anchors[i].x - s_uwb_anchors[j].x;
+                const float dy = s_uwb_anchors[i].y - s_uwb_anchors[j].y;
+                const float dz = s_uwb_anchors[i].z - s_uwb_anchors[j].z;
+                if (dx * dx + dy * dy + dz * dz < 1.0f) {
+                    POS_PRINT("POST uwb anchors %u and %u are within 1 m\n",
+                              (unsigned)i, (unsigned)j);
+                    ok = false;
+                }
+            }
+        }
+        if (n_en != UWB_ANCHOR_COUNT) {
+            POS_PRINT("POST uwb %u enabled rows, UWB_ANCHOR_COUNT is %u\n",
+                      (unsigned)n_en, (unsigned)UWB_ANCHOR_COUNT);
+            ok = false;
+        }
+
+        // Synthetic ranges from a point 30 m above and 5 m east of the
+        // pad. If the configured geometry cannot recover that, it cannot
+        // recover the vehicle either.
+        ariadna_uwb_cfg_t cfg;
+        ariadna_uwb_cfg_default(&cfg);
+        ariadna_uwb_obs_t obs[ARIADNA_UWB_MAX_ANCHORS];
+        const float tx = 5.0f, ty = -3.0f, tz = 30.0f;
+        memset(obs, 0, sizeof(obs));
+        for (uint8_t i = 0; i < UWB_ANCHOR_COUNT; i++) {
+            if (!s_uwb_anchors[i].enabled) continue;
+            const float dx = tx - s_uwb_anchors[i].x;
+            const float dy = ty - s_uwb_anchors[i].y;
+            const float dz = tz - s_uwb_anchors[i].z;
+            obs[i].range_m = sqrtf(dx * dx + dy * dy + dz * dz);
+            obs[i].sigma_m = 0.2f;
+            obs[i].valid   = 1;
+        }
+        const float prior[3] = { 0.0f, 0.0f, 20.0f };
+        ariadna_uwb_fix_t f;
+        if (!ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                               prior, &cfg, &f) ||
+            fabsf(f.x - tx) > 0.5f || fabsf(f.y - ty) > 0.5f) {
+            POS_PRINT("POST uwb solve (%.2f %.2f) want (%.2f %.2f) mode %u\n",
+                      f.x, f.y, tx, ty, (unsigned)f.mode);
+            ok = false;
+        }
+
+        // And the degraded case, because it is the one that will actually
+        // happen: three anchors must still place the vehicle horizontally.
+        obs[UWB_ANCHOR_COUNT - 1].valid = 0;
+        if (!ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                               prior, &cfg, &f) ||
+            fabsf(f.x - tx) > 1.0f || fabsf(f.y - ty) > 1.0f) {
+            POS_PRINT("POST uwb 3-anchor solve (%.2f %.2f) mode %u\n",
+                      f.x, f.y, (unsigned)f.mode);
+            ok = false;
+        }
+    }
+
     return ok;
 }
 
 // =====================================================================
-//  11. CORE 0 — sensors and the estimator
+//  12. CORE 0 — sensors and the estimator
 // =====================================================================
 void setup()
 {
@@ -1699,10 +2408,18 @@ void setup()
     digitalWrite(PIN_UWB_CS, HIGH);      // deselect before SPI comes up:
                                          // it shares the bus with the IMU
 
+    // The annunciator first: from here on every failure below has a
+    // colour, and a board that dies in sensors_begin() still says so.
+    ariadna_rgb_begin(&s_rgb, POS_RGB_BRIGHTNESS, ARIADNA_RGB_POWER_PIN);
+    ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SOLID, 0);
+    ariadna_rgb_service(&s_rgb);
+
     bool sensors = sensors_begin();
     s_est.begin();
 
-    s_uwb.begin(PIN_UWB_CS, PIN_UWB_RST, PIN_UWB_INT);
+    ariadna_uwb_cfg_default(&s_uwb_cfg);
+    memset(&s_uwb_fix, 0, sizeof(s_uwb_fix));
+    const bool uwb_ok = s_uwb.begin(PIN_UWB_CS, PIN_UWB_RST, PIN_UWB_INT);
     s_lidar.begin();
 
     // Level the attitude estimate against gravity. The vehicle must be
@@ -1714,8 +2431,12 @@ void setup()
     }
 
     s_post_pass = self_test() && sensors;
-    POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s)\n",
-              s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL");
+    POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s, UWB %s)\n",
+              s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL",
+              uwb_ok ? "up" : (ARIADNA_UWB_ENABLED ? "FAIL" : "not built"));
+    if (uwb_ok)
+        POS_PRINT("# UWB: %u anchors configured, solve at %lu Hz\n",
+                  (unsigned)UWB_ANCHOR_COUNT, (unsigned long)UWB_SOLVE_HZ);
 
     // The Master link belongs to core 0: it transmits, so it owns the DMA
     // ring. Core 1 only receives, which needs no state of its own.
@@ -1739,11 +2460,29 @@ void loop()
     static uint32_t last_gps_ms  = 0;
     static uint32_t last_prior_ms = 0;
     static uint32_t next_status_ms = 0;
+    static uint32_t last_uwb_solve_ms = 0;
+    static uint32_t last_uwb_gen  = 0;
 
     const uint32_t period = (uint32_t)(1000000UL / ESTIMATOR_HZ);
 
     uint32_t now = micros();
     if (next_us == 0) { next_us = now; last_step_us = now; }
+
+    // ---- the idle path ---------------------------------------------------
+    //
+    // Everything below the estimator's tick rate happens HERE, in the time
+    // between steps, because two-way ranging throughput is set by how
+    // promptly the tag answers an anchor. Polled only once per 240 Hz tick
+    // the constellation would range at a few hertz; polled from the idle
+    // path it reaches the ten hertz per anchor the filter is tuned for.
+    //
+    // Both calls are internally rate limited and neither blocks, so this
+    // costs the idle core and nothing else. THE ORDER MATTERS: the return
+    // below is what makes this the idle path, so anything placed after it
+    // runs at 240 Hz instead.
+    s_uwb.poll();
+    ariadna_rgb_service(&s_rgb);
+
     if ((int32_t)(now - next_us) < 0) return;
     next_us += period;
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
@@ -1920,11 +2659,65 @@ void loop()
         s_est.fuse_horizontal_prior();
     }
 
-    // ---- future sensors ---------------------------------------------------
-    // Both return invalid fixes today. The calls are here so that the path
-    // from sensor to filter is exercised every tick and cannot rot.
+    // ---- lidar ------------------------------------------------------------
+    // Returns an invalid fix today. The call is here so that the path from
+    // sensor to filter is exercised every tick and cannot rot.
     s_est.fuse_range(s_lidar.read());
-    s_est.fuse_range(s_uwb.range());
+
+    // ---- UWB --------------------------------------------------------------
+    //
+    // Ranges arrive asynchronously into the driver's per-anchor slots at
+    // roughly 10 Hz each; the multilateration runs at UWB_SOLVE_HZ and
+    // only when something has actually changed. Solving faster than the
+    // ranges arrive would re-fuse the same measurement repeatedly, which
+    // is the same mistake the barometer's baro_fresh flag exists to
+    // prevent, with the same consequence: a filter that believes it has
+    // seen five independent fixes when it has seen one.
+    //
+    // The whole path is written so that ANY subset of the anchors works.
+    // Nothing here counts anchors or branches on how many answered — the
+    // solver reports what the geometry supported and the estimator
+    // weights it. A dead anchor costs accuracy and nothing else.
+    if (s_uwb.present() && (uint32_t)(now_ms - last_uwb_solve_ms) >=
+                               (1000u / UWB_SOLVE_HZ)) {
+        last_uwb_solve_ms = now_ms;
+        s_uwb.age(now_ms);
+
+        if (s_uwb.fresh() == 0) {
+            // The constellation has gone quiet. Clear the published fix
+            // rather than leave the last good one sitting in the status
+            // packet, where it would read as a working constellation for
+            // as long as nobody thought to power-cycle something.
+            s_uwb_fix.mode   = ARIADNA_UWB_SOL_NONE;
+            s_uwb_fix.use_x  = s_uwb_fix.use_y = s_uwb_fix.use_z = 0;
+            s_uwb_fix.n_used = 0;
+            s_uwb_fix.mask   = 0;
+            s_uwb_fix.residual_rms = 0.0f;
+        } else if (s_uwb.generation() != last_uwb_gen) {
+            last_uwb_gen = s_uwb.generation();
+
+            ariadna_uwb_obs_t obs[ARIADNA_UWB_MAX_ANCHORS];
+            (void)s_uwb.snapshot(obs, now_ms);
+
+            // The prior is the filter's own position. It is the
+            // linearisation point, the held height in the degraded 2-D
+            // modes, and the tie-breaker for the two-anchor ambiguity —
+            // which is exactly why the vertical channel being
+            // barometer-anchored matters to the HORIZONTAL accuracy of a
+            // partial constellation.
+            const float prior[3] = { s_est.px(), s_est.py(), s_est.pz() };
+            if (ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                                  prior, &s_uwb_cfg, &s_uwb_fix)) {
+                // Solve latency only: the ranges themselves are at most
+                // UWB_RANGE_MAX_AGE_MS old and the solver used them where
+                // they were measured.
+                s_est.fuse_uwb(s_uwb_fix, 0.5f * (1.0f / (float)UWB_SOLVE_HZ),
+                               now_ms);
+            }
+        }
+    }
+    if (s_uwb.healthy()) s_sensor_ok |= ARIADNA_SENS_UWB;
+    else                 s_sensor_ok &= (uint16_t)~ARIADNA_SENS_UWB;
 
     // ---- publish -----------------------------------------------------------
     //
@@ -1966,6 +2759,11 @@ void loop()
     if (s_est.have_origin())             st.flags |= ARIADNA_NAV_POS_ORIGIN;
     if (s_est.gps_aided(now_ms))         st.flags |= ARIADNA_NAV_GPS_AIDED;
     if (s_est.zupt())                    st.flags |= ARIADNA_NAV_ZUPT;
+    // Two separate facts, and the difference between them is diagnostic
+    // gold on the pad: UWB_OK means the radio is ranging, UWB_AIDED means
+    // the filter accepted what it produced.
+    if (s_uwb.healthy())                 st.flags |= ARIADNA_NAV_UWB_OK;
+    if (s_est.uwb_aided(now_ms))         st.flags |= ARIADNA_NAV_UWB_AIDED;
 
     // VALID is what unlocks control on the Navigation MCU, so it demands
     // everything the guidance law actually depends on: an attitude, a
@@ -2003,6 +2801,12 @@ void loop()
         ps.sensor_ok    = s_sensor_ok;
         ps.imu_overflow = (uint16_t)sensor.imu.getFIFOOverflowCount();
         ps.cal_state    = s_cal_state;
+        ps.uwb_sigma_h  = s_est.uwb_sigma_h();
+        ps.uwb_resid    = s_uwb_fix.residual_rms;
+        ps.uwb_anchors  = s_uwb.fresh();
+        ps.uwb_mask     = s_uwb_fix.mask;
+        ps.uwb_mode     = s_uwb_fix.mode;
+        ps.uwb_rejects  = s_est.uwb_rejects();
 
         if (have_gps && gps.valid) {
             ps.lat      = gps.lat_1e7;
@@ -2015,10 +2819,16 @@ void loop()
 
         link_send(ARIADNA_PKT_POS_STATUS, &ps, sizeof(ps));
     }
+
+    // ---- annunciator ------------------------------------------------------
+    // Last in the tick, after everything that matters. Choosing the colour
+    // is arithmetic on values already computed; pushing it to the LED
+    // happens in the idle path above and only when it changed.
+    annunciate(st.flags, now_ms);
 }
 
 // =====================================================================
-//  12. CORE 1 — GPS and receiving from the Master
+//  13. CORE 1 — GPS and receiving from the Master
 //
 //  No sensor bus is touched here, by design. GPS is a UART and the Master
 //  link is a UART, so this core can be as bursty as NMEA wants to be

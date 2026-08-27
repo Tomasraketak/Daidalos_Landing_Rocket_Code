@@ -69,11 +69,11 @@ static void test_layout(void)
     check(sizeof(ariadna_nav_state_t)     == 88, "nav_state is 88 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
     check(sizeof(ariadna_nav_status_t)    == 48, "nav_status is 48 bytes");
-    check(sizeof(ariadna_pos_status_t)    == 68, "pos_status is 68 bytes");
+    check(sizeof(ariadna_pos_status_t)    == 80, "pos_status is 80 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
-    check(sizeof(ariadna_tlm_t)           == 46, "telemetry is 46 bytes");
-    check(sizeof(ariadna_gs_serial_t)     == 48, "gs serial is 48 bytes");
+    check(sizeof(ariadna_tlm_t)           == 47, "telemetry is 47 bytes");
+    check(sizeof(ariadna_gs_serial_t)     == 49, "gs serial is 49 bytes");
 
     // Every inter-MCU struct must be a multiple of 4 so that the packed
     // and natural layouts agree and no member is ever misaligned.
@@ -85,7 +85,7 @@ static void test_layout(void)
     check(sizeof(ariadna_cmd_t)          % 4 == 0, "cmd 4-byte multiple");
 
     // Telemetry field offsets. This is the contract ground_visualizer.py
-    // decodes with "<Iii" + "h"*11 + "B"*12 + "bb". If any line here moves,
+    // decodes with "<Iii" + "h"*11 + "B"*13 + "bb". If any line here moves,
     // that format string is wrong and the ground station shows garbage.
     check(offsetof(ariadna_tlm_t, t_ms)       ==  0, "tlm.t_ms at 0");
     check(offsetof(ariadna_tlm_t, lat)        ==  4, "tlm.lat at 4");
@@ -113,9 +113,10 @@ static void test_layout(void)
     check(offsetof(ariadna_tlm_t, health)     == 43, "tlm.health at 43");
     check(offsetof(ariadna_tlm_t, flags)      == 44, "tlm.flags at 44");
     check(offsetof(ariadna_tlm_t, exp)        == 45, "tlm.exp at 45");
+    check(offsetof(ariadna_tlm_t, uwb)        == 46, "tlm.uwb at 46");
 
-    check(offsetof(ariadna_gs_serial_t, rssi) == 46, "gs.rssi at 46");
-    check(offsetof(ariadna_gs_serial_t, snr)  == 47, "gs.snr at 47");
+    check(offsetof(ariadna_gs_serial_t, rssi) == 47, "gs.rssi at 47");
+    check(offsetof(ariadna_gs_serial_t, snr)  == 48, "gs.snr at 48");
 
     // Nothing may exceed the frame buffer.
     check(sizeof(ariadna_nav_state_t) <= ARIADNA_PAYLOAD_MAX, "nav_state fits a frame");

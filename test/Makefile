@@ -2,6 +2,7 @@
 #
 #   make          numerical check of the algorithm against the Python model
 #   make est      Ariadna V2 navigation filter
+#   make uwb      Ariadna V2 UWB multilateration
 #   make link     Ariadna V2 inter-processor link codec
 #   make syntax   compile the sketches against a stub Arduino header
 #   make sync     verify the Navigation MCU's guidance copy has not drifted
@@ -20,6 +21,7 @@ V2      = ../Ariadna_V2
 NAV_DIR = $(V2)/Navigation_MCU
 LINK_H  = $(V2)/common/ariadna_link.h
 KF_H    = $(V2)/common/ariadna_kf.h
+UWB_H   = $(V2)/common/ariadna_uwb.h
 
 all: host_test
 	./host_test
@@ -50,6 +52,23 @@ est: est_test
 
 est_test: est_test.cpp $(KF_H)
 	$(CXX) $(CXXFLAGS) -o est_test est_test.cpp -lm
+
+# ---------------------------------------------------------------------
+# Ariadna V2 UWB multilateration. Same discipline as the filter above:
+# ariadna_uwb.h compiles unchanged into this test and unchanged into
+# position_mcu.ino.
+#
+# This one earns its place more than most. The solver's whole job is to
+# behave sensibly when the constellation is INCOMPLETE, and a partial
+# constellation is difficult to arrange deliberately on a launch site and
+# trivial to arrange here. Anchors are removed one at a time, fed NaNs,
+# given negative ranges, placed on top of each other and put in a line.
+# ---------------------------------------------------------------------
+uwb: uwb_test
+	./uwb_test
+
+uwb_test: uwb_test.cpp $(UWB_H)
+	$(CXX) $(CXXFLAGS) -o uwb_test uwb_test.cpp -lm
 
 # ---------------------------------------------------------------------
 # Arduino cannot compile a .cpp that lives outside the sketch folder, so
@@ -96,7 +115,7 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(NAV_DIR)/navigation_mcu.ino
 	@echo "sketches compile clean"
 
-check: all est link sync pyfmt syntax
+check: all est uwb link sync pyfmt syntax
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -104,5 +123,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test link_test est_test
-.PHONY: all est link sync sync-fix pyfmt syntax check golden clean
+	rm -f host_test link_test est_test uwb_test
+.PHONY: all est uwb link sync sync-fix pyfmt syntax check golden clean

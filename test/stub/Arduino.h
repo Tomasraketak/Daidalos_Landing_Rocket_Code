@@ -54,7 +54,18 @@ inline void     analogWriteRange(uint32_t) {}
 inline uint32_t micros(void) { return 0; }
 inline uint32_t millis(void) { return 0; }
 inline void     delay(uint32_t) {}
+inline void     delayMicroseconds(uint32_t) {}
 inline void     tight_loop_contents(void) {}
+
+// Annunciators. ariadna_rgb.h drives the buzzer through these and
+// compiles its RGB path out when Adafruit_NeoPixel is absent, which it is
+// here — so these three are all the shim needs for `make syntax` to cover
+// the annunciator code as well as the control code.
+inline void     tone(uint8_t, uint32_t) {}
+inline void     tone(uint8_t, uint32_t, uint32_t) {}
+inline void     noTone(uint8_t) {}
+inline int      digitalPinToInterrupt(uint8_t p) { return (int)p; }
+inline void     detachInterrupt(int) {}
 
 class SerialStub {
 public:

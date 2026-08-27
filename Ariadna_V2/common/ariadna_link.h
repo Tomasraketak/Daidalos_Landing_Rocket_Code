@@ -236,13 +236,18 @@ typedef enum {
 #define ARIADNA_NAV_MAG_OK     (1u << 3)
 #define ARIADNA_NAV_GPS_FIX    (1u << 4)
 #define ARIADNA_NAV_PAD_REF    (1u << 5)   // pad altitude reference captured
-#define ARIADNA_NAV_UWB_OK     (1u << 6)   // FUTURE: DWM1000 ranging valid
+#define ARIADNA_NAV_UWB_OK     (1u << 6)   // DWM1000 ranging alive: >=1 fresh anchor
 #define ARIADNA_NAV_LIDAR_OK   (1u << 7)   // FUTURE: TF Luna range valid
 #define ARIADNA_NAV_ACC_SAT    (1u << 8)   // accelerometer clipped this cycle
 #define ARIADNA_NAV_DEADRECK   (1u << 9)   // extrapolated, not measured
 #define ARIADNA_NAV_POS_ORIGIN (1u << 10)  // horizontal origin set: px/py mean m from the pad
 #define ARIADNA_NAV_GPS_AIDED  (1u << 11)  // a GPS fix was accepted recently
 #define ARIADNA_NAV_ZUPT       (1u << 12)  // zero-velocity update active (pre-launch only)
+// A UWB position fix was ACCEPTED by the filter recently. Distinct from
+// ARIADNA_NAV_UWB_OK, which only says the radio is producing ranges: a
+// constellation can be alive and still be gated out, and the difference
+// between those two states is exactly what the pad crew needs to see.
+#define ARIADNA_NAV_UWB_AIDED  (1u << 13)
 
 /**
  * Navigation state estimate. The most important packet in the system:
@@ -356,7 +361,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 48, "nav_status layout cha
 #define ARIADNA_SENS_BARO      (1u << 1)
 #define ARIADNA_SENS_MAG       (1u << 2)
 #define ARIADNA_SENS_GPS       (1u << 3)
-#define ARIADNA_SENS_UWB       (1u << 4)   // FUTURE
+#define ARIADNA_SENS_UWB       (1u << 4)
 #define ARIADNA_SENS_LIDAR     (1u << 5)   // FUTURE
 
 /**
@@ -388,14 +393,25 @@ typedef struct {
     // diagnostic, and the estimator already folds it into `quality`.
     float    sigma_pos_h;    // m,   horizontal position
     float    sigma_vel_h;    // m/s, horizontal velocity
+    // UWB constellation health. Diagnostics, not control: the estimator
+    // has already folded the fix into px/py by the time this is built.
+    // What the pad crew reads off it is whether the anchors are actually
+    // working BEFORE the vehicle needs them, which is the only time
+    // anything can be done about a dead one.
+    float    uwb_sigma_h;    // m, horizontal 1-sigma of the last accepted fix
+    float    uwb_resid;      // m, post-fit range residual RMS. Large = reflections
     uint16_t sensor_ok;      // ARIADNA_SENS_* bits
     uint16_t imu_overflow;   // ICM42688P FIFO overflow count
     uint8_t  sats;
     uint8_t  fix;            // 0 none, 2 2D, 3 3D
     uint8_t  hdop_x10;
     uint8_t  cal_state;      // 0 uncal, 1 gyro done, 2 gyro+accel, 3 full
+    uint8_t  uwb_anchors;    // anchors that contributed to the last solve
+    uint8_t  uwb_mask;       // bit i: anchor slot i contributed
+    uint8_t  uwb_mode;       // ariadna_uwb_mode_t: 0 none, 1 LOS, 2 2-D, 3 3-D
+    uint8_t  uwb_rejects;    // consecutive innovation-gate rejections
 } ariadna_pos_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 68, "pos_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 80, "pos_status layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
@@ -461,11 +477,13 @@ typedef enum {
 // ---------------------------------------------------------------------
 //  LoRa downlink packet
 //
-//  Packed to 46 bytes because airtime, not RAM, is the constraint. At
-//  SF7 / BW125 / CR4-5 a 46-byte payload is ~72 ms on air, so the 5 Hz
-//  default downlink is about a 36 % duty cycle. Raising the rate or the
+//  Packed to 47 bytes because airtime, not RAM, is the constraint. At
+//  SF7 / BW125 / CR4-5 a 47-byte payload is ~73 ms on air, so the 5 Hz
+//  default downlink is about a 37 % duty cycle. Raising the rate or the
 //  size eats that margin directly — check ARIADNA_TLM_HZ in master_mcu.ino
-//  before adding a field.
+//  before adding a field. The most recent addition was the single UWB
+//  status byte, and it was argued for on exactly those grounds: one byte
+//  of airtime against being able to see a dead anchor from the pad.
 //
 //  Field order is 4-byte, then 2-byte, then 1-byte, so every member is
 //  naturally aligned even though the struct is packed; only the two bytes
@@ -474,7 +492,7 @@ typedef enum {
 //  ground_visualizer.py must be updated in lockstep. Its struct format
 //  string is asserted against this layout by ../../test/link_test.cpp.
 // ---------------------------------------------------------------------
-#define ARIADNA_TLM_VERSION  2
+#define ARIADNA_TLM_VERSION  3
 
 #pragma pack(push, 1)
 typedef struct {
@@ -504,9 +522,31 @@ typedef struct {
     uint8_t  health;       // 43  ARIADNA_HLT_* bits
     uint8_t  flags;        // 44  ARIADNA_TF_* bits
     uint8_t  exp;          // 45  experiment / payload phase, free for you
+    uint8_t  uwb;          // 46  ARIADNA_TUWB_* — see below
 } ariadna_tlm_t;
 #pragma pack(pop)
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_tlm_t) == 46, "telemetry layout changed - update ground_visualizer.py");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_tlm_t) == 47, "telemetry layout changed - update ground_visualizer.py");
+
+// --- ariadna_tlm_t.uwb ------------------------------------------------
+//
+// One byte, because that is what the airtime budget had left. It carries
+// the two things the pad crew cannot work out any other way: HOW MANY
+// anchors are answering, and whether the filter is actually using them.
+//
+//   bits 0-3   anchors that contributed to the last solve, 0..15
+//   bits 4-5   solution mode: 0 none, 1 line-of-sight, 2 two-D, 3 three-D
+//   bit  6     a UWB fix was accepted by the navigation filter recently
+//   bit  7     the DWM1000 itself is alive and ranging
+//
+// Reading 0x00 during a countdown means the anchors are not powered.
+// Reading 0x84 (alive, four anchors, no accepted fix) means they are
+// powered and the filter is rejecting them — which is a survey error or
+// a reflection, and is fixable in the ten minutes before launch.
+#define ARIADNA_TUWB_N_MASK    0x0F
+#define ARIADNA_TUWB_MODE_MASK 0x30
+#define ARIADNA_TUWB_MODE_SHIFT   4
+#define ARIADNA_TUWB_AIDED     0x40
+#define ARIADNA_TUWB_ALIVE     0x80
 
 // --- ariadna_tlm_t.health --------------------------------------------
 #define ARIADNA_HLT_POS_LINK   (1u << 0)   // Position MCU talking
@@ -535,7 +575,7 @@ typedef struct {
     int8_t        snr;     // dB
 } ariadna_gs_serial_t;
 #pragma pack(pop)
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 48, "gs serial layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 49, "gs serial layout changed");
 
 // ---------------------------------------------------------------------
 //  Default rates

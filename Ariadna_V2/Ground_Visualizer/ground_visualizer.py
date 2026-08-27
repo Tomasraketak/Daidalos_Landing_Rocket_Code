@@ -71,17 +71,21 @@ PAD_LON = 16.6912772
 SYNC0 = 0xA5
 SYNC1 = 0x1D
 PKT_TELEMETRY = 0x40
-TLM_VERSION = 2
+TLM_VERSION = 3
 
 # Downlink rate the vehicle is configured for. Must match ARIADNA_TLM_HZ in
 # ariadna_link.h — it is what the link-quality percentage is measured
 # against, so a stale value here reads as a permanently bad link.
 TLM_HZ = 10
 
-#            t_ms lat lon | 11 x int16                | 12 x uint8      | rssi snr
-GS_FORMAT = "<Iii" + "h" * 11 + "B" * 12 + "bb"
+#            t_ms lat lon | 11 x int16                | 13 x uint8      | rssi snr
+GS_FORMAT = "<Iii" + "h" * 11 + "B" * 13 + "bb"
 GS_SIZE = struct.calcsize(GS_FORMAT)
-assert GS_SIZE == 48, f"packet layout drift: {GS_SIZE} != 48"
+assert GS_SIZE == 49, f"packet layout drift: {GS_SIZE} != 49"
+
+# ariadna_tlm_t.uwb, one byte of UWB constellation health. See the
+# ARIADNA_TUWB_* block in ariadna_link.h for why it is worth the airtime.
+UWB_MODE_NAMES = {0: "--", 1: "LOS", 2: "2D", 3: "3D"}
 
 STATE_NAMES = {
     0: "BOOT", 1: "IDLE", 2: "ARMED", 3: "ASCENT", 4: "APOGEE", 5: "DESCENT",
@@ -418,7 +422,7 @@ class SerialWorker(QtCore.QThread):
          alt_dm, vz_dms, vh_dms, acc_cg, roll_d, pitch_d, yaw_d, temp_d,
          tvc_x_cd, tvc_y_cd, thrust_n,
          version, state, nav_phase, clamp_pct, vbat_cv, curr_da,
-         hdop_x10, sats, pyro, health, flags, exp,
+         hdop_x10, sats, pyro, health, flags, exp, uwb,
          rssi, snr) = u
 
         if version != TLM_VERSION:
@@ -447,6 +451,10 @@ class SerialWorker(QtCore.QThread):
             "FLAGS": flags,
             "ERROR": (flags >> 5) & 0x07,
             "EXP": exp,
+            "UWB_N": uwb & 0x0F,
+            "UWB_MODE": (uwb >> 4) & 0x03,
+            "UWB_AIDED": bool(uwb & 0x40),
+            "UWB_ALIVE": bool(uwb & 0x80),
             "RSSI": rssi, "SNR": snr,
             "sys_time": time.time(),
         })
@@ -1018,6 +1026,11 @@ class GroundStation(QtWidgets.QMainWindow):
             "TEMPERATURE", "SATELLITES",
             "HDOP", "LORA SIGNAL",
             "LINK QUALITY", "ERROR",
+            # The UWB constellation. Two cards rather than one because the
+            # two facts fail independently: the anchors can be alive and
+            # the filter can still be rejecting every fix they produce,
+            # which is what a survey error looks like from the ground.
+            "UWB ANCHORS", "UWB FIX",
         ]
         for i, name in enumerate(card_names):
             card = TelemetryCard(name)
@@ -1098,7 +1111,8 @@ class GroundStation(QtWidgets.QMainWindow):
                     "vz", "hvel", "accel", "roll", "pitch", "yaw", "temp",
                     "tvc_x", "tvc_y", "clamp", "thrust", "battery", "current",
                     "hdop", "sats", "pyro_cont", "pyro_fired", "health",
-                    "flags", "error", "rssi", "snr"])
+                    "flags", "error", "rssi", "snr",
+                    "uwb_n", "uwb_mode", "uwb_aided", "uwb_alive"])
             self.is_recording = True
             self.record_btn.setText("⏹ STOP REC")
             self.record_btn.setStyleSheet("background-color: #ff0000; color: white;")
@@ -1251,6 +1265,9 @@ class GroundStation(QtWidgets.QMainWindow):
             "HEALTH": 0xFF,
             "FLAGS": 0x0B if state >= 2 else 0x08,
             "ERROR": 0, "EXP": int(t / 5) % 8,
+            "UWB_N": 4 if int(t) % 20 < 15 else 3,
+            "UWB_MODE": 3 if alt > 5 else 2,
+            "UWB_AIDED": True, "UWB_ALIVE": True,
             "RSSI": -60 + int(math.sin(t) * 25),
             "SNR": 9 + int(math.cos(t) * 4),
             "sys_time": time.time(),
@@ -1271,7 +1288,9 @@ class GroundStation(QtWidgets.QMainWindow):
                     d["TVC_X"], d["TVC_Y"], d["CLAMP"], d["THRUST"],
                     d["BATTERY"], d["CURRENT"], d["HDOP"], d["SATS"],
                     d["PYRO_CONT"], d["PYRO_FIRED"], d["HEALTH"],
-                    d["FLAGS"], d["ERROR"], d["RSSI"], d["SNR"]])
+                    d["FLAGS"], d["ERROR"], d["RSSI"], d["SNR"],
+                    d["UWB_N"], d["UWB_MODE"],
+                    int(d["UWB_AIDED"]), int(d["UWB_ALIVE"])])
                 if time.time() - self.last_flush_time >= 10.0:
                     self.csv_file.flush()
                     os.fsync(self.csv_file.fileno())
@@ -1320,6 +1339,15 @@ class GroundStation(QtWidgets.QMainWindow):
         c["HDOP"].set_value(f"{d['HDOP']:.1f}")
         c["ERROR"].set_value(ERROR_NAMES.get(d["ERROR"], "?"))
 
+        # UWB. "n/4 anchors" and what the filter is doing with them.
+        c["UWB ANCHORS"].set_value(f"{d['UWB_N']} / 4")
+        if not d["UWB_ALIVE"]:
+            c["UWB FIX"].set_value("OFFLINE")
+        elif d["UWB_AIDED"]:
+            c["UWB FIX"].set_value(f"FUSED {UWB_MODE_NAMES.get(d['UWB_MODE'], '?')}")
+        else:
+            c["UWB FIX"].set_value("GATED OUT")
+
         c["LORA SIGNAL"].value_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         c["LORA SIGNAL"].set_value(
             f"<b>{d['RSSI']}</b><span style='font-size:10px;color:#aaa;'> dBm</span> "
@@ -1332,6 +1360,14 @@ class GroundStation(QtWidgets.QMainWindow):
         c["ERROR"].set_status("#ff2222" if d["ERROR"] else "#00ff88")
         c["HDOP"].set_status("#ff2222" if d["HDOP"] > 2.5
                              else "#ffaa00" if d["HDOP"] > 1.5 else "#00ff88")
+        # Three anchors still navigates; two is a warning; one or none is
+        # not a constellation any more.
+        c["UWB ANCHORS"].set_status("#00ff88" if d["UWB_N"] >= 3
+                                    else "#ffaa00" if d["UWB_N"] == 2 else "#ff2222")
+        # Green only when the filter is ACCEPTING fixes. Alive but gated
+        # out is amber, and it is the state worth acting on before launch.
+        c["UWB FIX"].set_status("#00ff88" if d["UWB_AIDED"]
+                                else "#ffaa00" if d["UWB_ALIVE"] else "#444444")
         c["LORA SIGNAL"].set_status("#00ff88" if d["RSSI"] > -90
                                     else "#ffaa00" if d["RSSI"] > -110 else "#ff2222")
         c["GUIDANCE PHASE"].set_status("#ff8c00" if d["PHASE"] == 2 else "#444444")

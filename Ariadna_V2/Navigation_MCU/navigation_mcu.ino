@@ -47,6 +47,7 @@
 #include "guidance.h"
 #include "../common/ariadna_link.h"
 #include "../common/ariadna_uart_dma.h"
+#include "../common/ariadna_rgb.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -570,7 +571,83 @@ static void handle_command(const ariadna_cmd_t *c)
 }
 
 // =====================================================================
-//  9. POWER-ON SELF TEST
+//  9. ANNUNCIATOR
+//
+//  The XIAO's own WS2812, reporting the one thing this board knows that
+//  nothing else in the vehicle does: whether it is READY TO FIRE A PYRO.
+//
+//  That is worth a dedicated LED. The Master's annunciator reports the
+//  mission state and the Position MCU's reports the navigation solution;
+//  neither can tell you that the igniter has continuity, that the
+//  guidance planner is still converging, or that this board has stopped
+//  receiving a navigation state and has therefore parked the TVC.
+//
+//    solid red         self test failed. Do not arm.
+//    red, 2 flashes    armed, but channel 1 has NO CONTINUITY. The
+//                      igniter is open, or the wrong side of a connector
+//                      is in your hand.
+//    slow blue         alive, waiting for a navigation state
+//    slow amber        navigation state arriving, not armed
+//    slow green        armed and receiving. Continuity on channel 1.
+//    fast green        the landing burn is running
+//    magenta fast      the navigation state has gone stale and the TVC is
+//                      parked. This is the failure the link supervision
+//                      exists to make visible.
+//
+//  ---------------------------------------------------------------------
+//  WHY THIS IS SAFE INSIDE A 200 Hz CONTROL LOOP
+//  ---------------------------------------------------------------------
+//  Because ariadna_rgb_service() only touches the LED when the computed
+//  pixel value has changed. A solid colour costs one 30 microsecond
+//  transfer and then nothing; the fastest pattern here costs two
+//  transfers per second. It is called at the very end of the tick, after
+//  the actuator packet is already on the wire, so even that cost lands in
+//  the slack rather than in the control path.
+// =====================================================================
+static ariadna_rgb_t s_rgb;
+
+static const uint8_t NAV_RGB_BRIGHTNESS = 60;
+
+/**
+ * Choose the annunciator's message.
+ *
+ * `fresh` is the link supervisor's verdict, passed in rather than
+ * recomputed so the LED and the actuator packet cannot disagree about
+ * whether the navigation state is usable.
+ */
+static void annunciate(bool fresh, bool stale_parked)
+{
+    if (!s_post_pass) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_SOLID, 0);
+        return;
+    }
+    if (stale_parked) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_MAGENTA, ARIADNA_PAT_FAST, 0);
+        return;
+    }
+    if (s_armed && !(s_cont_mask & 0x01)) {
+        // Armed with an open igniter. The single most useful thing this
+        // board can tell somebody standing next to the vehicle.
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_BLINK_N, 2);
+        return;
+    }
+    if (s_dg_out.phase == DG_PHASE_BURN) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN, ARIADNA_PAT_FAST, 0);
+        return;
+    }
+    if (!fresh) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SLOW, 0);
+        return;
+    }
+    if (s_armed) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN, ARIADNA_PAT_SLOW, 0);
+        return;
+    }
+    ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER, ARIADNA_PAT_SLOW, 0);
+}
+
+// =====================================================================
+//  10. POWER-ON SELF TEST
 //
 //  Cheap, and it catches the failure that matters: a guidance module that
 //  linked but does not compute. A failure here inhibits arming — the board
@@ -706,7 +783,7 @@ static bool self_test(void)
 }
 
 // =====================================================================
-//  10. CORE 0 — 200 Hz control
+//  11. CORE 0 — 200 Hz control
 // =====================================================================
 void setup()
 {
@@ -721,6 +798,11 @@ void setup()
     analogReadResolution(12);
 
     Serial.begin(ARIADNA_CONSOLE_BAUD);      // pad console, internal USB-C
+
+    // Up before the self test, so a board that fails one has a colour.
+    ariadna_rgb_begin(&s_rgb, NAV_RGB_BRIGHTNESS, ARIADNA_RGB_POWER_PIN);
+    ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SOLID, 0);
+    ariadna_rgb_service(&s_rgb);
 
     MASTER_PORT.setTX(PIN_MASTER_TX);
     MASTER_PORT.setRX(PIN_MASTER_RX);
@@ -933,12 +1015,18 @@ void loop()
                   (unsigned long)s_plan_calls);
     }
 
+    // ---- annunciator ----------------------------------------------------
+    // Very last, after the actuator packet is already on the wire. See
+    // the section 9 header for why this is affordable at 200 Hz.
+    annunciate(state_fresh, s_have_state && !s_dg_nav.valid);
+    ariadna_rgb_service(&s_rgb);
+
     uint32_t dt = micros() - t0;
     if (dt > s_loop_max_us) s_loop_max_us = dt;
 }
 
 // =====================================================================
-//  11. CORE 1 — trajectory replanner
+//  12. CORE 1 — trajectory replanner
 //
 //  dg_step_planner() does ONE trajectory projection per call and keeps the
 //  root find's bracket between calls. A full solve is about seven

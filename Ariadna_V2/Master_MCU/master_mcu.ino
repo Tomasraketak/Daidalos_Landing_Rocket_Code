@@ -70,6 +70,12 @@
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
 
+// The shared annunciator engine. ARIADNA_RGB_PIN must be set BEFORE the
+// include: the header instantiates the pixel object at that pin, and the
+// Master's SK6812 is on GP2 rather than on the XIAO's on-board GPIO.
+#define ARIADNA_RGB_PIN  2
+#include "../common/ariadna_rgb.h" 
+
 #include <string.h>
 #include <math.h>
 
@@ -90,6 +96,13 @@ static const uint8_t PIN_NAV_RX  = 5;
 // ---- annunciators ----------------------------------------------------
 static const uint8_t PIN_RGB     = 2;   // SK6812, PIO driven
 static const uint8_t PIN_BUZZER  = 3;   // PWM
+
+// ariadna_rgb.h instantiates its pixel object at ARIADNA_RGB_PIN, which
+// is set immediately above the include at the top of this file. The two
+// numbers describe the same wire, so they are checked against each other
+// here rather than left to agree by luck.
+static_assert(ARIADNA_RGB_PIN == PIN_RGB,
+              "ARIADNA_RGB_PIN disagrees with PIN_RGB - the SK6812 will not light");
 
 // ---- subordinate resets ---------------------------------------------
 // Active LOW into each XIAO's RUN pin. Held high in normal operation.
@@ -253,7 +266,10 @@ static volatile uint32_t s_tlm_skipped = 0;
 static bool     s_servo_ok    = false;
 static bool     s_post_pass   = false;
 
-Adafruit_NeoPixel s_rgb(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
+// The pixel object itself lives in ariadna_rgb.h, so the pattern engine
+// and the hardware it drives cannot get out of step between boards.
+static ariadna_rgb_t  s_rgb;
+static ariadna_buzzer_t s_buzz;
 
 // =====================================================================
 //  3. PCA9685 — servo bus
@@ -597,43 +613,88 @@ static void log_push(const LogRecord *r)
 // =====================================================================
 //  5. ANNUNCIATORS
 // =====================================================================
-static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
-{
-    s_rgb.setPixelColor(0, s_rgb.Color(r, g, b));
-    s_rgb.show();
-}
+// ---------------------------------------------------------------------
+//  The pad crew's instrument panel
+//
+//  One colour per MISSION state, so the vehicle can be read from outside
+//  the safety line without a laptop. The Position MCU's own LED reports
+//  the NAVIGATION state, which is a different question — see the
+//  annunciator section in position_mcu.ino.
+//
+//    solid blue        BOOT
+//    slow green        IDLE, safe, RBF fitted
+//    fast red          ARMED. Stay behind the line.
+//    solid amber       ASCENT
+//    solid yellow      APOGEE
+//    solid magenta     DESCENT
+//    solid white       GUIDANCE — the Navigation MCU has authority
+//    solid green       LANDED
+//    slow green        RECOVERY, with the beacon
+//    fast amber        ABORT
+//    slow blue         TEST mode, pyros inhibited
+//    solid red         ERROR
+//
+//  The state colours are the same ones the V1 flight computer used. They
+//  are not changed here because the people who read them have not.
+// ---------------------------------------------------------------------
 
-// One colour per mission state, so the pad crew can read the vehicle from
-// outside the safety line without a laptop.
+// Beacon and warning sequences. Expressed as data so that nothing in the
+// vehicle ever calls delay() to make a noise — ariadna_buzzer_service()
+// advances them from the main loop.
+static const ariadna_beep_step_t BEEP_RECOVERY[] = {
+    { 2700, 150 }, { 0, 850 }
+};
+static const ariadna_beep_step_t BEEP_ARMED[] = {
+    { 1800,  40 }, { 0, 960 }
+};
+
 static void annunciate(void)
 {
+    // Rate limited because choosing the message is the cheap part; the
+    // engine below only touches the LED when the pixel actually changes.
     static uint32_t next_ms = 0;
-    static bool     blink   = false;
     if (millis() < next_ms) return;
-    next_ms = millis() + 250;
-    blink = !blink;
+    next_ms = millis() + 50;
 
     switch (s_state) {
-    case ARIADNA_STATE_BOOT:     rgb_set(0, 0, 40); break;                 // blue
-    case ARIADNA_STATE_IDLE:     rgb_set(0, 30, 0); break;                 // green
-    case ARIADNA_STATE_ARMED:    rgb_set(blink ? 60 : 0, 0, 0); break;     // red blink
-    case ARIADNA_STATE_ASCENT:   rgb_set(60, 30, 0); break;                // amber
-    case ARIADNA_STATE_APOGEE:   rgb_set(40, 40, 0); break;
-    case ARIADNA_STATE_DESCENT:  rgb_set(40, 0, 40); break;                // magenta
-    case ARIADNA_STATE_GUIDANCE: rgb_set(60, 60, 60); break;               // white
-    case ARIADNA_STATE_LANDED:   rgb_set(0, 60, 0); break;
-    case ARIADNA_STATE_RECOVERY: rgb_set(0, blink ? 60 : 0, 0); break;
-    case ARIADNA_STATE_ABORT:    rgb_set(blink ? 60 : 0, blink ? 20 : 0, 0); break;
-    case ARIADNA_STATE_TEST:     rgb_set(0, 0, blink ? 60 : 0); break;
-    default:                     rgb_set(60, 0, 0); break;                 // ERROR
+    case ARIADNA_STATE_BOOT:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE,    ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_IDLE:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN,   ARIADNA_PAT_SLOW,  0); break;
+    case ARIADNA_STATE_ARMED:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED,     ARIADNA_PAT_FAST,  0); break;
+    case ARIADNA_STATE_ASCENT:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER,   ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_APOGEE:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_YELLOW,  ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_DESCENT:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_MAGENTA, ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_GUIDANCE:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_WHITE,   ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_LANDED:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN,   ARIADNA_PAT_SOLID, 0); break;
+    case ARIADNA_STATE_RECOVERY:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_GREEN,   ARIADNA_PAT_SLOW,  0); break;
+    case ARIADNA_STATE_ABORT:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER,   ARIADNA_PAT_FAST,  0); break;
+    case ARIADNA_STATE_TEST:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE,    ARIADNA_PAT_SLOW,  0); break;
+    default:
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_RED,     ARIADNA_PAT_SOLID, 0); break;
     }
 
     // The recovery beacon. Loud, periodic, and only after landing — a
-    // buzzer during the flight is just battery drain.
+    // buzzer during the flight is just battery drain, and it is the one
+    // thing that finds a vehicle in long grass.
+    //
+    // min_gap_ms is what lets these be called unconditionally from a
+    // state that persists: a sequence already running is not restarted.
     if (s_state == ARIADNA_STATE_RECOVERY) {
-        if (blink) tone(PIN_BUZZER, 2700, 120);
+        ariadna_buzzer_play(&s_buzz, BEEP_RECOVERY, 2, 1, 2000);
     } else if (s_state == ARIADNA_STATE_ARMED) {
-        if (blink) tone(PIN_BUZZER, 1800, 40);
+        ariadna_buzzer_play(&s_buzz, BEEP_ARMED, 2, 1, 2000);
+    } else {
+        ariadna_buzzer_stop(&s_buzz);
     }
 }
 
@@ -955,6 +1016,26 @@ static void build_telemetry(ariadna_tlm_t *t)
     t->hdop_x10 = s_pos_status.hdop_x10;
     t->sats     = s_pos_status.sats;
 
+    // UWB constellation health, one byte. Built from BOTH status sources
+    // on purpose: the anchor count and the solution mode come from the
+    // Position MCU's 20 Hz housekeeping, while "the filter accepted a
+    // fix" is a flag on the 240 Hz navigation state. Reading the second
+    // without the first is how you end up believing a constellation is
+    // working because it was working half a second ago.
+    {
+        uint8_t u = 0;
+        if (s_have_pos_status) {
+            uint8_t n = s_pos_status.uwb_anchors;
+            if (n > 15) n = 15;
+            u |= n;
+            u |= (uint8_t)((s_pos_status.uwb_mode & 0x03) << ARIADNA_TUWB_MODE_SHIFT);
+            if (s_pos_status.sensor_ok & ARIADNA_SENS_UWB) u |= ARIADNA_TUWB_ALIVE;
+        }
+        if (s_have_nav && (s_nav.flags & ARIADNA_NAV_UWB_AIDED))
+            u |= ARIADNA_TUWB_AIDED;
+        t->uwb = u;
+    }
+
     // Low nibble continuity, high nibble fired.
     if (s_have_nav_status)
         t->pyro = (uint8_t)((s_nav_status.pyro_cont & 0x0F) |
@@ -1069,8 +1150,12 @@ void setup()
 
     Serial.begin(ARIADNA_CONSOLE_BAUD);
 
-    s_rgb.begin();
-    rgb_set(0, 0, 40);
+    // 0xFF: the SK6812 is powered from the board's own rail, so there is
+    // no LED power-enable pin to drive as there is on the XIAOs.
+    ariadna_rgb_begin(&s_rgb, 60, 0xFF);
+    ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SOLID, 0);
+    ariadna_rgb_service(&s_rgb);
+    ariadna_buzzer_begin(&s_buzz, PIN_BUZZER);
 
     // ---- servo bus ----
     Wire.setSDA(PIN_I2C_SDA);
@@ -1140,6 +1225,8 @@ void loop()
     read_analogue();
     state_machine();
     annunciate();
+    ariadna_rgb_service(&s_rgb);
+    ariadna_buzzer_service(&s_buzz);
 
     // ---- state broadcast, 10 Hz -----------------------------------------
     if (millis() >= next_bcast_ms) {

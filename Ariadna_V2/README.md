@@ -16,9 +16,10 @@ machine, and the ground segment.
 | board | hardware | owns |
 |---|---|---|
 | **Master** | Raspberry Pi Pico 2 W | mission state machine, all servos, flash log, LoRa downlink, arming |
-| **Position** | XIAO RP2350 | sensor fusion, the navigation solution |
+| **Position** | XIAO RP2350 | sensor fusion, the navigation solution, the UWB tag |
 | **Navigation** | XIAO RP2350 | guidance, ignition timing, TVC, pyros |
 | **Ground station** | Raspberry Pi Pico 2 | LoRa receive, OLED, USB uplink to the laptop |
+| **UWB anchor** ×4 | XIAO RP2350 | fixed ranging beacons on the ground around the pad |
 
 One rule decides which board does what: **nothing that can block may share a core with
 something that must not.** A barometer read blocks on I²C. A flash sector erase blocks for
@@ -40,7 +41,152 @@ control loop, so none of them do.
                              ┌─────▼──────┐      USB      ┌────────────┐
                              │ Ground stn │ ──framed────► │ visualiser │
                              └────────────┘               └────────────┘
+
+   and on the ground, around the pad:
+
+     ┌────────┐   ┌────────┐        UWB two-way ranging, ~10 Hz per anchor
+     │anchor 1│   │anchor 2│   ◄─────────────────────────────────┐
+     └────────┘   └────────┘                                     │
+     ┌────────┐   ┌────────┐                            the tag on the
+     │anchor 4│   │anchor 3│   ◄──────────────────────  Position MCU
+     └────────┘   └────────┘
 ```
+
+---
+
+## What each MCU actually does, and how
+
+The table above says who owns what. This section says what each board *does with
+its time* — the loops, the cores, the rates, and the one thing on each board that
+must never be allowed to block.
+
+Read it before changing anything on a board you have not worked on: almost every
+non-obvious decision in this firmware is a consequence of a timing constraint that
+is invisible from inside a single file.
+
+### Position MCU — *where am I?*
+
+**Hardware:** XIAO RP2350. ICM42688P over SPI, BMP580 + AK09918C over I²C (all three
+on the Voltino TriSense), LK76 GPS on a PIO UART, DWM1000 UWB on the same SPI bus as
+the IMU, TF Luna lidar on the same I²C bus (declared, not implemented).
+
+**Product:** exactly one thing — `ariadna_nav_state_t`, 88 bytes, emitted at 240 Hz.
+It makes no control decisions whatsoever.
+
+| core | runs | may block? |
+|---|---|---|
+| 0 | *all* sensor I/O, the estimator, the UWB tag, every outgoing packet | no |
+| 1 | GPS NMEA parsing, receiving from the Master | yes, freely |
+
+Every I²C and SPI transaction in the vehicle's sensor stack happens on **core 0**, so
+there is no bus arbitration to get wrong and the DMA transmit ring has exactly one
+producer. Core 1 touches no shared bus, which is what lets it be as bursty as NMEA
+wants to be. The GPS fix crosses between them through a seqlock; neither core ever
+waits on the other.
+
+One estimator tick, in order:
+
+1. **service the UWB radio and the LED** — in the *idle path*, before the tick-rate
+   test, so ranging throughput is set by the core's spare time rather than by the
+   estimator's period;
+2. **drain the IMU FIFO** through the fusion library (240 Hz);
+3. **read the barometer** — but only every 20 ms, and the resulting correction is
+   applied on exactly one tick per sample. Correcting on every tick would feed the
+   same measurement in five times and make the filter √5 over-confident;
+4. **rotate** body-frame linear acceleration and gyro rates into the pad frame with
+   this file's own rotation matrix;
+5. **predict** all three Kalman axes;
+6. **correct** from whichever of the barometer, GPS, UWB and the zero-velocity
+   update have something new to say;
+7. **build and transmit** the navigation state — immediately, in the same tick that
+   produced it, because a buffered state has a latency that varies packet to packet,
+   which is worse for a control loop than latency that is merely large;
+8. **choose the LED colour** from the flags it just transmitted.
+
+Twenty times a second it also sends `ariadna_pos_status_t`: attitude in degrees,
+lat/lon, temperature, filter σ's and UWB constellation health. None of that is on
+the 240 Hz path, and that is what makes the 240 Hz path affordable.
+
+### Navigation MCU — *when do I light the motor, and where do I point it?*
+
+**Hardware:** XIAO RP2350. Three pyro channels and three continuity senses. **No
+sensors at all** — everything it knows arrives as `nav_state` from the Position MCU,
+routed through the Master.
+
+**Product:** `ariadna_actuator_t` at 200 Hz — two TVC servo angles and a thrust
+clamp — plus the decision to fire a pyro.
+
+| core | runs | period |
+|---|---|---|
+| 0 | link, attitude loop, ignition logic, pyro timing, actuator TX | 5 ms, hard |
+| 1 | trajectory replanner, **one solver iteration per call** | best effort |
+
+The planner is the interesting part. A full trajectory solve is about seven
+projections; running it to convergence inside the control loop would blow the 5 ms
+budget outright. So `dg_step_planner()` does exactly one projection per call and
+keeps the root find's bracket between calls, converging in ~35 ms of wall time
+without ever blocking for a whole solve. The two cores share the planar navigation
+state through a seqlock — never a mutex, because core 0 must not be able to wait.
+
+Its link supervision is a three-stage policy, and each stage is a deliberate choice
+about how to fail:
+
+| state age | what happens |
+|---|---|
+| < 60 ms | normal: the state is used as received |
+| 60–250 ms | **dead reckoned** forward from the last state and the thrust estimate |
+| > 250 ms | the state is marked invalid: TVC parks, and the clamp **freezes** |
+
+The clamp freezes rather than closing because shutting it mid-burn guarantees a
+crash, and the grain finishes burning either way.
+
+### Master MCU — *what is the mission doing?*
+
+**Hardware:** Pico 2 W. PCA9685 servo driver, W25Q128 flash, LoRa SX1278, ACS712
+current sense, battery divider, RBF pin, breakwire, SK6812 and buzzer.
+
+**Product:** the mission state, the servo pulses, the flash log, and the downlink.
+
+| core | runs | may block? |
+|---|---|---|
+| 0 | UART routing, PCA9685 writes, the state machine, ADC | no |
+| 1 | flash log writes, LoRa transmission | yes — both do |
+
+This split is the clearest example of the one rule. A flash sector erase blocks for
+up to 400 ms and a LoRa packet is tens of milliseconds on air; either one inside the
+servo path would be a visible glitch in the nozzle. Core 0 pushes log records into a
+ring and core 1 drains it.
+
+Core 0's most important property is what it does *not* do: between reading an
+actuator packet and writing the PCA9685 it does nothing at all. The nozzle command
+already crosses a UART and an I²C bus, and every microsecond added there is phase
+lag on a 9 rad/s loop.
+
+It is also the only board that can arm the vehicle, and the only one that decides
+what mission state everything else is in — which is why the Position MCU's ZUPT and
+its barometer trust are both gated on a `master_state` packet rather than on
+anything either board could work out for itself.
+
+### Ground station — *tell me, and let me stop it*
+
+**Hardware:** Pico 2. LoRa, SSD1306 OLED, three buttons.
+
+| core | runs |
+|---|---|
+| 0 | LoRa receive and the framed USB uplink to the laptop — nothing that blocks |
+| 1 | the OLED (23 ms per full redraw) and the buttons |
+
+The OLED is on core 1 for exactly the reason its redraw time suggests. The station
+shows enough to run the flight if the laptop dies.
+
+### UWB anchors — *and here is where the pad is*
+
+**Hardware:** XIAO RP2350 and a DWM1000, four of them, standing on the ground.
+
+One loop, no cores to divide: poll the IRQ line, service the ranging stack, throttle,
+show a colour. They are the only part of the system that is not bolted to the
+vehicle, and the firmware on the vehicle is written on the assumption that they will
+fail — see below.
 
 ---
 
@@ -225,6 +371,85 @@ The failure it prevents is not subtle. An unbounded horizontal velocity eventual
 the Navigation MCU's sanity limits, at which point that board rejects the **whole**
 `nav_state` — throwing away a perfectly good altitude and attitude and parking the TVC.
 
+#### UWB — the reason it can land *on* the pad
+
+Four DWM1000 anchors stand on the ground around the pad; the Position MCU carries the
+tag. Each anchor answers a two-way ranging exchange at about 10 Hz, and
+[`common/ariadna_uwb.h`](common/ariadna_uwb.h) turns the four distances into a
+position in the pad frame with an honest per-axis 1σ — which the Kalman filter then
+consumes exactly as it consumes a GPS fix.
+
+The argument for the whole subsystem is one number. GPS gives horizontal position to
+about 2.5 m in good conditions; UWB two-way ranging gives 10–30 cm. Two and a half
+metres is the difference between landing on the pad and landing next to it, and no
+amount of guidance authority recovers a position error the estimator does not know it
+has.
+
+**The interesting problem is not solving four ranges. It is what to do when there are
+not four.** Anchors run off their own batteries, sit in the grass, and are
+line-of-sight devices pointed at something that is about to light a rocket motor
+between them. So the solver degrades in defined steps rather than failing:
+
+| anchors | what comes out | why |
+|---|---|---|
+| **4+** | full 3-D position | the vertical is published only if the geometry actually observed it |
+| **3** | 3-D attempted, 2-D if the vertical is not observable | ground anchors are coplanar: height is mirror-ambiguous and weakly seen near the pad |
+| **2** | horizontal, height held from the filter's own estimate | two spheres meet in a circle; Gauss-Newton from the prior takes the nearer point, and the covariance comes out stretched along the ambiguous direction |
+| **1** | a line-of-sight scalar, projected onto the axes | a single range is not a position, but it still constrains the distance to that anchor — enough to stop horizontal drift |
+| **0** | nothing | the navigation solution carries on exactly as it did before UWB existed |
+
+Two design decisions make that table safe rather than merely clever.
+
+**Every mode produces the same shape of answer: a position plus a per-axis σ, with a
+`use_x` / `use_y` / `use_z` flag.** The filter is three independent per-axis Kalman
+filters, and a scalar update of one state is all it can accept. Expressing even the
+single-anchor case that way means the fusion code in the sketch has *one* path, not
+five — there is no mode logic in the estimator to get wrong. A four-anchor fix and a
+one-anchor hint differ entirely in their sigmas.
+
+**The sigmas come from the covariance, so a direction the geometry cannot see gets an
+enormous σ automatically.** They are the square roots of the diagonal of the inverse
+information matrix, and the Cholesky factorisation that produces them *is* the
+degeneracy test: if a pivot is not comfortably positive, the geometry does not support
+that many unknowns and an axis is dropped rather than divided by something near zero.
+`make uwb` checks the calibration by Monte Carlo — 600 noisy trials, and the observed
+spread must match the quoted σ.
+
+Everything a bad measurement could do is stopped before it reaches the filter:
+
+* **per-anchor slots with their own timestamps.** An anchor that stops answering ages
+  out on its own; nothing has to detect it, and the others carry on unchanged.
+* **screening** — non-finite, negative, absurd or implausibly-jumping ranges never
+  reach the solver.
+* **a post-fit residual test.** A reflected path is always *longer*; ten metres of
+  extra path on one anchor cannot be absorbed by a three-unknown fit of four
+  equations, so the residual gives it away and the whole fix is dropped. The threshold
+  is set so that a 30 cm antenna-delay error — a real, common thing — is still
+  accepted. A gate that fires on real data is worse than no gate.
+* **a σ floor** in the estimator, covering what the solver's covariance cannot know
+  about: anchor survey error, antenna delay calibration, and the offset between the
+  tag's antenna and the vehicle's centre of mass.
+* **a 4σ innovation gate with re-anchoring**, shorter than the GPS one — because if
+  UWB and the filter disagree persistently, UWB is the one to believe.
+
+> ⚠️ **The anchor coordinates are an input, not an output.** Nothing discovers that an
+> anchor was moved two metres from where `s_uwb_anchors[]` says it is; the solver will
+> produce a position that is confidently wrong by about that much, and the filter will
+> prefer it to GPS because it arrives with a small σ. Measure the square with a tape.
+> The post-fit residual in `POS_STATUS` is the check on that work: a survey error shows
+> up as a residual that will not go below a few tens of centimetres however good the
+> radio conditions are.
+
+The vertical channel is deliberately *not* re-anchored from UWB. The barometer is the
+vertical's absolute reference and has its own re-anchor; giving two sensors authority
+over one state is how a filter ends up oscillating between two answers.
+
+`ARIADNA_NAV_UWB_OK` and `ARIADNA_NAV_UWB_AIDED` are separate flags on purpose. The
+first says the radio is ranging; the second says the filter *accepted* what it
+produced. A constellation can be perfectly alive and entirely gated out, and the
+difference between those two states is exactly what a survey error looks like from the
+pad — which is why it is also on the downlink, in the one-byte `uwb` field.
+
 #### Predict at 240 Hz, correct at 50 Hz
 
 The estimator's *prediction* step runs every tick. The barometer *correction* runs only on
@@ -282,11 +507,11 @@ the bench.
 Three separate things had to change for a 10 Hz downlink to be *reliable* rather than
 merely configured.
 
-**1. Airtime.** A 46-byte payload at SF7 is 92.4 ms on air at 125 kHz bandwidth — a 92 %
+**1. Airtime.** A 47-byte payload at SF7 is 92.4 ms on air at 125 kHz bandwidth — a 92 %
 duty cycle at 10 Hz, which is not a margin, it is a coincidence. **Bandwidth is now
 250 kHz**, halving airtime to 46.2 ms:
 
-| SF7, CR4/5, 46 B | airtime | duty at 5 Hz | duty at 10 Hz | sensitivity |
+| SF7, CR4/5, 47 B | airtime | duty at 5 Hz | duty at 10 Hz | sensitivity |
 |---|---|---|---|---|
 | BW 125 kHz | 92.4 ms | 46 % | 92 % | −123 dBm |
 | **BW 250 kHz** | **46.2 ms** | **23 %** | **46 %** | **−120 dBm** |
@@ -344,6 +569,81 @@ drops the landing rate from 72.6 % to 6.9 %.
 
 ---
 
+## Annunciators — reading the vehicle without a laptop
+
+On the pad there is no laptop. There is a vehicle on a rail, a crew behind a line, and
+a few seconds in which somebody has to decide whether to arm it. Every board therefore
+drives an indicator, and **each one answers a different question**:
+
+| board | LED | answers |
+|---|---|---|
+| Master | SK6812 on GP2, buzzer on GP3 | *what is the mission doing?* |
+| Position | XIAO on-board WS2812 | *does the vehicle know where it is?* |
+| Navigation | XIAO on-board WS2812 | *is it ready to fire a pyro?* |
+| Anchor | XIAO on-board WS2812 | *is this anchor ranging?* |
+
+They are driven by one shared, non-blocking pattern engine,
+[`common/ariadna_rgb.h`](common/ariadna_rgb.h), so that a colour means the same thing
+everywhere in the system.
+
+### Master — the mission state
+
+Solid blue BOOT · slow green IDLE · **fast red ARMED** · solid amber ASCENT · solid
+yellow APOGEE · solid magenta DESCENT · **solid white GUIDANCE** · solid green LANDED ·
+slow green + beacon RECOVERY · fast amber ABORT · slow blue TEST · solid red ERROR.
+
+The buzzer chirps once a second when ARMED and runs a 1 Hz beacon in RECOVERY. Nothing
+else: a buzzer during flight is battery drain, and the beacon is the thing that finds a
+vehicle in long grass.
+
+### Position — the navigation solution
+
+| indication | meaning |
+|---|---|
+| solid blue | booting |
+| red, 1 flash | self test failed, or the IMU is not talking |
+| red, 2 flashes | no barometer — the vertical channel has no absolute reference |
+| slow amber | alive, but no pad reference: `px`/`py`/`pz` mean nothing yet |
+| slow magenta | pad reference taken, no GPS and no UWB — dead reckoning only |
+| slow cyan | navigating on GPS |
+| **pulsing green** | navigating on GPS, UWB constellation alive |
+| **solid green** | UWB fixes are being *accepted by the filter* |
+
+The distinction between the last two is the one worth understanding from behind the
+safety line. Pulsing green says the anchors are powered. Solid green says they are
+powered, surveyed correctly, and agreeing with the rest of the navigation solution.
+**Solid green is the one to wait for before arming.**
+
+### Navigation — the pyro state
+
+| indication | meaning |
+|---|---|
+| solid red | self test failed. Do not arm. |
+| **red, 2 flashes** | armed, but channel 1 has **no continuity** |
+| slow blue | alive, waiting for a navigation state |
+| slow amber | navigation state arriving, not armed |
+| slow green | armed and receiving, continuity on channel 1 |
+| fast green | the landing burn is running |
+| fast magenta | the navigation state has gone stale; the TVC is parked |
+
+### Anchor
+
+Solid red = the DWM1000 did not come up. Slow blue = up, but the tag has never called.
+Pulsing green = ranging (what all four should look like during a countdown). Fast amber
+= it *was* ranging and the tag has been quiet for five seconds.
+
+### Why this is affordable inside a 200 Hz loop
+
+Driving a WS2812 means bit-banging 24 bits at 800 kHz with interrupts off — about 30 µs
+during which nothing else on that core happens. Two properties keep that harmless:
+`ariadna_rgb_service()` is a state machine that never delays or blocks, and it pushes to
+the LED **only when the computed pixel value differs from the one already on the wire**.
+A solid colour therefore costs one transfer and then nothing at all; the fastest pattern
+in the vehicle costs two transfers a second. Every board calls it at the very end of its
+tick, after the work that matters.
+
+---
+
 ## What is verified, and what is not
 
 This matters more than anything else in this README.
@@ -351,13 +651,16 @@ This matters more than anything else in this README.
 | | how |
 |---|---|
 | **guidance algorithm** | 124 numerical checks against the Monte-Carlo simulation, including the properties that make the two-axis form correct: exact reduction to the planar law, isotropy in azimuth, an orthonormal gimbal basis, the dynamic-inversion round trip, a pure roll rate moving neither servo, and the gimbal axes tracking the airframe through a full 360° roll. |
-| **link codec** | 110 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
+| **link codec** | 111 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
 | **navigation filter** | 29 checks: `make est`. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
+| **UWB multilateration** | 55 checks: `make uwb`. Every degraded case — four anchors down to one and none, NaN and negative ranges, coincident and collinear anchors, a 10 m reflection, and a 600-trial Monte Carlo that the quoted σ must match. `ariadna_uwb.h` likewise compiles unchanged into both. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
 | **DMA channel setup** | ⚠️ **not testable off-target.** The ring it drives is tested; the channel configuration is not. |
 | **estimator wiring** | ⚠️ **partly verified.** The filter arithmetic is covered by `make est`; how the sketch feeds it — sensor axes, GPS parsing, the pad reference — is not. Boot self-test checks convergence, the barometric conversion, the innovation gate and quaternion/matrix agreement. |
+| **UWB anchor survey** | ⚠️ **cannot be verified in software at all.** The boot self test catches duplicated addresses, anchors closer than a metre and a geometry that cannot solve; it cannot catch an anchor that is simply not where the table says. Measure it, and watch the post-fit residual. |
+| **UWB driver** | ⚠️ **not host-compiled with the radio present** — the ranging library is absent from the host build. The geometry is fully tested; the SPI and IRQ handling is not. |
 | **body→pad rotation** | ⚠️ **not verified.** Three conventions have to agree and only one is ours. |
 | **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. Build them in Arduino IDE. |
 
@@ -406,7 +709,8 @@ signs at the Master are still hardware conventions and still need bench test 3.*
 cd ../test
 make          # 124 guidance checks against the simulation
 make est      # 29 navigation filter checks
-make link     # 110 link codec checks, the transmit ring, and the link budget
+make uwb      # 55 UWB multilateration checks, including every degraded case
+make link     # 111 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled
@@ -426,20 +730,44 @@ Arduino IDE 2, board package **arduino-pico** (earlephilhower).
 | sketch | board | libraries |
 |---|---|---|
 | `Master_MCU/master_mcu.ino` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU/position_mcu.ino` | Seeed XIAO RP2350 | [Voltino TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) |
-| `Navigation_MCU/navigation_mcu.ino` | Seeed XIAO RP2350 | none |
+| `Position_MCU/position_mcu.ino` | Seeed XIAO RP2350 | [Voltino TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library), [arduino-dw1000](https://github.com/thotro/arduino-dw1000)\*, Adafruit_NeoPixel |
+| `Navigation_MCU/navigation_mcu.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Ground_Station/ground_station.ino` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
+| `Uwb_Anchor/uwb_anchor.ino` | Seeed XIAO RP2350 ×4 | arduino-dw1000, Adafruit_NeoPixel |
+
+\* **Optional.** The Position MCU detects `DW1000Ranging.h` with `__has_include` and
+compiles the entire UWB path out if it is absent, flying on GPS, barometer and IMU
+exactly as it did before. Set `ARIADNA_UWB_ENABLED` to 0 by hand to do the same thing
+deliberately — for instance to rule the radio out while chasing an SPI fault.
+Adafruit_NeoPixel is optional in the same way: without it the annunciator calls compile
+to nothing, which is what lets `make syntax` build the sketches against a stub Arduino
+header with no libraries at all.
+
+Flash the four anchors from one sketch by changing `ANCHOR_ID` to 1, 2, 3, 4 in turn.
+**Write the number on the box** — an anchor whose ID does not match where it physically
+stands is the one failure in this system that produces a confident, wrong position
+rather than no position.
 
 The sketches reach the shared headers by relative path (`#include "../common/ariadna_link.h"`).
 Arduino IDE 2 resolves quoted includes relative to the including file, so one copy serves all
 four. Keep the directory layout as it is.
 
-`common/` holds three headers, and the split is deliberate: `ariadna_link.h` is the wire
-format, `ariadna_uart_dma.h` is the only part with a hardware dependency, and
-`ariadna_kf.h` is the navigation filter — kept out of `position_mcu.ino` for the same reason
-`guidance.cpp` is kept out of the Navigation MCU's sketch. Anything inside a `.ino` can only
-be tested by flashing a board, and the Position MCU sketch cannot be host-compiled at all
-because it pulls in TriSense. The filter can, and is: `make est`.
+`common/` holds five headers, and the split is deliberate:
+
+| header | is | tested by |
+|---|---|---|
+| `ariadna_link.h` | the wire format | `make link`, `make pyfmt` |
+| `ariadna_uart_dma.h` | the only part with a hardware dependency | `make link` (the ring) |
+| `ariadna_kf.h` | the navigation filter's arithmetic | `make est` |
+| `ariadna_uwb.h` | the UWB multilateration | `make uwb` |
+| `ariadna_rgb.h` | the annunciator pattern engine | `make syntax` |
+
+The arithmetic is kept out of `position_mcu.ino` for the same reason `guidance.cpp` is
+kept out of the Navigation MCU's sketch. Anything inside a `.ino` can only be tested by
+flashing a board, and the Position MCU sketch cannot be host-compiled at all because it
+pulls in TriSense. The filter and the multilateration can be, and are — and the headers
+that are checked on a workstation are the *same files* that compile into the sketch, not
+copies of them.
 
 Visualiser:
 
@@ -452,51 +780,15 @@ python Ground_Visualizer/ground_visualizer.py
 
 ## Pinout
 
-From the spreadsheet, unchanged. `D0..D12` are the XIAO silkscreen aliases the board variant
-defines — the sketches use those names rather than raw GPIO numbers, so they stay correct
-regardless of how Seeed numbers the die.
+**The complete pinout of the whole avionics — all five boards, the PCA9685 channels, the
+inter-board wiring, the power rails and the interlocks — is in
+[`PINOUT.md`](PINOUT.md).** It is derived from the spreadsheet's *"Přiřazení pinů 2"*
+sheet and it names, for every pin, the constant in the sketch that actually drives it.
 
-**Master (Pico 2 W)**
+The sketches use the XIAO silkscreen aliases (`D0`…`D12`) that the board variant defines
+rather than raw GPIO numbers, so they stay correct regardless of how Seeed numbers the die.
 
-| pin | function |
-|---|---|
-| GP0 / GP1 | UART0 ↔ Position MCU |
-| GP2 | SK6812 RGB |
-| GP3 | buzzer |
-| GP4 / GP5 | UART1 ↔ Navigation MCU |
-| GP6 / GP7 | reset lines to Position / Navigation |
-| GP8 / GP9 | I²C0 → PCA9685 |
-| GP10 | breakwire, launch detect |
-| GP12–GP15 | SPI1 → W25Q128 flash |
-| GP16–GP21 | SPI0 + DIO0 + RST → LoRa Ra-02 |
-| GP22 | spare digital out ("S16") |
-| GP26 / GP27 / GP28 | current sense / battery / RBF |
-
-**Position (XIAO RP2350)**
-
-| pin | function |
-|---|---|
-| D0 / D1 / D2 | UWB INT / RST / CS *(future)* |
-| D3 | TriSense CS |
-| D4 / D5 | I²C — BMP580, AK09918C, TF Luna *(future)* |
-| D6 / D7 | UART ↔ Master |
-| D8 / D9 / D10 | SPI — ICM42688P, UWB |
-| D11 / D12 | LK76 GPS, on a **PIO** UART |
-
-**Navigation (XIAO RP2350)**
-
-| pin | function |
-|---|---|
-| D0 / D1 / D2 | pyro continuity 1 / 2 / 3 |
-| D3 | pyro 1 — landing motor igniter |
-| D4 / D5 | I²C, broken out |
-| D6 / D7 | UART ↔ Master |
-| D8 | pyro 2 — landing motor igniter, **backup** |
-| D9 | pyro 3 — reserve, never fired automatically |
-| D10 | spare |
-| USB-C | pad console |
-
-### Two notes on the pinout
+### Three notes on the pinout
 
 **The spreadsheet labels the XIAO UARTs "UART1".** On the arduino-pico core `Serial1` is
 UART0 and `Serial2` is UART1, and which instance reaches D6/D7 depends on the variant's GPIO
@@ -507,6 +799,12 @@ is silent on the bench, change that one line before touching anything else.
 underside of the XIAO and are not guaranteed to land on one. The RP2350 will put a UART on
 any pin, which is one of the places its architecture saves a design compromise rather than
 just being fast.
+
+**D0 and D1 on the Position MCU are not a UART either.** The spreadsheet's second column
+names the pin's *function* and its third names what is *physically on it*; where the two
+disagree, the third wins. D0 and D1 carry the DWM1000's interrupt and reset lines, and the
+reset is driven open-drain — pulled LOW to reset, then released to a floating input, because
+driving it high can damage the module.
 
 ---
 
@@ -600,7 +898,7 @@ monotone in sector index and 12 reads find the boundary instead of 4096.
 
 ## Telemetry
 
-46 bytes at 4 Hz over LoRa, SF7 / 125 kHz / CR4-5, which is 92 ms on air and a 37 % duty
+47 bytes at 4 Hz over LoRa, SF7 / 125 kHz / CR4-5, which is 92 ms on air and a 37 % duty
 cycle. `make link` prints the figure. Raising the rate or the packet size eats that margin
 directly, and the 433 MHz ISM band has duty-cycle limits in the EU that this is already close
 to. If you need a faster downlink, widen the bandwidth to 250 kHz — that halves airtime for
@@ -609,6 +907,15 @@ about 3 dB of link budget — rather than shortening the packet.
 The V2 packet is **not compatible with the V1 ground station**. It carries mission state,
 guidance phase, TVC deflection, thrust clamp, thrust estimate, pyro continuity and per-board
 health alongside everything V1 had, and GPS resolution goes from 1e-6 to 1e-7 degrees.
+
+The most recent addition is a single **UWB status byte**, and it was argued for on exactly
+the airtime grounds above: one byte against being able to see a dead anchor from the pad. It
+packs the anchor count, the solution mode, whether the filter is *accepting* UWB fixes, and
+whether the radio is alive. Reading `0x00` during a countdown means the anchors are not
+powered; reading `0x84` — alive, four anchors, no accepted fix — means they are powered and
+the filter is rejecting them, which is a survey error and is fixable in the ten minutes
+before launch. `ARIADNA_TLM_VERSION` is 3; a V2 packet is refused by the visualiser rather
+than misread.
 
 The USB link from the receiver to the laptop is **framed** — sync word, length, CRC — where
 V1 wrote a bare struct. V1 had no way to resynchronise: one dropped byte and every packet
@@ -632,6 +939,15 @@ Suggested order:
 
 2. **Bench the links.** Power all three. Confirm `rx_ok` climbs and `rx_bad` does not on
    every console. Confirm the Navigation MCU's `loop_us` and `overruns` stay near zero.
+
+2b. **Bench the UWB constellation, before you need it.** Power the four anchors and confirm
+   each one goes to pulsing green. Then put the vehicle at a *measured* point — a tape
+   measure and a known corner of the anchor square is enough — and check that `px`/`py` in
+   `POS_STATUS` agree with where it actually is, and that the post-fit residual settles below
+   about 20 cm. A residual that will not come down, or a position that is consistently offset,
+   is a survey error in `s_uwb_anchors[]`, not a radio problem. Then **unplug one anchor** and
+   confirm the solution stays sane and the anchor count in the downlink drops to three. Then a
+   second. The vehicle must still be navigating.
 
 3. **⚠️ Check the TVC signs.** Loop running, dummy thrust estimate, no motor. Deflect the
    airframe by hand along +x and confirm the nozzle swings to **oppose** the motion. Then
