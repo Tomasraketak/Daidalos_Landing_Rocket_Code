@@ -120,10 +120,22 @@ typedef struct {
     float    x, y, z;     // pad-ENU metres, same frame as the estimator
 } ariadna_uwb_anchor_t;
 
-/** One range observation, indexed in parallel with the anchor table. */
+/**
+ * One range observation, indexed in parallel with the anchor table.
+ *
+ * `age_s` is not decoration. Two-way ranging is a REQUEST/RESPONSE
+ * protocol and the anchors answer one at a time, so a set of four ranges
+ * is spread over up to a whole round-robin period — and the solver
+ * treats them as simultaneous. On a stationary tag that is free. On a
+ * vehicle descending at 20 m/s a 300 ms spread is six metres of motion
+ * between the first range and the last, and the least-squares fit
+ * absorbs it as a POSITION ERROR of about 2.8 m rather than rejecting
+ * it. See ariadna_uwb_derotate(), which exists entirely to remove this.
+ */
 typedef struct {
     float   range_m;      // metres, as reported by the ranging stack
     float   sigma_m;      // 1-sigma of THIS range, per anchor and per sample
+    float   age_s;        // seconds between this measurement and the solve epoch
     uint8_t valid;        // 0 = this anchor did not report in time
     uint8_t _pad[3];
 } ariadna_uwb_obs_t;
@@ -170,6 +182,10 @@ typedef struct {
     float   z_min_m;          // solutions are clamped above the anchor plane
     float   z_max_m;
     float   los_cos_floor;    // |e_axis| floor for the single-anchor projection
+    // --- motion compensation, see ariadna_uwb_derotate() --------------
+    float   max_age_s;        // an observation older than this is dropped
+    float   vel_sigma_m_s;    // 1-sigma of the velocity used to de-rotate
+    float   acc_max_m_s2;     // acceleration the vehicle may have had meanwhile
     uint8_t max_iters;
     uint8_t allow_two;        // permit the ambiguous two-anchor solve
     uint8_t allow_los;        // permit the single-anchor projection
@@ -194,6 +210,13 @@ static inline void ariadna_uwb_cfg_default(ariadna_uwb_cfg_t *c)
     c->z_min_m       = -2.0f;    // the pad frame's zero is the pad, not the anchors
     c->z_max_m       = 400.0f;
     c->los_cos_floor = 0.15f;
+    // 250 ms lets an anchor miss one exchange at 10 Hz and still count.
+    // Longer would be free if the vehicle were stationary; it is not.
+    c->max_age_s     = 0.25f;
+    c->vel_sigma_m_s = 0.5f;
+    // 4 g. The landing burn is about 3 g, so this bounds what the
+    // velocity-only de-rotation cannot account for.
+    c->acc_max_m_s2  = 40.0f;
     c->max_iters     = 8;
     c->allow_two     = 1;
     c->allow_los     = 1;
@@ -325,10 +348,107 @@ static inline void ariadna_uwb_screen(const ariadna_uwb_anchor_t *tab,
         if (!(r == r) || !(s == s))                      continue;  // NaN
         if (!(r > cfg->range_min_m && r < cfg->range_max_m)) continue;
         if (!(s > 0.0f) || s > 100.0f)                   continue;
+        // Age is screened here rather than at the driver so that the
+        // limit is one number in one place, and so the host test can
+        // exercise it. A negative age is a clock that ran backwards.
+        const float age = obs[i].age_s;
+        if (!(age == age) || age < 0.0f || age > cfg->max_age_s) continue;
         if (!(tab[i].x == tab[i].x) || !(tab[i].y == tab[i].y) ||
             !(tab[i].z == tab[i].z))                     continue;  // bad survey
         sel->idx[sel->n++] = i;
         sel->mask |= (uint8_t)(1u << i);
+    }
+}
+
+/**
+ * Bring every range forward to a common epoch, using the vehicle's own
+ * velocity.
+ *
+ * ---------------------------------------------------------------------
+ * WHY THIS IS NOT OPTIONAL ON A ROCKET
+ * ---------------------------------------------------------------------
+ * The four anchors do not answer at the same instant — they answer one
+ * at a time, so a full set of ranges is smeared over up to a round-robin
+ * period. Least squares then fits a single position to four measurements
+ * that were taken from four different places.
+ *
+ * On a stationary tag that costs nothing, which is why almost every UWB
+ * example ignores it. Measured against this solver, on a 40 m anchor
+ * square with a 300 ms spread:
+ *
+ *     descent speed   position error   post-fit residual
+ *          0 m/s          0.00 m            0.00 m
+ *         10 m/s          1.46 m            0.41 m     <- accepted
+ *         20 m/s          2.83 m            0.83 m     <- accepted
+ *         50 m/s          6.28 m            2.14 m     <- gated out
+ *
+ * The 50 m/s row is the harmless one: the residual test catches it and
+ * the fix is thrown away. The DANGEROUS rows are 10 and 20 m/s — the
+ * speeds this vehicle has in its last ten and five metres — where the
+ * error is large, systematically biased along the direction of travel,
+ * and small enough in residual to sail through every gate. A confident,
+ * wrong altitude in the final seconds is precisely the failure UWB was
+ * added to prevent.
+ *
+ * ---------------------------------------------------------------------
+ * THE CORRECTION
+ * ---------------------------------------------------------------------
+ * A range measured at t = now - age is a distance from where the vehicle
+ * WAS. To first order the distance from where it is now is
+ *
+ *     r(now) = r(t) + e . v * age
+ *
+ * with e the unit line of sight from the anchor toward the vehicle. That
+ * is exact for constant velocity and leaves an error of ~(1/2) a age^2,
+ * which is not corrected but IS paid for: the sigma is inflated by that
+ * term plus the uncertainty in v itself. So an old range is not merely
+ * shifted, it is also trusted less, and the least squares weights it
+ * accordingly instead of being told a confident lie.
+ *
+ * Velocity comes from the navigation filter, which is legitimate rather
+ * than circular: it is the DERIVATIVE that is being borrowed, over a
+ * fraction of a second, to correct a position measurement. An error in v
+ * of 0.5 m/s over 200 ms is 0.1 m — an order below the ranging noise.
+ *
+ * `vel` may be NULL, in which case ages are only used to inflate the
+ * sigmas. That is the honest fallback before the filter has a velocity.
+ */
+static inline void ariadna_uwb_derotate(const ariadna_uwb_anchor_t *tab,
+                                        ariadna_uwb_obs_t *obs, uint8_t n,
+                                        const float prior[3],
+                                        const float vel[3],
+                                        const ariadna_uwb_cfg_t *cfg)
+{
+    if (!tab || !obs || !cfg || !prior) return;
+    if (n > ARIADNA_UWB_MAX_ANCHORS) n = ARIADNA_UWB_MAX_ANCHORS;
+
+    for (uint8_t i = 0; i < n; i++) {
+        if (!tab[i].enabled || !obs[i].valid) continue;
+        float age = obs[i].age_s;
+        if (!(age == age) || age <= 0.0f) continue;      // nothing to do
+        if (age > cfg->max_age_s) continue;              // screen() drops it
+
+        if (vel) {
+            const float dx = prior[0] - tab[i].x;
+            const float dy = prior[1] - tab[i].y;
+            const float dz = prior[2] - tab[i].z;
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d < 1e-3f) d = 1e-3f;
+            const float proj = (dx * vel[0] + dy * vel[1] + dz * vel[2]) / d;
+            const float corrected = obs[i].range_m + proj * age;
+            // Refuse a correction that is not finite or that would move
+            // the range outside anything a radio could have produced.
+            if (corrected == corrected &&
+                corrected > cfg->range_min_m && corrected < cfg->range_max_m)
+                obs[i].range_m = corrected;
+        }
+
+        // What the correction could not remove, added in quadrature:
+        // the residual acceleration term and the velocity uncertainty.
+        const float acc_term = 0.5f * cfg->acc_max_m_s2 * age * age;
+        const float vel_term = cfg->vel_sigma_m_s * age;
+        const float s0 = obs[i].sigma_m;
+        obs[i].sigma_m = sqrtf(s0 * s0 + acc_term * acc_term + vel_term * vel_term);
     }
 }
 

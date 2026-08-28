@@ -400,6 +400,13 @@ typedef struct {
     // anything can be done about a dead one.
     float    uwb_sigma_h;    // m, horizontal 1-sigma of the last accepted fix
     float    uwb_resid;      // m, post-fit range residual RMS. Large = reflections
+    // The barometer offset the filter has learned by comparing the
+    // barometer against UWB, positive = the barometer reads HIGH. A few
+    // tens of centimetres is a barometer being calibrated. A value
+    // pinned at its clamp is the filter saying the anchor survey and the
+    // pad reference disagree about where the ground is — which is worth
+    // knowing before launch, not after.
+    float    baro_trim;      // m
     uint16_t sensor_ok;      // ARIADNA_SENS_* bits
     uint16_t imu_overflow;   // ICM42688P FIFO overflow count
     uint8_t  sats;
@@ -411,7 +418,7 @@ typedef struct {
     uint8_t  uwb_mode;       // ariadna_uwb_mode_t: 0 none, 1 LOS, 2 2-D, 3 3-D
     uint8_t  uwb_rejects;    // consecutive innovation-gate rejections
 } ariadna_pos_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 80, "pos_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 84, "pos_status layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed

@@ -326,10 +326,14 @@ pressure both cancel), a bias state, and dropping trust in the barometer during 
 
 #### The plume is an R, not a bandwidth
 
-The landing motor's plume raises static pressure around the airframe, so the barometer reads
-*low* — it thinks the vehicle is higher than it is, exactly when altitude matters most. The
-old filter dropped its barometer bandwidth during the burn. This one inflates the
-barometer's measurement variance instead.
+The landing motor's plume disturbs static pressure around the airframe, so the barometric
+altitude is wrong by metres exactly when altitude matters most. The *sign* depends on where
+the static port sits relative to the recirculation and is not worth asserting from a desk;
+the magnitude, and the fact that it is transient, are certain. The old filter dropped its
+barometer bandwidth during the burn. This one inflates the barometer's measurement variance
+instead — and not knowing the sign is itself an argument for doing it that way, because a
+variance says *this measurement is bad*, which is true either way, while a correction has to
+commit to a direction and doubles the error if it commits wrongly.
 
 Same intent, better mechanism. Inflating R states the thing that is actually true — *this
 measurement is now bad* — and lets the filter work out the consequences, including how much
@@ -449,6 +453,123 @@ first says the radio is ranging; the second says the filter *accepted* what it
 produced. A constellation can be perfectly alive and entirely gated out, and the
 difference between those two states is exactly what a survey error looks like from the
 pad — which is why it is also on the downlink, in the one-byte `uwb` field.
+
+#### A moving vehicle: why the ranges are de-rotated before they are solved
+
+The anchors do not answer at the same instant. They answer one at a time, so a full set of
+ranges is smeared over a round-robin period — and least squares then fits a *single*
+position to four measurements taken from four different places.
+
+On a stationary tag that costs nothing, which is why almost every UWB example ignores it.
+Measured against this solver on a 40 m square with a 200 ms spread:
+
+| descent speed | position error, uncorrected | post-fit residual | outcome |
+|---|---|---|---|
+| 0 m/s | 0.00 m | 0.00 m | fine |
+| 10 m/s | 1.46 m | 0.41 m | **accepted** |
+| 20 m/s | 2.08 m | 0.62 m | **accepted** |
+| 50 m/s | 11.58 m | 2.14 m | gated out |
+
+**The 50 m/s row is the harmless one.** The residual test catches it and the fix is thrown
+away. The dangerous rows are 10 and 20 m/s — the speeds this vehicle has in its last ten and
+five metres — where the error is metres, systematically biased *along the direction of
+travel*, and small enough in residual to pass every gate. That is the worst kind of sensor
+error: confident, wrong, biased the way the vehicle is moving, at the altitude where the
+guidance law has the least time to recover.
+
+`ariadna_uwb_derotate()` removes it. A range measured at `t = now − age` is a distance from
+where the vehicle *was*; to first order the distance from where it is now is
+
+```
+r(now) = r(t) + e · v · age
+```
+
+with `e` the unit line of sight and `v` the filter's own velocity. Borrowing the *derivative*
+from the filter to correct a position measurement over a fraction of a second is not
+circular — a 0.5 m/s velocity error over 200 ms is 0.1 m, an order below the ranging noise.
+What the first-order correction leaves behind is ~½·a·age², and that is not ignored: it is
+added to the range's sigma, so an old range is both shifted *and* trusted less.
+
+With it, the same descent profile comes out as:
+
+| height | speed | uncorrected | **corrected** |
+|---|---|---|---|
+| 60 m | 50 m/s | 11.58 m | **0.13 m** |
+| 30 m | 35 m/s | 5.01 m | **0.18 m** |
+| 10 m | 20 m/s | 2.08 m | **0.22 m** |
+| 5 m | 10 m/s | 0.93 m | **0.12 m** |
+| 2 m | 5 m/s | 0.31 m | **0.00 m** |
+
+The same reasoning fixed the driver's outlier test, which was a fixed 15 m jump threshold. At
+50 m/s a range to one anchor legitimately changes by 5 m between exchanges and 25 m across a
+half-second gap, so a fixed threshold starts rejecting the fastest part of the descent — it
+looks most like a fault exactly when the data is most real. The allowance now scales with the
+vehicle's own speed and the size of the gap.
+
+#### The vertical: anchored below 10 m, and a barometer that gets calibrated
+
+Four anchors on flat ground see height through the direction cosine `h/r`, which collapses as
+the vehicle lands. The solver's covariance tracks that honestly, so the height simply stops
+being published when the geometry stops supporting it:
+
+| height | σ_z | published? | horizontal σ |
+|---|---|---|---|
+| 30 m | 0.17 m | yes | 0.26 m |
+| 10 m | 0.37 m | yes | 0.19 m |
+| 5 m | 0.72 m | yes | 0.18 m |
+| 2 m | 1.77 m | yes | 0.18 m |
+| 1 m | — | **no** | 0.18 m |
+| 0.3 m | — | **no** | 0.18 m |
+
+Note the last column: the *horizontal* accuracy gets **better** all the way down. That is the
+geometry working in the vehicle's favour exactly where it matters.
+
+A UWB height is accepted only from a **full four-anchor** constellation — three coplanar
+anchors give a horizontal fix worth having and a vertical one that is not — and below 10 m it
+goes in with its sigma scaled up. That is the "light anchoring": enough to correct a standing
+barometer error over about a second, not enough for a marginal-geometry height to move the
+altitude the guidance law is flying in one step. The vertical is still never *re-anchored*
+from UWB; the barometer keeps that authority.
+
+**But fusing the two only averages a barometer bias, it does not remove it.** Weighted by
+their variances and rates, a metre of offset comes out as most of a metre of altitude error.
+Removing it needs the offset estimated as its own quantity, which is what
+`ariadna_baro_trim_t` in `ariadna_kf.h` does: a slow (τ = 2.5 s), clamped (±1.5 m), heavily
+gated first-order observer of `h_baro − z_uwb`, subtracted from every barometer reading.
+
+Measured end to end through the real estimator, on a 150 m descent at `v ≈ −2.24·√h`
+(27 m/s at entry, 20 at 80 m, 10 at 20 m, 5 at 5 m), altitude error below 15 m:
+
+| case | RMS | at touchdown | learned trim |
+|---|---|---|---|
+| no bias, no UWB — reference | 0.01 m | 0.00 m | — |
+| **+1.0 m barometer bias, no UWB** | 0.99 m | **+1.00 m** | — |
+| **+1.0 m barometer bias, UWB on** | 0.07 m | **+0.07 m** | +0.93 m |
+| −0.8 m bias, UWB on | 0.03 m | −0.03 m | −0.78 m |
+| +1.0 m bias, **UWB dies below 2 m** | 0.07 m | **+0.07 m** | +0.93 m |
+| +1.0 m bias, **plume below 30 m** | 0.34 m | +1.02 m | +0.88 m |
+
+Three of those rows are the design:
+
+* **93 % of the bias is removed**, both signs.
+* **UWB dying below 2 m costs nothing**, because the trim *holds* its learned value. That is
+  the point rather than a side effect: the anchor geometry gives up on height in the last two
+  metres, so the vehicle lands on a barometer that UWB already calibrated.
+* **The plume row is the honest limit.** During the burn the trim is *frozen* — the
+  difference between the two heights is mostly plume, not bias, and learning then would store
+  a transient as a permanent offset and apply it after burnout. Frozen, the last two metres
+  fall back on a plume-corrupted barometer and the error goes back to about a metre. The
+  sensor for that regime is the TF Luna lidar, which is wired into the pipeline and not yet
+  implemented. **A single anchor on a 3 m mast would also fix it** — it keeps the vertical
+  direction cosine alive to the ground, and the anchor table has eight slots and takes any
+  `z`.
+
+> ⚠️ **What the trim cannot do.** It cannot tell a barometer bias from a mis-surveyed anchor
+> plane. Anchors that really sit 0.5 m from where `s_uwb_anchors[]` says produce a 0.5 m
+> altitude error and a trim of ∓0.5 m — measured, not argued. This is why the trim is
+> *clamped* rather than unbounded: a survey error shows up as a value pinned at its limit,
+> reported in `POS_STATUS` and flashed by the Position MCU's LED as **yellow ×3**, instead of
+> being quietly absorbed. Watch it on the pad.
 
 #### Predict at 240 Hz, correct at 50 Hz
 
@@ -652,12 +773,13 @@ This matters more than anything else in this README.
 |---|---|
 | **guidance algorithm** | 124 numerical checks against the Monte-Carlo simulation, including the properties that make the two-axis form correct: exact reduction to the planar law, isotropy in azimuth, an orthonormal gimbal basis, the dynamic-inversion round trip, a pure roll rate moving neither servo, and the gimbal axes tracking the airframe through a full 360° roll. |
 | **link codec** | 111 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
-| **navigation filter** | 29 checks: `make est`. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
-| **UWB multilateration** | 55 checks: `make uwb`. Every degraded case — four anchors down to one and none, NaN and negative ranges, coincident and collinear anchors, a 10 m reflection, and a 600-trial Monte Carlo that the quoted σ must match. `ariadna_uwb.h` likewise compiles unchanged into both. |
+| **navigation filter** | 47 checks: `make est`, including the barometer trim observer. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
+| **UWB multilateration** | 108 checks: `make uwb`. Every degraded case — four anchors down to one and none, NaN and negative ranges, coincident and collinear anchors, a 10 m reflection, a 600-trial Monte Carlo the quoted σ must match, the whole descent profile from 50 m/s down, and the vertical envelope to the ground. `ariadna_uwb.h` likewise compiles unchanged into both. |
 | **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
 | **DMA channel setup** | ⚠️ **not testable off-target.** The ring it drives is tested; the channel configuration is not. |
+| **estimator, end to end** | ⚠️ **measured, not in `make check`.** The closed-loop descent numbers above were produced by compiling the `Estimator` class on the host, which needs the sketch sliced by hand because that class lives in the `.ino`. The pieces it is built from — the filter, the trim observer, the multilateration — are all in `make check`. Moving the whole estimator into a header is the obvious next refactor. |
 | **estimator wiring** | ⚠️ **partly verified.** The filter arithmetic is covered by `make est`; how the sketch feeds it — sensor axes, GPS parsing, the pad reference — is not. Boot self-test checks convergence, the barometric conversion, the innovation gate and quaternion/matrix agreement. |
 | **UWB anchor survey** | ⚠️ **cannot be verified in software at all.** The boot self test catches duplicated addresses, anchors closer than a metre and a geometry that cannot solve; it cannot catch an anchor that is simply not where the table says. Measure it, and watch the post-fit residual. |
 | **UWB driver** | ⚠️ **not host-compiled with the radio present** — the ranging library is absent from the host build. The geometry is fully tested; the SPI and IRQ handling is not. |
@@ -708,8 +830,8 @@ signs at the Master are still hardware conventions and still need bench test 3.*
 ```
 cd ../test
 make          # 124 guidance checks against the simulation
-make est      # 29 navigation filter checks
-make uwb      # 55 UWB multilateration checks, including every degraded case
+make est      # 47 navigation filter and barometer-trim checks
+make uwb      # 108 UWB checks: degraded constellations and a moving vehicle
 make link     # 111 link codec checks, the transmit ring, and the link budget
 make sync     # the Navigation MCU's guidance copy has not drifted
 make pyfmt    # ground_visualizer.py matches the C packet layout
@@ -758,7 +880,7 @@ four. Keep the directory layout as it is.
 |---|---|---|
 | `ariadna_link.h` | the wire format | `make link`, `make pyfmt` |
 | `ariadna_uart_dma.h` | the only part with a hardware dependency | `make link` (the ring) |
-| `ariadna_kf.h` | the navigation filter's arithmetic | `make est` |
+| `ariadna_kf.h` | the navigation filter's arithmetic and the barometer trim | `make est` |
 | `ariadna_uwb.h` | the UWB multilateration | `make uwb` |
 | `ariadna_rgb.h` | the annunciator pattern engine | `make syntax` |
 

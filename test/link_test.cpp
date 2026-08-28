@@ -69,7 +69,7 @@ static void test_layout(void)
     check(sizeof(ariadna_nav_state_t)     == 88, "nav_state is 88 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
     check(sizeof(ariadna_nav_status_t)    == 48, "nav_status is 48 bytes");
-    check(sizeof(ariadna_pos_status_t)    == 80, "pos_status is 80 bytes");
+    check(sizeof(ariadna_pos_status_t)    == 84, "pos_status is 84 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
     check(sizeof(ariadna_tlm_t)           == 47, "telemetry is 47 bytes");

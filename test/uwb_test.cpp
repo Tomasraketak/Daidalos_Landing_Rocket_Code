@@ -64,6 +64,35 @@ static void ranges(const ariadna_uwb_anchor_t *a, ariadna_uwb_obs_t *o,
         const float dx = tx - a[i].x, dy = ty - a[i].y, dz = tz - a[i].z;
         o[i].range_m = sqrtf(dx * dx + dy * dy + dz * dz) + (bias ? bias[i] : 0.0f);
         o[i].sigma_m = sigma;
+        o[i].age_s   = 0.0f;
+        o[i].valid   = 1;
+    }
+}
+
+/**
+ * Synthesise a REALISTIC set: the anchors answer round-robin, so each
+ * range was taken from where the vehicle was `age` seconds ago, on a
+ * straight-line descent at `vz` (negative = falling).
+ *
+ * This is what a moving vehicle actually produces, and it is the thing
+ * the naive version of this solver got wrong.
+ */
+static void ranges_moving(const ariadna_uwb_anchor_t *a, ariadna_uwb_obs_t *o,
+                          float tx, float ty, float tz,
+                          float vx, float vy, float vz,
+                          const float *age, float sigma)
+{
+    memset(o, 0, sizeof(ariadna_uwb_obs_t) * ARIADNA_UWB_MAX_ANCHORS);
+    for (int i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) {
+        if (!a[i].enabled) continue;
+        // Where the vehicle was when THIS anchor answered.
+        const float px = tx - vx * age[i];
+        const float py = ty - vy * age[i];
+        const float pz = tz - vz * age[i];
+        const float dx = px - a[i].x, dy = py - a[i].y, dz = pz - a[i].z;
+        o[i].range_m = sqrtf(dx * dx + dy * dy + dz * dz);
+        o[i].sigma_m = sigma;
+        o[i].age_s   = age[i];
         o[i].valid   = 1;
     }
 }
@@ -449,6 +478,161 @@ static void test_lookup(void)
     check(ariadna_uwb_find(a, 4, 0x1002) == -1, "a disabled slot is not found");
 }
 
+// ---------------------------------------------------------------------
+//  9. A MOVING VEHICLE
+//
+//  The anchors answer one at a time, so four ranges are smeared over a
+//  round-robin period and the solver fits one position to four
+//  measurements taken from four different places.
+//
+//  This is the test that matters most for this vehicle, and the reason
+//  is not the top speed. At 50 m/s the smear is large enough that the
+//  post-fit residual catches it and the fix is thrown away — a safe
+//  failure. The dangerous band is 10-20 m/s, the speed in the last ten
+//  and five metres of the descent, where the error is metres, biased
+//  along the direction of travel, and small enough in residual to pass
+//  every gate. Uncorrected, that is a confident wrong altitude in the
+//  final seconds.
+// ---------------------------------------------------------------------
+static void test_motion_compensation(void)
+{
+    printf("motion compensation\n");
+
+    ariadna_uwb_anchor_t a[ARIADNA_UWB_MAX_ANCHORS];
+    ariadna_uwb_obs_t    o[ARIADNA_UWB_MAX_ANCHORS];
+    ariadna_uwb_cfg_t    cfg;
+    ariadna_uwb_fix_t    f;
+    layout(a);
+    ariadna_uwb_cfg_default(&cfg);
+
+    // Round-robin at 10 Hz per anchor: the newest range is fresh, the
+    // oldest is 200 ms old — one whole cycle, and one missed exchange.
+    const float age[4] = { 0.00f, 0.07f, 0.14f, 0.20f };
+
+    // The descent profile the vehicle actually flies: fast and high,
+    // slow and low. Accuracy matters most in the last rows.
+    struct { float h, vz, tol; } leg[] = {
+        {  60.0f, -50.0f, 0.35f },
+        {  30.0f, -35.0f, 0.30f },
+        {  10.0f, -20.0f, 0.25f },
+        {   5.0f, -10.0f, 0.25f },
+        {   2.0f,  -5.0f, 0.25f },
+    };
+
+    for (unsigned k = 0; k < sizeof(leg) / sizeof(leg[0]); k++) {
+        const float tx = 1.5f, ty = -2.0f;
+        const float vel[3] = { 1.0f, -0.5f, leg[k].vz };
+
+        ranges_moving(a, o, tx, ty, leg[k].h, vel[0], vel[1], vel[2], age, 0.20f);
+        const float prior[3] = { tx, ty, leg[k].h };
+
+        // --- without compensation, for the record ------------------------
+        ariadna_uwb_obs_t raw[ARIADNA_UWB_MAX_ANCHORS];
+        memcpy(raw, o, sizeof(raw));
+        for (int i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) raw[i].age_s = 0.0f;
+        ariadna_uwb_fix_t nf;
+        ariadna_uwb_solve(a, raw, 4, prior, &cfg, &nf);
+        const float err_raw = sqrtf((nf.x - tx) * (nf.x - tx) +
+                                    (nf.y - ty) * (nf.y - ty) +
+                                    (nf.z - leg[k].h) * (nf.z - leg[k].h));
+
+        // --- with it ------------------------------------------------------
+        ariadna_uwb_derotate(a, o, 4, prior, vel, &cfg);
+        const int ok = ariadna_uwb_solve(a, o, 4, prior, &cfg, &f);
+        const float err = sqrtf((f.x - tx) * (f.x - tx) +
+                                (f.y - ty) * (f.y - ty) +
+                                (f.z - leg[k].h) * (f.z - leg[k].h));
+
+        printf("       h %5.1f m  vz %6.1f m/s : uncorrected %.2f m -> corrected %.2f m"
+               "  (resid %.2f m)\n",
+               (double)leg[k].h, (double)leg[k].vz,
+               (double)err_raw, (double)err, (double)f.residual_rms);
+
+        char msg[96];
+        snprintf(msg, sizeof msg, "de-rotated fix at %.0f m / %.0f m/s is accepted",
+                 (double)leg[k].h, (double)leg[k].vz);
+        check(ok == 1, msg);
+        snprintf(msg, sizeof msg, "de-rotated fix at %.0f m / %.0f m/s is within %.2f m",
+                 (double)leg[k].h, (double)leg[k].vz, (double)leg[k].tol);
+        check(err < leg[k].tol, msg);
+        snprintf(msg, sizeof msg, "compensation actually helped at %.0f m/s",
+                 (double)leg[k].vz);
+        check(err < err_raw, msg);
+        check(finite_fix(f), "moving fix is finite");
+    }
+
+    // An old range must be trusted LESS, not merely shifted. Two
+    // identical sets differing only in age must produce different sigmas.
+    ranges_moving(a, o, 0.0f, 0.0f, 20.0f, 0.0f, 0.0f, -20.0f, age, 0.20f);
+    const float prior[3] = { 0.0f, 0.0f, 20.0f };
+    const float vel[3]   = { 0.0f, 0.0f, -20.0f };
+    ariadna_uwb_derotate(a, o, 4, prior, vel, &cfg);
+    check(o[3].sigma_m > o[0].sigma_m * 1.1f,
+          "the oldest range comes out with a larger sigma than the freshest");
+    check(o[0].sigma_m > 0.0f && o[3].sigma_m < 5.0f, "and both stay sensible");
+
+    // A range older than the limit is dropped outright rather than
+    // extrapolated across half a second of a rocket's descent.
+    ranges(a, o, 0.0f, 0.0f, 20.0f, 0.2f);
+    o[2].age_s = 1.0f;
+    ariadna_uwb_solve(a, o, 4, prior, &cfg, &f);
+    check(f.n_used == 3, "an over-age range is dropped, the others still solve");
+
+    // A negative age is a clock that ran backwards. Not extrapolated.
+    ranges(a, o, 0.0f, 0.0f, 20.0f, 0.2f);
+    o[1].age_s = -0.5f;
+    ariadna_uwb_solve(a, o, 4, prior, &cfg, &f);
+    check(f.n_used == 3, "a negative age is dropped");
+
+    // No velocity available yet: ages must still inflate the sigmas, and
+    // nothing may break.
+    ranges_moving(a, o, 0.0f, 0.0f, 20.0f, 0.0f, 0.0f, -20.0f, age, 0.20f);
+    ariadna_uwb_derotate(a, o, 4, prior, nullptr, &cfg);
+    check(o[3].sigma_m > 0.20f, "with no velocity, an old range is still de-weighted");
+    check(ariadna_uwb_solve(a, o, 4, prior, &cfg, &f) == 1 || f.use_x == 0,
+          "and the solve either works or refuses cleanly");
+    check(finite_fix(f), "and stays finite");
+}
+
+// ---------------------------------------------------------------------
+//  10. The vertical, all the way down
+//
+//  Four anchors on flat ground see height through the direction cosine
+//  h/r, which collapses as the vehicle lands. The solver must publish a
+//  useful height at 10 m, and must stop publishing one before the
+//  geometry stops supporting it — silently, without a step.
+// ---------------------------------------------------------------------
+static void test_vertical_envelope(void)
+{
+    printf("vertical envelope\n");
+
+    ariadna_uwb_anchor_t a[ARIADNA_UWB_MAX_ANCHORS];
+    ariadna_uwb_obs_t    o[ARIADNA_UWB_MAX_ANCHORS];
+    ariadna_uwb_cfg_t    cfg;
+    ariadna_uwb_fix_t    f;
+    layout(a);
+    ariadna_uwb_cfg_default(&cfg);
+
+    printf("       height   sigma_z   z published   horizontal sigma\n");
+    const float hs[] = { 30.0f, 20.0f, 10.0f, 5.0f, 3.0f, 2.0f, 1.0f, 0.3f };
+    int published_at_10 = 0, published_at_0_3 = 0;
+    for (unsigned k = 0; k < sizeof(hs) / sizeof(hs[0]); k++) {
+        ranges(a, o, 0.5f, 0.5f, hs[k], 0.25f);
+        const float prior[3] = { 0.0f, 0.0f, hs[k] };
+        ariadna_uwb_solve(a, o, 4, prior, &cfg, &f);
+        printf("       %5.1f m   %6.2f m      %s          %.3f m\n",
+               (double)hs[k], (double)(f.use_z ? f.sigma_z : 999.0f),
+               f.use_z ? "yes" : " no", (double)f.sigma_x);
+        if (hs[k] == 10.0f) published_at_10 = f.use_z;
+        if (hs[k] == 0.3f)  published_at_0_3 = f.use_z;
+        check(finite_fix(f), "fix finite through the whole descent");
+        check(f.use_x && f.use_y, "the horizontal never drops out on the way down");
+        check(fabsf(f.x - 0.5f) < 0.5f, "and stays accurate");
+    }
+    check(published_at_10 == 1, "height IS published at 10 m — the light-anchor band");
+    check(published_at_0_3 == 0, "height is NOT published at 0.3 m — geometry is gone");
+}
+
 int main(void)
 {
     printf("\nAriadna V2 UWB multilateration checks\n");
@@ -461,6 +645,8 @@ int main(void)
     test_sigma_calibration();
     test_endurance();
     test_lookup();
+    test_motion_compensation();
+    test_vertical_envelope();
     printf("-------------------------------------\n");
     printf("%d checks, %d failures\n\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

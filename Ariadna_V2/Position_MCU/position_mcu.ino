@@ -345,12 +345,24 @@ private:
 // =====================================================================
 
 /**
- * A range older than this is not evidence about where the vehicle is
- * NOW. At 45 m/s of descent, 300 ms is thirteen metres — far beyond what
- * a decimetre-class sensor is for, so a stale anchor is dropped rather
- * than extrapolated.
+ * A range older than this is dropped rather than extrapolated.
+ *
+ * 200 ms lets an anchor miss one exchange at 10 Hz and still count,
+ * which is what keeps a marginal link contributing instead of flapping
+ * in and out of the solution.
+ *
+ * It is not longer because the ranges inside a set are NOT simultaneous,
+ * and the difference is corrected by a velocity extrapolation — see
+ * ariadna_uwb_derotate(). That correction is first order, so what it
+ * leaves behind grows as the SQUARE of the age: at 4 g, 200 ms leaves
+ * 0.8 m and 400 ms would leave 3.2 m. The residual gate would then start
+ * throwing away good fixes at exactly the accelerations the landing burn
+ * produces.
+ *
+ * Must stay at or below ariadna_uwb_cfg_t::max_age_s, which screens on
+ * the same quantity inside the solver.
  */
-static const uint32_t UWB_RANGE_MAX_AGE_MS = 300;
+static const uint32_t UWB_RANGE_MAX_AGE_MS = 200;
 
 /** Rate the multilateration itself runs at. Ranges arrive far slower. */
 static const uint32_t UWB_SOLVE_HZ = 25;
@@ -533,19 +545,39 @@ public:
         for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) {
             obs[i].range_m = 0.0f;
             obs[i].sigma_m = 0.0f;
+            obs[i].age_s   = 0.0f;
             obs[i].valid   = 0;
             obs[i]._pad[0] = obs[i]._pad[1] = obs[i]._pad[2] = 0;
 
             const Slot &s = _slot[i];
             if (!s.have) continue;
-            if ((uint32_t)(now_ms - s.t_ms) > UWB_RANGE_MAX_AGE_MS) continue;
+            const uint32_t age_ms = (uint32_t)(now_ms - s.t_ms);
+            if (age_ms > UWB_RANGE_MAX_AGE_MS) continue;
 
             obs[i].range_m = s.range_m;
             obs[i].sigma_m = s.sigma_m;
+            // THE AGE IS THE POINT, not bookkeeping. The anchors answer
+            // one at a time, so these ranges were taken from several
+            // different places, and at 20 m/s those places are metres
+            // apart. ariadna_uwb_derotate() uses this to bring them all
+            // to one epoch before the solve.
+            obs[i].age_s   = (float)age_ms * 1e-3f;
             obs[i].valid   = 1;
             n++;
         }
         return n;
+    }
+
+    /**
+     * Tell the driver roughly how fast the vehicle is going.
+     *
+     * Used only by the jump test in accept(). Written from core 0 at the
+     * solve rate and read from the ranging callback on the same core, so
+     * there is nothing to synchronise.
+     */
+    void set_speed_hint(float mps)
+    {
+        _speed_hint = (mps == mps && mps > 0.0f && mps < 200.0f) ? mps : 0.0f;
     }
 
     bool     healthy(void)   const { return _ok && _fresh > 0; }
@@ -589,12 +621,23 @@ private:
     // Ranging error grows with distance as the link margin falls.
     static constexpr float UWB_SIGMA_PER_M  = 0.004f;
 
-    // A single range that disagrees with the previous one from the SAME
-    // anchor by more than this, sooner than the vehicle could have
-    // covered it, is a decode error or a reflection. The vehicle's own
-    // speed is bounded by ~100 m/s, so 15 m inside one ranging interval
-    // is not motion.
-    static constexpr float UWB_MAX_JUMP_M = 15.0f;
+    // Jump test. A range that disagrees with the previous one from the
+    // SAME anchor by more than the vehicle could possibly have moved in
+    // between is a decode error or a reflection, not motion.
+    //
+    // THE THRESHOLD HAS TO SCALE WITH SPEED AND WITH THE GAP. A fixed
+    // 15 m is a sound test on a bench and a broken one on a rocket: at
+    // 50 m/s the range to an anchor legitimately changes by 5 m between
+    // consecutive exchanges and by 25 m across a 500 ms gap. A fixed
+    // threshold would start rejecting the fastest part of the descent —
+    // that is, it would look most like a fault exactly when the data is
+    // most real.
+    //
+    // So the allowance is a floor for ranging noise plus what the
+    // vehicle could have covered: its own estimated speed, with wide
+    // margin for that estimate being wrong.
+    static constexpr float UWB_JUMP_BASE_M    = 3.0f;    // noise floor
+    static constexpr float UWB_JUMP_MARGIN_MS = 25.0f;   // m/s of headroom
 
     struct Slot {
         float    range_m;
@@ -637,8 +680,14 @@ private:
         // dropout the vehicle really may be somewhere else, and refusing
         // to re-acquire an anchor that went quiet for a second would turn
         // a momentary outage into a permanent one.
+        const float gap_s = (s.last_ms != 0)
+                                ? (float)(uint32_t)(now - s.last_ms) * 1e-3f
+                                : 0.0f;
+        const float allowed = UWB_JUMP_BASE_M +
+                              (_speed_hint + UWB_JUMP_MARGIN_MS) * gap_s;
+
         if (s.last_ms != 0 && (uint32_t)(now - s.last_ms) < 500u &&
-            fabsf(range_m - s.last_range) > UWB_MAX_JUMP_M) {
+            fabsf(range_m - s.last_range) > allowed) {
             _rejected++;
             s.last_range = range_m;    // but remember it: two agreeing
             s.last_ms    = now;        // outliers are a real move
@@ -698,6 +747,7 @@ private:
     uint32_t _gen = 0;
     uint32_t _rejected = 0;
     uint32_t _last_poll_us = 0;
+    float    _speed_hint = 0.0f;
     Slot     _slot[ARIADNA_UWB_MAX_ANCHORS];
 
     static UwbTag *s_self;
@@ -1142,11 +1192,18 @@ static void rotate_q(const float q[4], const float v[3], float out[3])
 //  ---------------------------------------------------------------------
 //  THE PLUME, AND WHY IT IS AN R AND NOT A BANDWIDTH
 //  ---------------------------------------------------------------------
-//  The landing motor's plume raises static pressure around the airframe,
-//  so the barometer reads LOW — it thinks the vehicle is higher than it
-//  is, exactly when altitude matters most. The old filter handled this by
-//  dropping its barometer bandwidth during the burn. This one inflates
-//  the barometer's measurement variance instead.
+//  The landing motor's plume disturbs static pressure around the
+//  airframe, so the barometric altitude is wrong by metres exactly when
+//  altitude matters most. The SIGN depends on where the static port sits
+//  relative to the recirculation and is not worth asserting from a desk;
+//  what is certain is the magnitude and that it is transient. The old
+//  filter handled this by dropping its barometer bandwidth during the
+//  burn. This one inflates the barometer's measurement variance instead.
+//
+//  Not knowing the sign is itself an argument for inflating R rather than
+//  applying a correction: a variance says "this measurement is bad",
+//  which is true either way, while a correction has to commit to a
+//  direction and doubles the error if it commits wrongly.
 //
 //  Same intent, better mechanism. Inflating R says the thing that is
 //  actually true — "this measurement is now bad" — and lets the filter
@@ -1230,7 +1287,8 @@ public:
     void set_baro_trust(bool trusted)
     {
         const float s = trusted ? BARO_SIGMA : BARO_SIGMA_BURN;
-        _baro_var = s * s;
+        _baro_var    = s * s;
+        _baro_trusted = trusted;
     }
 
     /**
@@ -1271,9 +1329,25 @@ public:
      * few samples, not for fifty, and those are what the gate is there to
      * absorb.
      */
-    void fuse_baro(float h_baro)
+    void fuse_baro(float h_baro_raw, uint32_t now_ms)
     {
         if (!_have_pad_ref) return;
+
+        // Remember the RAW reading. fuse_uwb() compares it against the
+        // UWB height to learn the trim below, and it must compare
+        // against what the sensor actually said, not against a value
+        // this filter has already corrected — otherwise the trim is
+        // measuring its own output and converges to whatever it likes.
+        //
+        // The clock is a PARAMETER, not a millis() call, for the same
+        // reason every other method here takes one: a filter that reads
+        // the wall clock cannot be run against a synthetic descent on a
+        // workstation, and this path decides the altitude the vehicle
+        // lands on.
+        _last_h_baro    = h_baro_raw;
+        _last_h_baro_ms = now_ms ? now_ms : 1;
+
+        const float h_baro = h_baro_raw - ariadna_baro_trim_value(&_trim);
 
         if (ariadna_kf_correct(&_kz, 0, h_baro, _baro_var, GATE_SIGMA)) {
             _baro_rejects = 0;
@@ -1517,15 +1591,47 @@ public:
             any = true;
             if (!ariadna_kf_correct(&_ky, 0, z, s * s, GATE_SIGMA)) rejected = true;
         }
-        // The vertical is offered only when the anchor geometry actually
-        // observed it — which, with four anchors on flat ground, means at
-        // altitude and not near the pad. The barometer owns the vertical
-        // the rest of the time.
-        if (f.use_z) {
-            const float s = inflate(f.sigma_z);
+        // --- the vertical -------------------------------------------------
+        //
+        // Offered only when the anchor geometry actually observed it,
+        // and then only from FOUR anchors. Three coplanar anchors can
+        // produce a height whose covariance looks acceptable while
+        // resting on a single weak direction cosine; the horizontal is
+        // worth having from three, the vertical is not.
+        //
+        // WHY IT IS FUSED AT ALL, GIVEN THE BAROMETER EXISTS. Two
+        // reasons, and they are strongest exactly where it matters:
+        //
+        //   * during the landing burn the plume corrupts static pressure
+        //     and set_baro_trust() inflates the barometer's variance to
+        //     BARO_SIGMA_BURN — twenty-five metres, which is a formal
+        //     way of saying "ignore this". UWB does not care about the
+        //     plume. In that window it is the only absolute vertical
+        //     reference the vehicle has;
+        //   * the barometer can be biased — weather drift over a long
+        //     countdown, ground effect near the pad — and a bias is
+        //     invisible to a sensor that only ever compares against
+        //     itself. UWB is an independent measurement of the same
+        //     state, which is what makes the bias observable at all.
+        //
+        // WHY IT IS FUSED *LIGHTLY* BELOW UWB_Z_LIGHT_ALT. Because the
+        // geometry is degrading fast down there: with a 40 m anchor
+        // square, sigma_z is 0.37 m at 10 m, 0.72 m at 5 m and 1.77 m at
+        // 2 m, and the vertical is the state the guidance law flies. The
+        // scale factor buys margin against a marginal-geometry height
+        // dragging the altitude around in the last seconds, while still
+        // letting a persistent disagreement be corrected over about a
+        // second. The barometer stays the fast, low-noise altimeter; UWB
+        // supplies the slow truth.
+        //
+        // And the vertical is NEVER re-anchored from UWB — see below.
+        if (f.use_z && f.n_used >= UWB_Z_MIN_ANCHORS) {
+            float s = inflate(f.sigma_z);
+            if (_kz.x[0] < UWB_Z_LIGHT_ALT) s *= UWB_Z_LIGHT_SCALE;
             const float z = f.z + _kz.x[1] * age_s;
             any = true;
             if (!ariadna_kf_correct(&_kz, 0, z, s * s, GATE_SIGMA)) rejected = true;
+            else                                    learn_baro_trim(f, z, now_ms);
         }
         if (!any) return;
 
@@ -1557,6 +1663,30 @@ public:
     bool uwb_aided(uint32_t now_ms) const
     {
         return _last_uwb_ms != 0 && (uint32_t)(now_ms - _last_uwb_ms) < 1000u;
+    }
+
+    /**
+     * The learned barometer offset, metres, positive = reads high.
+     *
+     * Worth watching on the pad console. A value that settles at a few
+     * tens of centimetres is a barometer being calibrated. A value
+     * pinned at UWB_TRIM_LIMIT_M is the filter telling you the anchor
+     * survey and the pad reference disagree about where the ground is.
+     */
+    float baro_trim(void) const { return ariadna_baro_trim_value(&_trim); }
+
+    /**
+     * True when the trim is sitting on its clamp.
+     *
+     * This is not a barometer being calibrated any more — it is the
+     * anchor survey and the pad reference disagreeing about where the
+     * ground is by more than a barometer plausibly drifts. It gets its
+     * own annunciator code because it is fixable in the ten minutes
+     * before launch and unfixable afterwards.
+     */
+    bool baro_trim_saturated(void) const
+    {
+        return ariadna_baro_trim_saturated(&_trim) != 0;
     }
 
     float uwb_sigma_h(void) const { return _uwb_sigma_h; }
@@ -1676,6 +1806,30 @@ public:
     // rate. Shorter than GPS_MAX_REJECTS on purpose — see fuse_uwb().
     static constexpr uint8_t UWB_MAX_REJECTS = 4;
 
+    // --- the vertical ---------------------------------------------------
+    // A UWB height is accepted only from a full constellation. Three
+    // coplanar anchors give a horizontal fix worth having and a vertical
+    // one that is not.
+    static constexpr uint8_t UWB_Z_MIN_ANCHORS = 4;
+    // Below this the anchor geometry is visibly degrading, so the height
+    // goes in with its sigma scaled up: enough to correct a standing
+    // barometer error over about a second, not enough to move the
+    // altitude the guidance law is flying in one step.
+    static constexpr float UWB_Z_LIGHT_ALT   = 10.0f;   // m
+    static constexpr float UWB_Z_LIGHT_SCALE = 2.0f;
+
+    // --- the barometer trim ---------------------------------------------
+    // See learn_baro_trim(). The time constant is deliberately long
+    // compared with anything the vehicle does: this corrects a standing
+    // offset, never a transient.
+    static constexpr float UWB_TRIM_TAU_S      = 2.5f;   // s
+    // A barometer can plausibly be a metre out over a long countdown.
+    // More than that is a survey error, and the clamp makes it visible
+    // rather than absorbing it.
+    static constexpr float UWB_TRIM_LIMIT_M    = 1.5f;   // m
+    static constexpr float UWB_TRIM_MAX_DISCREP = 3.0f;  // m
+    static constexpr float UWB_TRIM_SIGMA_MAX  = 1.0f;   // m
+
 private:
     void reset_states(void)
     {
@@ -1692,6 +1846,19 @@ private:
         _baro_rejects = 0;
         _uwb_rejects  = 0;
         _zupt = false;
+
+        // The barometer trim is cleared HERE and only here. It describes
+        // the barometer relative to a particular pad reference, so it is
+        // meaningless once a new one is taken — and reset_states() is
+        // reached from exactly the two places that take one, begin() and
+        // set_pad_reference(). It deliberately survives everything else,
+        // including a filter re-anchor: a calibration learned during the
+        // descent is most valuable in the last two metres, which is
+        // exactly where UWB stops being able to see height.
+        ariadna_baro_trim_reset(&_trim, UWB_TRIM_TAU_S, UWB_TRIM_LIMIT_M);
+        _last_h_baro    = 0.0f;
+        _last_h_baro_ms = 0;
+        _baro_trusted   = true;
     }
 
     static float hdop_of(const GpsFix &f)
@@ -1755,10 +1922,75 @@ private:
     float    _uwb_sigma_h = 0.0f;
     float    _uwb_resid   = 0.0f;
 
+    bool     _baro_trusted   = true;
+    ariadna_baro_trim_t _trim;         // how much the barometer reads HIGH
+    float    _last_h_baro    = 0.0f;   // m, RAW, before the trim
+    uint32_t _last_h_baro_ms = 0;
+
     /** Solver sigma, floored by what the solver cannot see. */
     static float inflate(float sigma)
     {
         return sqrtf(sigma * sigma + UWB_SIGMA_FLOOR * UWB_SIGMA_FLOOR);
+    }
+
+    /**
+     * Learn the barometer's bias from UWB, slowly.
+     *
+     * ------------------------------------------------------------------
+     * WHAT THIS IS FOR
+     * ------------------------------------------------------------------
+     * Fusing a UWB height and a barometric height together AVERAGES a
+     * barometer bias; it does not remove it. With the barometer at 50 Hz
+     * and sigma 0.5 m against UWB at 25 Hz and sigma 0.7 m, a one-metre
+     * offset comes out as roughly 0.8 m of residual error — better, and
+     * still wrong, and still wrong in the direction that matters.
+     *
+     * Removing it needs the bias to be estimated as its own quantity.
+     * That is all this is: a slow, clamped, heavily gated first-order
+     * observer of the difference between the two independent
+     * measurements, subtracted from the barometer in fuse_baro().
+     *
+     * ------------------------------------------------------------------
+     * THE THREE GATES, AND WHY EACH ONE IS LOAD-BEARING
+     * ------------------------------------------------------------------
+     *  1. ONLY WHILE THE BAROMETER IS TRUSTED. During the burn the
+     *     difference between the two heights is mostly PLUME, not bias.
+     *     Learning then would store the plume as a permanent offset and
+     *     then apply it after burnout, when the plume is gone — turning
+     *     a transient into a lasting altitude error. This is the gate
+     *     that would hurt most if it were missing.
+     *  2. ONLY ON GOOD GEOMETRY. sigma_z must be small; near the ground
+     *     it is not, and a trim learned from a 2 m sigma is noise.
+     *  3. ONLY SMALL DISCREPANCIES, AND CLAMPED. A metre-class offset is
+     *     a barometer. A five-metre one is a mis-surveyed anchor plane,
+     *     and absorbing that would silently move the vehicle's idea of
+     *     the ground. The clamp means such a survey error shows up as a
+     *     trim pinned at its limit — visible in the status packet and on
+     *     the pad console — instead of being quietly accommodated.
+     *
+     * The time constant is seconds, so this cannot move the altitude
+     * suddenly no matter what UWB does. If UWB drops out in the last two
+     * metres, where the geometry gives up anyway, the trim FREEZES at
+     * what it had learned: the vehicle lands on a barometer that has
+     * been calibrated against UWB, which is the whole point.
+     */
+    void learn_baro_trim(const ariadna_uwb_fix_t &f, float z_uwb, uint32_t now)
+    {
+        if (!_baro_trusted)                     return;   // gate 1: the plume
+        if (f.sigma_z > UWB_TRIM_SIGMA_MAX)     return;   // gate 2: geometry
+        if (_last_h_baro_ms == 0 || now == 0)   return;
+
+        if ((uint32_t)(now - _last_h_baro_ms) > 200u) return;  // stale baro
+
+        // Positive means the barometer reads HIGH.
+        const float d = _last_h_baro - z_uwb;
+        if (!(d == d))                          return;
+        if (fabsf(d) > UWB_TRIM_MAX_DISCREP)    return;   // gate 3: not a bias
+
+        // The arithmetic itself is in ariadna_kf.h, where est_test.cpp can
+        // reach it. What stays here is only the gating, which depends on
+        // types that live in this sketch.
+        (void)ariadna_baro_trim_update(&_trim, d, now);
     }
 };
 
@@ -1901,6 +2133,10 @@ static void link_poll(void)
 //                      absolute reference and the vehicle cannot fly
 //    amber slow        alive, but no pad reference yet: the Master has
 //                      not sent SET_PAD_REF, so px/py/pz mean nothing
+//    yellow, 3 flashes the barometer trim has hit its clamp: UWB and the
+//                      pad reference disagree about where the ground is
+//                      by more than a barometer drifts. Re-measure the
+//                      anchor survey BEFORE flying.
 //    magenta slow      pad reference taken, still waiting for a GPS fix
 //                      and with no UWB — dead reckoning only
 //    cyan slow         navigating on GPS
@@ -1942,6 +2178,15 @@ static void annunciate(uint16_t nav_flags, uint32_t now_ms)
     }
     if (!(nav_flags & ARIADNA_NAV_PAD_REF)) {
         ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER, ARIADNA_PAT_SLOW, 0);
+        return;
+    }
+    // Ranked ABOVE the healthy states on purpose. A saturated barometer
+    // trim means UWB and the pad reference disagree about where the
+    // ground is by more than a barometer drifts — a survey error, which
+    // is fixable now and not fixable once the vehicle has left the rail.
+    // It must not be hidden behind a reassuring green.
+    if (s_est.baro_trim_saturated()) {
+        ariadna_rgb_set(&s_rgb, ARIADNA_C_YELLOW, ARIADNA_PAT_BLINK_N, 3);
         return;
     }
     if (nav_flags & ARIADNA_NAV_UWB_AIDED) {
@@ -2589,6 +2834,11 @@ void loop()
     rotate(R, ab, a_pad);
 
     // ---- filter step ------------------------------------------------------
+    // The mission clock is taken ONCE per tick and passed to everything
+    // that needs it, so the barometer, the GPS, UWB and the status
+    // packet all agree on when "now" was.
+    const uint32_t now_ms = millis();
+
     uint32_t step_now = micros();
     float dt = (float)(step_now - last_step_us) * 1e-6f;
     last_step_us = step_now;
@@ -2601,7 +2851,7 @@ void loop()
                            s_master.state == ARIADNA_STATE_GUIDANCE));
 
     s_est.predict(dt, a_pad[0], a_pad[1], a_pad[2]);
-    if (baro_fresh) s_est.fuse_baro(h_baro);
+    if (baro_fresh) s_est.fuse_baro(h_baro, now_ms);
 
     // ---- GPS -------------------------------------------------------------
     // Position and velocity both, with the fix aged forward to now. The
@@ -2609,7 +2859,6 @@ void loop()
     // horizontal position state for the position to correct.
     GpsFix gps;
     bool have_gps = gps_acquire(&gps);
-    const uint32_t now_ms = millis();
     const float amag_g = accel_magnitude_g();
 
     if (have_gps && gps.valid && gps.t_ms != last_gps_ms) {
@@ -2706,13 +2955,42 @@ void loop()
             // barometer-anchored matters to the HORIZONTAL accuracy of a
             // partial constellation.
             const float prior[3] = { s_est.px(), s_est.py(), s_est.pz() };
+            const float vel[3]   = { s_est.vx(), s_est.vy(), s_est.vz() };
+
+            // BRING THE RANGES TO ONE EPOCH BEFORE SOLVING THEM.
+            //
+            // The anchors answer one at a time, so this set was taken
+            // from several different places. Standing still that is
+            // free; descending it is not, and the failure is not a
+            // graceful one. Measured on the host, on a 40 m square with
+            // a 200 ms spread, an UNCOMPENSATED solve is out by 2.1 m at
+            // 20 m/s and 11.6 m at 50 m/s — and the 20 m/s case sails
+            // through the residual gate, because the error is a
+            // consistent translation along the direction of travel
+            // rather than a disagreement between the ranges.
+            //
+            // That is the worst kind of sensor error: confident, wrong,
+            // and biased in the direction the vehicle is moving, at the
+            // altitude where the guidance law has the least time to
+            // recover. With the de-rotation the same cases come out at
+            // 0.22 m and 0.13 m. See ../../test/uwb_test.cpp, which
+            // walks the whole descent profile.
+            ariadna_uwb_derotate(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                                 prior, vel, &s_uwb_cfg);
+
+            // The jump test in the driver has to know how fast the
+            // vehicle is, for the same reason: at 50 m/s a range to one
+            // anchor legitimately changes by metres between exchanges.
+            s_uwb.set_speed_hint(sqrtf(vel[0] * vel[0] + vel[1] * vel[1] +
+                                       vel[2] * vel[2]));
+
             if (ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
                                   prior, &s_uwb_cfg, &s_uwb_fix)) {
-                // Solve latency only: the ranges themselves are at most
-                // UWB_RANGE_MAX_AGE_MS old and the solver used them where
-                // they were measured.
-                s_est.fuse_uwb(s_uwb_fix, 0.5f * (1.0f / (float)UWB_SOLVE_HZ),
-                               now_ms);
+                // The ranges have been brought to now_ms, so what is left
+                // is only the gap between this solve and the estimator
+                // step that consumes it — sub-millisecond, since they are
+                // the same tick.
+                s_est.fuse_uwb(s_uwb_fix, 0.0f, now_ms);
             }
         }
     }
@@ -2807,6 +3085,7 @@ void loop()
         ps.uwb_mask     = s_uwb_fix.mask;
         ps.uwb_mode     = s_uwb_fix.mode;
         ps.uwb_rejects  = s_est.uwb_rejects();
+        ps.baro_trim    = s_est.baro_trim();
 
         if (have_gps && gps.valid) {
             ps.lat      = gps.lat_1e7;

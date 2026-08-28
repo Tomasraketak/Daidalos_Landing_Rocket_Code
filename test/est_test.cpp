@@ -318,6 +318,106 @@ static void test_axis_independence(void)
           "one axis is bit-identical whatever another axis is fed");
 }
 
+// ---------------------------------------------------------------------
+//  7. The barometer trim observer
+//
+//  This decides the altitude the vehicle lands on, so it is checked here
+//  rather than trusted. What it must do: converge on a standing offset,
+//  ignore zero-mean noise, never move suddenly, clamp rather than absorb
+//  a large disagreement, and HOLD its value when the independent sensor
+//  goes away — which on this vehicle happens in the last two metres,
+//  where the anchor geometry stops seeing height.
+// ---------------------------------------------------------------------
+static void test_baro_trim(void)
+{
+    printf("barometer trim observer\n");
+
+    ariadna_baro_trim_t t;
+    const float TAU = 2.5f, LIMIT = 1.5f;
+
+    // --- converges on a constant offset --------------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    check(ariadna_baro_trim_value(&t) == 0.0f, "starts at zero");
+    // 25 Hz, the UWB solve rate, for four time constants.
+    for (int k = 1; k <= (int)(25 * 4 * TAU); k++)
+        ariadna_baro_trim_update(&t, 1.0f, (uint32_t)(k * 40));
+    check(fabsf(ariadna_baro_trim_value(&t) - 1.0f) < 0.05f,
+          "converges on a 1.0 m offset");
+
+    // --- the time constant is what it claims ---------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    const int steps_1tau = (int)(25 * TAU);
+    for (int k = 1; k <= steps_1tau; k++)
+        ariadna_baro_trim_update(&t, 1.0f, (uint32_t)(k * 40));
+    // 1 - 1/e = 0.632, with a little slack for the discrete update.
+    check(ariadna_baro_trim_value(&t) > 0.55f && ariadna_baro_trim_value(&t) < 0.70f,
+          "one time constant reaches ~63 %");
+
+    // --- no single update may move it far ------------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    ariadna_baro_trim_update(&t, 3.0f, 1000);          // starts the clock
+    ariadna_baro_trim_update(&t, 3.0f, 1040);
+    check(fabsf(ariadna_baro_trim_value(&t)) < 0.10f,
+          "one 3 m observation moves the trim by centimetres, not metres");
+
+    // A long stall then a resume must not produce a catch-up jump.
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    ariadna_baro_trim_update(&t, 1.0f, 1000);
+    ariadna_baro_trim_update(&t, 1.0f, 1900);          // 900 ms gap
+    check(fabsf(ariadna_baro_trim_value(&t)) <= 0.2f,
+          "a 900 ms gap cannot produce a step larger than the gain clamp");
+
+    // --- zero-mean noise averages away --------------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    uint32_t seed = 99u;
+    for (int k = 1; k <= 25 * 40; k++) {
+        seed = seed * 1664525u + 1013904223u;
+        const float n = ((float)((seed >> 9) & 0xFFFF) / 32768.0f) - 1.0f;
+        ariadna_baro_trim_update(&t, 0.5f * n, (uint32_t)(k * 40));
+    }
+    check(fabsf(ariadna_baro_trim_value(&t)) < 0.10f,
+          "zero-mean noise does not bias the trim");
+
+    // --- clamped, and it says so --------------------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    for (int k = 1; k <= 25 * 60; k++)
+        ariadna_baro_trim_update(&t, 5.0f, (uint32_t)(k * 40));
+    check(fabsf(ariadna_baro_trim_value(&t) - LIMIT) < 1e-3f,
+          "a 5 m disagreement is clamped, not absorbed");
+    check(ariadna_baro_trim_saturated(&t) == 1,
+          "and reports itself saturated - that is a survey error, not a barometer");
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    for (int k = 1; k <= 25 * 60; k++)
+        ariadna_baro_trim_update(&t, -5.0f, (uint32_t)(k * 40));
+    check(fabsf(ariadna_baro_trim_value(&t) + LIMIT) < 1e-3f, "clamps negative too");
+
+    // --- holds when the independent sensor goes away -------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    for (int k = 1; k <= 25 * 20; k++)
+        ariadna_baro_trim_update(&t, 0.8f, (uint32_t)(k * 40));
+    const float held = ariadna_baro_trim_value(&t);
+    check(fabsf(held - 0.8f) < 0.05f, "learned 0.8 m");
+    // Nothing calls update for the rest of the descent.
+    check(ariadna_baro_trim_value(&t) == held,
+          "and holds it when UWB stops - which is the last two metres");
+
+    // --- hostile input -------------------------------------------------
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    for (int k = 1; k <= 200; k++) ariadna_baro_trim_update(&t, 0.5f, (uint32_t)(k * 40));
+    const float before = ariadna_baro_trim_value(&t);
+    check(ariadna_baro_trim_update(&t, NAN, 9000) == 0, "a NaN observation is refused");
+    check(ariadna_baro_trim_value(&t) == before, "and changes nothing");
+    check(ariadna_baro_trim_update(&t, 0.5f, 0) == 0, "a zero timestamp is refused");
+    check(std::isfinite(ariadna_baro_trim_value(&t)), "the trim stays finite");
+
+    // The first update after a reset only starts the clock. Otherwise the
+    // first sample would be weighted by a dt that was never measured.
+    ariadna_baro_trim_reset(&t, TAU, LIMIT);
+    check(ariadna_baro_trim_update(&t, 1.0f, 5000) == 0, "the first update only arms");
+    check(ariadna_baro_trim_value(&t) == 0.0f, "and moves nothing");
+    check(ariadna_baro_trim_update(&t, 1.0f, 5040) == 1, "the second one counts");
+}
+
 int main(void)
 {
     printf("\nAriadna V2 navigation filter\n");
@@ -329,6 +429,7 @@ int main(void)
     test_gate();
     test_endurance();
     test_axis_independence();
+    test_baro_trim();
 
     printf("\n%d checks, %d failures\n\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

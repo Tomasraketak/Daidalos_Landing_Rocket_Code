@@ -347,8 +347,8 @@ crash, and the grain finishes burning either way.
 ```
 cd test
 make          # 124 numerical checks against the simulation
-make est      # the Ariadna V2 navigation filter
-make uwb      # the Ariadna V2 UWB multilateration, degraded cases included
+make est      # the Ariadna V2 navigation filter and barometer trim
+make uwb      # UWB multilateration: degraded constellations and a moving vehicle
 make link     # the Ariadna V2 link codec and transmit ring
 make sync     # the V2 copy of the guidance module has not drifted
 make pyfmt    # the Python ground station matches the C packet layout

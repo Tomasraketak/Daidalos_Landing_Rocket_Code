@@ -241,3 +241,8 @@ for the full table.
 The one to wait for before arming is the **Position MCU's solid green**: it means a
 pad reference is captured and UWB fixes are being *accepted* by the navigation
 filter, not merely produced by the radio.
+
+The one to act on is the Position MCU's **yellow, three flashes**: the barometer trim
+has hit its clamp, meaning UWB and the pad reference disagree about where the ground
+is by more than a barometer plausibly drifts. That is an anchor survey error. It is
+fixable in the ten minutes before launch and not fixable afterwards.
