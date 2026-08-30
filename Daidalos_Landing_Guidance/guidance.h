@@ -69,9 +69,11 @@
 // coupling scales with (I_transverse - I_axial), so under-estimating I_axial over-states
 // the coupling the feedforward has to cancel, which is the safe direction to be wrong in.
 #define DG_I_AXIAL_COEF   0.001378f     // m^2; I_axial = mass * this, 105 mm body
-#define DG_I_TOTAL        286.83f       // N.s, full-throttle impulse
-#define DG_BURN_T         1.75f         // s, nominal burn duration
-#define DG_MASS_PER_NS    0.00115051f   // kg consumed per N.s of RAW impulse
+// From the static fire. See the curve and the caveats in guidance.cpp.
+#define DG_I_TOTAL        222.17f       // N.s, full-throttle impulse
+#define DG_BURN_T         2.7302f       // s, nominal burn duration
+#define DG_MASS_PER_NS    0.00148536f   // kg consumed per N.s of RAW impulse
+#define DG_PEAK_THRUST    120.41f       // N, for reference and self-tests
 #define DG_H_START        85.0f         // m, guidance arming altitude
 
 // Actuators
@@ -83,9 +85,15 @@
 #define DG_CLAMP_MAX      1.00f
 #define DG_CLAMP_RATE     12.84f        // clamp fraction per second
 
-// Ignition
-#define DG_IGN_DELAY_LO   0.10f
-#define DG_IGN_DELAY_HI   0.30f
+// Ignition delay, MEASURED: command to thrust onset. The stand timed 1.450 s to
+// the 5 % crossing with 1.300-1.850 s across firings; onset is 50 ms earlier.
+//
+// This is the number that reshaped the vehicle. At 40 m/s the airframe falls 66 m
+// during the nominal delay and arrives 14 m/s faster, and the 0.55 s SPREAD alone
+// is +-13 m of ignition altitude on a ~50 m stopping budget. Every altitude margin
+// in this module was originally sized against 0.10-0.30 s.
+#define DG_IGN_DELAY_LO   1.25f
+#define DG_IGN_DELAY_HI   1.80f
 
 // Attitude loop gains (see tvc_gains.json / tools/precalibrate.py).
 // omega_n is a BANDWIDTH in rad/s and zeta a damping ratio: both survive the

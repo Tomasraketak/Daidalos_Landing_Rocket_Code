@@ -39,7 +39,10 @@ POS_CTL = False
 TERMINAL = False
 AX_BIAS = 0.0
 
-THRUST_TAU = [0.0, 0.005, 0.05, 0.15, 0.3, 0.45, 0.5, 0.6, 0.75, 0.9, 0.96, 0.99, 1.0]
+# Sampled to straddle the knees of the MEASURED curve, including the steep
+# 25-50 % stretch that a coarse lookup table smears.
+THRUST_TAU = [0.0, 0.01, 0.03, 0.055, 0.065, 0.075, 0.10, 0.15, 0.20,
+              0.35, 0.48, 0.60, 0.70, 0.80, 0.90, 0.96, 0.99, 1.0]
 
 TILT_H = [40.0, 25.0, 12.0, 5.0, 2.0, 0.5]
 TILT_VX = [0.0, 5.0, 12.0]
@@ -47,18 +50,22 @@ TILT_VZ = [-50.0, -30.0, -10.0, -2.0]
 
 # h, vx, vz, tau — sampled along a representative descent, from just after
 # ignition down to the last second of the burn.
+# Re-sampled for the measured motor: it lights higher, burns longer and arrests
+# more slowly, so the states along a real descent are different ones.
 SOLVE_STATES = [
-    (35.0, 8.0, -52.0, 0.00),
-    (28.0, 6.0, -45.0, 0.15),
-    (20.0, 4.0, -34.0, 0.35),
-    (12.0, 3.0, -24.0, 0.55),
-    (6.0, 1.5, -14.0, 0.72),
-    (2.5, 0.6, -7.0, 0.85),
-    (30.0, 0.0, -40.0, 0.10),
-    (24.0, 12.0, -38.0, 0.25),
+    (45.0, 8.0, -42.0, 0.00),
+    (38.0, 6.0, -38.0, 0.12),
+    (30.0, 4.0, -32.0, 0.28),
+    (20.0, 3.0, -24.0, 0.45),
+    (10.0, 1.5, -14.0, 0.62),
+    (4.0, 0.6, -7.0, 0.80),
+    (40.0, 0.0, -40.0, 0.08),
+    (33.0, 12.0, -36.0, 0.20),
 ]
 
-IGN_VZ = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0]
+# Stops at 45 m/s: above that the required ignition altitude exceeds H_START and
+# the entry is infeasible with the measured motor, so there is nothing to tabulate.
+IGN_VZ = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
 
 
 def main():

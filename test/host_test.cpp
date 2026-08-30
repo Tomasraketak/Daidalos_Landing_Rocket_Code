@@ -37,13 +37,31 @@ int main(void)
 
     // -----------------------------------------------------------------
     printf("1. Motor curve, thrust against normalised burn time\n");
-    printf("   (C uses a 64-entry uniform resample for O(1) lookup; the model\n");
-    printf("    interpolates the 13 raw knots, so small resampling error is\n");
-    printf("    expected and is bounded here at 3 N.)\n");
+    printf("   (MEASURED static fire. C uses a 512-entry uniform resample for\n");
+    printf("    O(1) lookup; the model interpolates the 17 raw knots, so a small\n");
+    printf("    resampling error is expected and is bounded here at 1 N.)\n");
     for (int i = 0; i < N_THRUST; i++) {
         char nm[64];
         snprintf(nm, sizeof nm, "thrust_ref(tau=%.3f)", G_THRUST_TAU[i]);
-        check(nm, dg_thrust_ref(G_THRUST_TAU[i]), G_THRUST_N[i], 3.0f);
+        check(nm, dg_thrust_ref(G_THRUST_TAU[i]), G_THRUST_N[i], 1.0f);
+    }
+    // The impulse is what actually lands the vehicle, and a lookup table can be
+    // right at every probe point and still lose area between them.
+    {
+        float I = 0.0f;
+        const int NS = 4096;
+        for (int i = 0; i < NS; i++)
+            I += dg_thrust_ref(((float)i + 0.5f) / (float)NS) / (float)NS;
+        check("total impulse from the table", I * DG_BURN_T, DG_I_TOTAL, 1.0f);
+        // The measured curve peaks at tau = 0.478, on a broad flat maximum -- not
+        // near the start like the placeholder it replaced. Scan for it rather than
+        // probing a remembered location.
+        float pk = 0.0f;
+        for (int i = 0; i <= 1000; i++) {
+            float v = dg_thrust_ref((float)i / 1000.0f);
+            if (v > pk) pk = v;
+        }
+        check("peak thrust from the table", pk, DG_PEAK_THRUST, 1.0f);
     }
 
     // -----------------------------------------------------------------
@@ -292,12 +310,15 @@ int main(void)
     // The body axis is tilted 0.15 rad the WRONG way — toward +x, while the
     // guidance wants a tilt toward -x to kill the +6 m/s drift. That leaves a real
     // error for the loop to work on. Crossrange is deliberately zero.
-    dg_nav_t nav = {18.7f, 6.0f, 0.0f, -45.0f,
+    dg_nav_t nav = {56.9f, 6.0f, 0.0f, -45.0f,
                     0.1494381f, 0.0f, 0.9887711f,     // thrust axis
                     0.9887711f, 0.0f, -0.1494381f,    // reference axis, roll phase 0
                     0.0f, 0.0f, 0.0f, 10.0f, true};
     dg_out_t out;
-    const int N_TICK = 160;                      // 0.8 s: 0.2 s to light, 0.6 s burning
+    // 2.8 s: 1.525 s for the measured igniter, then 1.275 s of burn. The old value
+    // was 160 ticks, which is 0.8 s -- shorter than this igniter's delay, so the
+    // motor never lit and every check below went back to passing on a parked servo.
+    const int N_TICK = 560;
     for (int i = 0; i < N_TICK; i++) {
         dg_step_attitude(&nav, &out);
         dg_step_planner(&nav);

@@ -14,6 +14,22 @@ The algorithm is a port of the one developed and Monte-Carlo tested in
 [Landing-Rocket-Sim](https://github.com/Tomasraketak/Landing-Rocket-Sim). It is pinned
 to that simulation numerically rather than by inspection — see [Verification](#verification).
 
+> ### ⚠️ The measured motor does not close this vehicle
+>
+> The landing motor's static fire gives **120.41 N peak (not 230), 222 N·s (not 287),
+> over 2.73 s (not 1.75), after a 1.25–1.80 s igniter delay (not 0.10–0.30 s)**. Those
+> numbers are now in `guidance.h` and `guidance.cpp`, and the guidance is correct for
+> them — but the **vehicle** cannot fly the 20–55 m/s @ 85 m envelope with this motor.
+> Best case is ~50 % at 20 m/s; above 35 m/s it is 0 % at any entry altitude.
+>
+> The motor can arrest at most ~48 m/s ideally, and the ±0.275 s igniter spread is
+> ±13 m of ignition altitude on a ~50 m stopping budget. The low end is capped by the
+> igniter *spread*, the top end by *impulse* — see
+> [the analysis](https://github.com/Tomasraketak/Landing-Rocket-Sim/blob/main/RESULTS.md#what-the-static-fire-changed).
+>
+> **This firmware is correct for the motor you have. The motor is not correct for the
+> mission.** Do not read the landing rates below as achievable.
+
 ---
 
 ## The vehicle it assumes
@@ -36,11 +52,12 @@ rather than saving it. Two consequences drive the whole design:
 | | |
 |---|---|
 | dry / wet mass | 2.87 / 3.20 kg |
-| grain | 0.330 kg, 286.8 N·s, ~1.75 s |
-| peak thrust | 230 N |
+| grain (**static fire**) | 222.2 N·s, 2.73 s |
+| peak thrust (**static fire**) | 120.41 N |
+| igniter delay (**static fire**) | 1.25–1.80 s, command to thrust onset |
 | body | 1.40 m long, 105 mm diameter |
 | guidance entry | 85 m altitude |
-| entry envelope | \|Vz\| 20–45 m/s (see below), \|Vx\| 0–15 m/s |
+| entry envelope | **see the warning above — the measured motor does not reach it** |
 | TVC | two axes, ±10° servo each, 2:1 to the nozzle |
 | roll | uncontrolled, 0–90 °/s, either direction |
 
@@ -424,9 +441,10 @@ common random numbers. Gates: |vz| < 3 m/s, horizontal **speed** < 0.75 m/s, **t
 
 | entry \|Vz\| at 85 m | design dispersions | full dispersions |
 |---|---|---|
-| 20–45 m/s | 99.7–100 % | 94–98 % |
-| 50 m/s | 92.2 % | 87.5 % |
-| 55 m/s | 66.1 % | 62.5 % |
+| 20 m/s | 59.3 % | 50.7 % |
+| 25 m/s | 50.7 % | 45.3 % |
+| 30 m/s | 8.0 % | 7.3 % |
+| 35 m/s and above | 0 % | 0 % |
 
 *Design* dispersions are igniter delay U(0.1, 0.3) s plus grain variation (1 % impulse,
 2 % burn rate). *Full* adds 3 m/s wind with gusts, mass and Cd spread, 0.30° nozzle

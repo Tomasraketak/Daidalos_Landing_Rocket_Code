@@ -3,9 +3,9 @@
 #ifndef GOLDEN_VECTORS_H
 #define GOLDEN_VECTORS_H
 
-#define N_THRUST 13
-static const float G_THRUST_TAU[] = {0.0f, 0.005f, 0.05f, 0.15f, 0.3f, 0.45f, 0.5f, 0.6f, 0.75f, 0.9f, 0.96f, 0.99f, 1.0f};
-static const float G_THRUST_N[]   = {0.0000f, 94.0625f, 217.0543f, 222.3000f, 228.2000f, 228.7500f, 200.5556f, 157.0000f, 113.7500f, 50.0000f, 16.0000f, 3.5000f, 0.0000f};
+#define N_THRUST 18
+static const float G_THRUST_TAU[] = {0.0f, 0.01f, 0.03f, 0.055f, 0.065f, 0.075f, 0.1f, 0.15f, 0.2f, 0.35f, 0.48f, 0.6f, 0.7f, 0.8f, 0.9f, 0.96f, 0.99f, 1.0f};
+static const float G_THRUST_N[]   = {0.0000f, 3.2872f, 9.8615f, 26.1288f, 44.7202f, 62.6523f, 75.1761f, 98.6004f, 114.7004f, 117.7825f, 120.2508f, 108.2624f, 83.3767f, 55.1237f, 23.8832f, 9.8271f, 2.4568f, 0.0000f};
 
 #define N_TILT 72
 static const float G_TILT[][4] = {
@@ -85,26 +85,24 @@ static const float G_TILT[][4] = {
 
 #define N_SOLVE 8
 static const float G_SOLVE[][5] = {
-  {35.0f, 8.0f, -52.0f, 0.0f, 3.317824f},   // status 0
-  {28.0f, 6.0f, -45.0f, 0.15f, 3.283817f},   // status 0
-  {20.0f, 4.0f, -34.0f, 0.35f, 3.570550f},   // status 0
-  {12.0f, 3.0f, -24.0f, 0.55f, 4.000000f},   // status 1
-  {6.0f, 1.5f, -14.0f, 0.72f, 4.000000f},   // status 1
-  {2.5f, 0.6f, -7.0f, 0.85f, 4.000000f},   // status 1
-  {30.0f, 0.0f, -40.0f, 0.1f, 2.938041f},   // status 0
-  {24.0f, 12.0f, -38.0f, 0.25f, 3.325775f},   // status 0
+  {45.0f, 8.0f, -42.0f, 0.0f, 3.797536f},   // status 0
+  {38.0f, 6.0f, -38.0f, 0.12f, 3.440745f},   // status 0
+  {30.0f, 4.0f, -32.0f, 0.28f, 3.612959f},   // status 0
+  {20.0f, 3.0f, -24.0f, 0.45f, 4.000000f},   // status 1
+  {10.0f, 1.5f, -14.0f, 0.62f, 4.000000f},   // status 1
+  {4.0f, 0.6f, -7.0f, 0.8f, 4.000000f},   // status 1
+  {40.0f, 0.0f, -40.0f, 0.08f, 3.525115f},   // status 0
+  {33.0f, 12.0f, -36.0f, 0.2f, 3.538385f},   // status 0
 };
 
-#define N_IGN 8
+#define N_IGN 6
 static const float G_IGN[][2] = {
-  {20.0f, 18.5840f},
-  {25.0f, 20.1634f},
-  {30.0f, 22.0792f},
-  {35.0f, 24.3363f},
-  {40.0f, 26.9587f},
-  {45.0f, 29.9877f},
-  {50.0f, 33.3119f},
-  {55.0f, 37.1287f},
+  {20.0f, 38.9040f},
+  {25.0f, 42.2020f},
+  {30.0f, 46.2648f},
+  {35.0f, 51.1055f},
+  {40.0f, 56.8753f},
+  {45.0f, 83.2854f},
 };
 
 #endif

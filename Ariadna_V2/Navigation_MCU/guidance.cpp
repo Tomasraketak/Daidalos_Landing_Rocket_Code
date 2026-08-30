@@ -31,40 +31,70 @@
 //  Motor: thrust against NORMALISED burn time tau in [0,1].
 //  The grain burns on its own clock; the clamp cannot slow it down, so tau
 //  advances with wall time and NOT with the commanded thrust.
+//
+//  MEASURED ON THE STAND, not a design curve. The stand reported, for each
+//  fraction of peak thrust, the instants the thrust crossed it going up and
+//  coming back down, timed from the ignition command:
+//
+//     %peak      N     rise[s]  decay[s]        %peak      N     rise    decay
+//        5     6.02    1.4500   4.0633            75    90.31   1.7555  3.2416
+//       10    12.04    1.5000   3.9964            90   108.37   1.8732  3.0369
+//       25    30.10    1.5643   3.7841            95   114.39   1.9048  2.9239
+//       50    60.20    1.5914   3.5436           100   120.41   2.7047  2.7047
+//
+//  Re-referenced below to thrust ONSET rather than to the command, so tau = 0
+//  is when thrust starts and the 1.4 s of nothing before it lives in
+//  DG_IGN_DELAY_LO/HI. The two zero end points are a linear extrapolation of
+//  the measured 5-10 % segments and carry 0.35 N.s between them, 0.16 %.
+//
+//  THIS MOTOR IS NOT THE ONE THE ENVELOPE WAS SIZED AGAINST. Peak thrust is
+//  120.41 N where the placeholder assumed 230, the burn is 2.73 s not 1.75,
+//  and the igniter takes 1.25-1.80 s rather than 0.10-0.30 s. Read the entry
+//  envelope in ../README.md before flying anything: the vehicle can no longer
+//  reach most of it.
 // ---------------------------------------------------------------------
-static const int   TCURVE_N = 13;
-static const float TCURVE_TAU[13] = {
-    0.000000f, 0.011429f, 0.142857f, 0.285714f, 0.428571f, 0.462857f,
-    0.514286f, 0.571429f, 0.714286f, 0.857143f, 0.914286f, 0.971429f, 1.000000f
+static const int   TCURVE_N = 17;
+static const float TCURVE_TAU[17] = {
+    0.000000f, 0.018314f, 0.036627f, 0.060179f, 0.070105f, 0.130210f,
+    0.173321f, 0.184895f, 0.477877f, 0.558164f, 0.599553f, 0.674529f,
+    0.785144f, 0.873233f, 0.950993f, 0.975496f, 1.000000f
 };
-static const float TCURVE_F[13] = {
-    0.0f, 215.0f, 222.0f, 228.0f, 230.0f, 228.0f,
-    190.0f, 165.0f, 125.0f, 80.0f, 40.0f, 10.0f, 0.0f
+static const float TCURVE_F[17] = {
+      0.00f,   6.02f,  12.04f,  30.10f,  60.20f,  90.31f,
+    108.37f, 114.39f, 120.41f, 114.39f, 108.37f,  90.31f,
+     60.20f,  30.10f,  12.04f,   6.02f,   0.00f
 };
 
 // Uniform resample of the curve, built once at init so the flight path never
-// runs the 13-point linear scan. O(1): one compare, two loads and a lerp.
+// runs the 17-point linear scan. O(1): one truncate, two loads and a lerp.
 //
-// The table spans [TAU_IGN, 1] rather than [0, 1]. The ignition transient rises
-// from 0 to 215 N in the first 1.1 % of the burn, which no uniform grid can
-// resample without smearing it (a 64-entry table put 69 N where the curve has
-// 94 N). Below TAU_IGN the ramp is evaluated exactly instead — it is a single
-// straight segment, so that is both cheaper and correct.
-#define TLUT_N   64
-#define TAU_IGN  0.011429f
-#define F_IGN    215.0f
+// It now spans the full [0, 1] and there is no special leading-ramp case. The
+// old curve rose to 215 N in the first 1.1 % of the burn, which no coarse
+// uniform grid could resample, so the ramp below TAU_IGN was evaluated exactly
+// instead. The measured curve has no such spike: it climbs to 5 % over the
+// first 1.8 %, and its steepest stretch is in the MIDDLE (25 % to 50 % of peak
+// in 10 ms). A special case at the start would do nothing for that, so the
+// table is simply finer.
+//
+// 512 intervals is 5.3 ms per cell: worst resampling error 0.68 N, 0.56 % of
+// peak, and the total impulse comes back exact to 3 decimal places. 2052 bytes
+// against 520 KB of SRAM. A 64-entry table -- what the old spiky curve used --
+// would smear the 25-50 % knee by 9.1 N.
+#define TLUT_N   512
 static float s_tlut[TLUT_N + 1];
 
 // Minimum ignition altitude against entry vertical speed at DG_H_START.
 // Generated offline by the simulation's find_ignition() solve, which costs
 // ~46 ms and must never run in flight. Horizontal entry speed changes this by
-// less than 0.3 m across 0..15 m/s, so the table is one-dimensional and the
-// values are the conservative (maximum) column.
-static const int   IGN_N = 8;
-static const float IGN_VZ[8]   = { 20.0f, 25.0f, 30.0f, 35.0f,
-                                   40.0f, 45.0f, 50.0f, 55.0f };
-static const float IGN_HMIN[8] = { 18.72f, 20.31f, 22.24f, 24.52f,
-                                   27.14f, 30.14f, 33.53f, 37.37f };
+// less than 0.3 m across 0..15 m/s, so the table is one-dimensional.
+//
+// These are three times the altitudes the placeholder motor needed (38.9 m at
+// 20 m/s where it wanted 18.7), because the peak thrust halved. Above ~45 m/s
+// the required altitude exceeds DG_H_START outright and the entry is simply
+// infeasible -- the table stops there rather than pretending otherwise.
+static const int   IGN_N = 6;
+static const float IGN_VZ[6]   = { 20.0f, 25.0f, 30.0f, 35.0f, 40.0f, 45.0f };
+static const float IGN_HMIN[6] = { 38.90f, 42.20f, 46.26f, 51.11f, 56.88f, 83.29f };
 
 // tan(max_tilt) against altitude. max_tilt = min(45 deg, 3*h + 5 deg).
 #define TAN_N 32
@@ -100,8 +130,7 @@ static inline float fast_asinf(float x) {
 
 float dg_thrust_ref(float tau) {
     if (tau <= 0.0f || tau >= 1.0f) return 0.0f;
-    if (tau < TAU_IGN) return F_IGN * (tau * (1.0f / TAU_IGN));   // exact ramp
-    float f = (tau - TAU_IGN) * ((float)TLUT_N / (1.0f - TAU_IGN));
+    float f = tau * (float)TLUT_N;
     int   i = (int)f;
     if (i >= TLUT_N) return 0.0f;
     float w = f - (float)i;
@@ -418,7 +447,7 @@ void dg_init(void) {
     solver_restart();
 
     for (int i = 0; i <= TLUT_N; i++) {
-        float tau = TAU_IGN + (1.0f - TAU_IGN) * (float)i / (float)TLUT_N;
+        float tau = (float)i / (float)TLUT_N;
         float v = 0.0f;
         if (tau > 0.0f && tau < 1.0f) {
             for (int j = 0; j < TCURVE_N - 1; j++) {
@@ -546,11 +575,23 @@ void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
     // comes from. The pad must still cover the spread in the low direction:
     // igniting high is recoverable by clamping down, igniting low is not.
     if (S.phase == DG_PHASE_COAST) {
+        // The trigger is CENTRED on the delay distribution. It used to be padded
+        // high by half the spread, because a hoverslam was asymmetric: igniting
+        // high was recoverable by clamping down, igniting low was not. The
+        // measured motor inverts that. Its 2.73 s burn cannot be shortened, its
+        // tail drops below vehicle weight for the last ~13 % of the curve, and at
+        // a thrust/weight of 3.8 the clamp can no longer stretch the schedule.
+        // Light high and the vehicle arrests at altitude with no motor left, then
+        // falls. Measured over 480 flights from 120 m: 6.5 % padded high, 14.2 %
+        // centred.
+        //
+        // Both the trigger altitude and the prediction now carry 0.5*g*t^2. At the
+        // old 0.2 s delay that term was 0.2 m and could be dropped; at 1.5 s it is
+        // 11 m, a fifth of the ignition altitude.
         const float dmean = 0.5f * (DG_IGN_DELAY_LO + DG_IGN_DELAY_HI);
-        const float dhalf = 0.5f * (DG_IGN_DELAY_HI - DG_IGN_DELAY_LO);
-        float h_trig = S.h_ign + fabsf(nav->vz) * dhalf
-                              + 0.5f * DG_G * dhalf * dhalf;
-        if (S.t_ignite_cmd < 0.0f && (nav->h + nav->vz * dmean) <= h_trig) {
+        float h_trig = S.h_ign;
+        float h_pred = nav->h + nav->vz * dmean - 0.5f * DG_G * dmean * dmean;
+        if (S.t_ignite_cmd < 0.0f && h_pred <= h_trig) {
             S.t_ignite_cmd = nav->t;
             S.t_burn_start = nav->t + dmean;   // best estimate of light-up
             out->ignite = true;
