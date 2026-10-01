@@ -90,11 +90,19 @@
 //  above the call.
 // =====================================================================
 
-#include "../common/ariadna_link.h"
-#include "../common/ariadna_uart_dma.h"
-#include "../common/ariadna_kf.h"
-#include "../common/ariadna_uwb.h"
-#include "../common/ariadna_rgb.h"
+#include "ariadna_link.h"
+#include "ariadna_uart_dma.h"
+#include "ariadna_kf.h"
+#include "ariadna_uwb.h"
+// Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
+// library's include path only when it sees a real #include of it, so the
+// header's __has_include probe on its own always reads "absent" and the
+// LED silently compiled to nothing. ARDUINO is undefined in the host
+// `make syntax` build, which has no libraries.
+#ifdef ARDUINO
+#include <Adafruit_NeoPixel.h>
+#endif
+#include "ariadna_rgb.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -120,6 +128,12 @@ static const uint8_t PIN_SPI_MISO      = D9;
 static const uint8_t PIN_SPI_MOSI      = D10;
 static const uint8_t PIN_I2C_SDA       = D4;   // BMP580, AK09918C, TF Luna
 static const uint8_t PIN_I2C_SCL       = D5;
+
+// The RP2350 pins out I2C0 SDA on GPIO 0/4/8/... and I2C1 SDA on GPIO
+// 2/6/10/..., so bit 1 of the SDA pin number picks the block. D4 is GPIO6:
+// Wire1. Derived rather than written down, so it stays right if the
+// harness moves.
+#define SENSOR_I2C  ((((PIN_I2C_SDA) >> 1) & 1) ? Wire1 : Wire)
 
 // The ICM42688P will take 12 MHz. 10 MHz leaves margin for the flight
 // harness, which is not a bench jumper.
@@ -227,22 +241,20 @@ static bool     s_post_pass  = false;
 //  Is the ranging library present?
 //
 //  The UWB stack needs arduino-dw1000 (thotro), which is not a
-//  dependency of anything else in this repository. If it is absent the
-//  whole UWB path compiles out and the board flies exactly as it did
-//  before — GPS, barometer, IMU — rather than failing to build. Set
-//  ARIADNA_UWB_ENABLED to 0 by hand to do the same thing deliberately,
-//  for instance to rule the radio out while chasing an SPI fault.
+//  dependency of anything else in this repository. Set
+//  ARIADNA_UWB_ENABLED to 0 if it is not installed: the whole UWB path
+//  then compiles out and the board flies exactly as it did before — GPS,
+//  barometer, IMU. The same switch rules the radio out deliberately, for
+//  instance while chasing an SPI fault.
+//
+//  This is a plain switch, not __has_include, on purpose. The Arduino
+//  builder only adds a library's include path once it has seen a real
+//  #include of it, so a __has_include probe ALWAYS reads "absent" — the
+//  radio was compiled out with no warning even with the library
+//  installed. A missing library is now a build error that names it.
 // ---------------------------------------------------------------------
 #ifndef ARIADNA_UWB_ENABLED
-#  if defined(__has_include)
-#    if __has_include("DW1000Ranging.h")
-#      define ARIADNA_UWB_ENABLED 1
-#    else
-#      define ARIADNA_UWB_ENABLED 0
-#    endif
-#  else
-#    define ARIADNA_UWB_ENABLED 0
-#  endif
+#  define ARIADNA_UWB_ENABLED 1
 #endif
 
 #if ARIADNA_UWB_ENABLED
@@ -2211,10 +2223,14 @@ static bool sensors_begin(void)
 {
     // Route both buses to the flight harness pins BEFORE begin(). The
     // arduino-pico core latches the pin mapping at begin(), and
-    // TriSense::beginAll() calls Wire.begin()/SPI.begin() internally with
+    // TriSense::beginAll() calls wire.begin()/SPI.begin() internally with
     // no pin arguments — so it inherits whatever is configured here.
-    Wire.setSDA(PIN_I2C_SDA);
-    Wire.setSCL(PIN_I2C_SCL);
+    //
+    // SENSOR_I2C, not Wire: D4/D5 are GPIO6/7, which only the RP2350's
+    // SECOND I2C block can reach. Wire is i2c0, refuses those pins, and
+    // the barometer and magnetometer were never found.
+    SENSOR_I2C.setSDA(PIN_I2C_SDA);
+    SENSOR_I2C.setSCL(PIN_I2C_SCL);
 
     SPI.setSCK(PIN_SPI_SCK);
     SPI.setRX(PIN_SPI_MISO);
@@ -2222,7 +2238,7 @@ static bool sensors_begin(void)
 
     // Hybrid: the IMU on SPI at 10 MHz where the bandwidth matters, the
     // barometer and magnetometer on I2C where it does not.
-    bool ok = sensor.beginAll(MODE_HYBRID, PIN_TRISENSE_CS, TRISENSE_SPI_HZ);
+    bool ok = sensor.beginAll(MODE_HYBRID, PIN_TRISENSE_CS, TRISENSE_SPI_HZ, SENSOR_I2C);
 
     s_sensor_ok = 0;
     if (ok) s_sensor_ok |= ARIADNA_SENS_IMU | ARIADNA_SENS_BARO | ARIADNA_SENS_MAG;
@@ -2399,7 +2415,9 @@ static bool self_test(void)
         for (int i = 0; i < (int)ESTIMATOR_HZ * 20; i++) {
             e.predict(dt, 0.0f, 0.0f, 0.4f);
             if ((i % every) == 0) {
-                e.fuse_baro(0.0f);      // on the pad, so the datum is 0
+                // on the pad, so the datum is 0; a synthetic clock, as
+                // everywhere else the filter is driven off the board
+                e.fuse_baro(0.0f, (uint32_t)(i * 1000 / (int)ESTIMATOR_HZ) + 1u);
                 e.fuse_zupt();
             }
         }
@@ -2433,7 +2451,8 @@ static bool self_test(void)
         const int every = (int)(ESTIMATOR_HZ / BARO_HZ);
         for (int i = 0; i < (int)ESTIMATOR_HZ * 3; i++) {
             e.predict(1.0f / (float)ESTIMATOR_HZ, 0.0f, 0.0f, 0.0f);
-            if ((i % every) == 0) e.fuse_baro(200.0f);
+            if ((i % every) == 0)
+                e.fuse_baro(200.0f, (uint32_t)(i * 1000 / (int)ESTIMATOR_HZ) + 1u);
         }
 
         if (fabsf(e.pz() - 200.0f) > 5.0f) {

@@ -11,8 +11,12 @@
 //  ../../test/est_test.cpp exercises every function here.
 //
 //  No Arduino dependency, and no dependency on the link header either —
-//  this is pure arithmetic. Include it with a relative path:
-//      #include "../common/ariadna_kf.h"
+//  this is pure arithmetic.
+//  Each sketch carries its own copy of this header in its folder (the
+//  Arduino builder compiles a sketch from a copy of its folder, so a
+//  "../common/" include does not resolve). This file is the original;
+//  `cd ../../test && make sync` checks the copies, `make sync-fix`
+//  refreshes them.
 //
 //  ---------------------------------------------------------------------
 //  THE FILTER

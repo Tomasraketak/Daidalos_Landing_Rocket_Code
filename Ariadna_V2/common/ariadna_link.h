@@ -13,11 +13,11 @@
 //  workstation instead of on the pad — the same discipline the guidance
 //  module already follows.
 //
-//  Include it with a relative path from each sketch:
-//      #include "../common/ariadna_link.h"
-//  Arduino IDE 2 resolves quoted includes relative to the including file,
-//  so one copy serves every sketch. (Only headers work this way; a .cpp
-//  outside the sketch folder would not be compiled.)
+//  Each sketch carries its own copy of this header in its folder (the
+//  Arduino builder compiles a sketch from a copy of its folder, so a
+//  "../common/" include does not resolve). This file is the original;
+//  `cd ../../test && make sync` checks the copies, `make sync-fix`
+//  refreshes them.
 //
 //  ---------------------------------------------------------------------
 //  FRAME FORMAT
@@ -487,7 +487,7 @@ typedef enum {
 //  Packed to 47 bytes because airtime, not RAM, is the constraint. At
 //  SF7 / BW125 / CR4-5 a 47-byte payload is ~73 ms on air, so the 5 Hz
 //  default downlink is about a 37 % duty cycle. Raising the rate or the
-//  size eats that margin directly — check ARIADNA_TLM_HZ in master_mcu.ino
+//  size eats that margin directly — check ARIADNA_TLM_HZ in Master_MCU.ino
 //  before adding a field. The most recent addition was the single UWB
 //  status byte, and it was argued for on exactly those grounds: one byte
 //  of airtime against being able to see a dead anchor from the pad.
@@ -590,7 +590,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 49, "gs serial layout chang
 // The navigation state is NOT sent on a timer. It is emitted by the
 // Position MCU the instant its estimator finishes a step, so the number
 // below is the estimator's rate rather than a transmit schedule — see
-// "Event-driven, not timed" in position_mcu.ino.
+// "Event-driven, not timed" in Position_MCU.ino.
 //
 // 240 Hz, feeding a 200 Hz control loop. Running the producer FASTER than
 // the consumer is the point: at equal rates two free-running crystals beat

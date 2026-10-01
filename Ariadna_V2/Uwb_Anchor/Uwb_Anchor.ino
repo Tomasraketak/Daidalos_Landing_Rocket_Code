@@ -7,7 +7,7 @@
 //  Four of these stand on the ground around the pad. Each answers
 //  two-way ranging requests from the tag on the vehicle; the tag turns
 //  the four distances into a position. This sketch is the ANCHOR half —
-//  the tag half lives in ../Position_MCU/position_mcu.ino, and the
+//  the tag half lives in ../Position_MCU/Position_MCU.ino, and the
 //  geometry that consumes both is ../common/ariadna_uwb.h.
 //
 //  ---------------------------------------------------------------------
@@ -23,7 +23,7 @@
 //  THE SHORT ADDRESS, AND THE ARGUMENT THAT MUST NOT BE DEFAULTED
 //  ---------------------------------------------------------------------
 //  The tag matches a range to an anchor by the anchor's 16-bit short
-//  address, looked up in the table in position_mcu.ino. In the
+//  address, looked up in the table in Position_MCU.ino. In the
 //  arduino-dw1000 library that address is RANDOMISED at startup unless
 //  startAsAnchor() is passed `false` as its third argument.
 //
@@ -47,7 +47,7 @@
 //  centre, and the same four in a rough line give metres across the line.
 //
 //  Then MEASURE where they are and put those numbers into
-//  s_uwb_anchors[] in position_mcu.ino. Nothing discovers this for you.
+//  s_uwb_anchors[] in Position_MCU.ino. Nothing discovers this for you.
 //
 //  ---------------------------------------------------------------------
 //  THE VOLTINOLABS HARDWARE WORKAROUNDS
@@ -67,7 +67,15 @@
 #include <DW1000Ranging.h>
 #include <DW1000.h>
 
-#include "../common/ariadna_rgb.h"
+// Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
+// library's include path only when it sees a real #include of it, so the
+// header's __has_include probe on its own always reads "absent" and the
+// LED silently compiled to nothing. ARDUINO is undefined in the host
+// `make syntax` build, which has no libraries.
+#ifdef ARDUINO
+#include <Adafruit_NeoPixel.h>
+#endif
+#include "ariadna_rgb.h"
 
 // =====================================================================
 //  1. WHICH ANCHOR IS THIS
@@ -226,7 +234,7 @@ void setup()
     Serial.print("  short address 0x000");
     Serial.println(ANCHOR_ID);
     Serial.println("Put this anchor's surveyed position into s_uwb_anchors[] "
-                   "in position_mcu.ino.");
+                   "in Position_MCU.ino.");
 }
 
 // =====================================================================

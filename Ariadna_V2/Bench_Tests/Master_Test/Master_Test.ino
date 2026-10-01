@@ -44,7 +44,7 @@
 #include "bench_common.h"
 
 // =====================================================================
-//  1. CONFIGURATION — pins identical to Master_MCU/master_mcu.ino
+//  1. CONFIGURATION — pins identical to Master_MCU/Master_MCU.ino
 // =====================================================================
 #define SERVO_TEST        1       // step the servos (0 = only init the PCA9685)
 #define FLASH_WRITE_TEST  1       // erase/write/verify the LAST flash sector

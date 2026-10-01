@@ -23,7 +23,7 @@
 #include "bench_common.h"
 
 // =====================================================================
-//  1. CONFIGURATION — pins identical to Navigation_MCU/navigation_mcu.ino
+//  1. CONFIGURATION — pins identical to Navigation_MCU/Navigation_MCU.ino
 // =====================================================================
 
 // !!! 1 = the 'y' command drives the pyro outputs HIGH. Bench it with LEDs

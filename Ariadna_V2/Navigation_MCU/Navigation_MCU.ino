@@ -45,9 +45,17 @@
 // =====================================================================
 
 #include "guidance.h"
-#include "../common/ariadna_link.h"
-#include "../common/ariadna_uart_dma.h"
-#include "../common/ariadna_rgb.h"
+#include "ariadna_link.h"
+#include "ariadna_uart_dma.h"
+// Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
+// library's include path only when it sees a real #include of it, so the
+// header's __has_include probe on its own always reads "absent" and the
+// LED silently compiled to nothing. ARDUINO is undefined in the host
+// `make syntax` build, which has no libraries.
+#ifdef ARDUINO
+#include <Adafruit_NeoPixel.h>
+#endif
+#include "ariadna_rgb.h"
 
 #include <Arduino.h>
 #include <string.h>

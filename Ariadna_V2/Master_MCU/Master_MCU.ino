@@ -54,15 +54,15 @@
 //  analogue servos will overheat or buzz at that rate.
 // =====================================================================
 
-#include "../common/ariadna_link.h"
-#include "../common/ariadna_uart_dma.h"
+#include "ariadna_link.h"
+#include "ariadna_uart_dma.h"
 
 // Vehicle constants come from the guidance module rather than being
 // repeated here. The state machine's handover altitude MUST equal the
 // altitude the Navigation MCU arms at, and the only way to guarantee that
 // is to read it from the same file. `cd ../../test && make sync` keeps
 // this copy identical to the verified original.
-#include "../Navigation_MCU/guidance.h"
+#include "guidance.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -74,7 +74,7 @@
 // include: the header instantiates the pixel object at that pin, and the
 // Master's SK6812 is on GP2 rather than on the XIAO's on-board GPIO.
 #define ARIADNA_RGB_PIN  2
-#include "../common/ariadna_rgb.h" 
+#include "ariadna_rgb.h" 
 
 #include <string.h>
 #include <math.h>
@@ -233,6 +233,13 @@ static const float GUIDANCE_ENTRY_M = DG_H_START;
 // =====================================================================
 //  2. STATE
 // =====================================================================
+
+// The Arduino builder generates a prototype for every function and puts
+// them all ABOVE the first one in the file — before LogRecord is defined
+// in section 4. Declaring the type here is what lets log_push(const
+// LogRecord *) have a prototype at all.
+struct LogRecord;
+
 static ariadna_rx_t          s_rx_pos;
 static ariadna_rx_t          s_rx_nav;
 
@@ -619,7 +626,7 @@ static void log_push(const LogRecord *r)
 //  One colour per MISSION state, so the vehicle can be read from outside
 //  the safety line without a laptop. The Position MCU's own LED reports
 //  the NAVIGATION state, which is a different question — see the
-//  annunciator section in position_mcu.ino.
+//  annunciator section in Position_MCU.ino.
 //
 //    solid blue        BOOT
 //    slow green        IDLE, safe, RBF fitted
@@ -1422,7 +1429,9 @@ void loop1()
     // ---- LoRa downlink ---------------------------------------------------
     //
     // ASYNCHRONOUS. endPacket(true) returns as soon as the packet is handed
-    // to the radio, and isTransmitting() reports when the air is clear.
+    // to the radio, and beginPacket() refuses — returns 0 — while the
+    // previous packet is still on air. (isTransmitting() would say the
+    // same thing more directly, but the LoRa library keeps it private.)
     //
     // At 10 Hz a 46-byte packet is 46 ms on air inside a 100 ms slot, so a
     // blocking endPacket() would put this core in the radio driver for
@@ -1436,17 +1445,16 @@ void loop1()
     // the backlog only grows. Skipping keeps every packet that does arrive
     // fresh, which is what a ground station needs.
     if (s_lora_ok && millis() >= next_tlm_ms) {
-        if (LoRa.isTransmitting()) {
-            s_tlm_skipped++;
+        ariadna_tlm_t t;
+        if (!tlm_acquire(&t)) {
+            // Torn snapshot: core 0 was mid-publish. Try again next pass.
+        } else if (!LoRa.beginPacket()) {
+            s_tlm_skipped++;                   // previous packet still on air
         } else {
             next_tlm_ms = millis() + 1000 / ARIADNA_TLM_HZ;
-            ariadna_tlm_t t;
-            if (tlm_acquire(&t)) {
-                LoRa.beginPacket();
-                LoRa.write((const uint8_t *)&t, sizeof(t));
-                LoRa.endPacket(true);          // async
-                s_tlm_sent++;
-            }
+            LoRa.write((const uint8_t *)&t, sizeof(t));
+            LoRa.endPacket(true);              // async
+            s_tlm_sent++;
         }
     }
 }

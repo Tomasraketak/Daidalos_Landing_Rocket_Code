@@ -17,11 +17,11 @@ Derived from the pinout spreadsheet, sheet **"Přiřazení pinů 2"**.
 
 | board | MCU | role | sketch |
 |---|---|---|---|
-| **Control / Master** | Raspberry Pi Pico 2 W | mission state machine, all servos, flash log, LoRa, arming | `Master_MCU/master_mcu.ino` |
-| **Position** | Seeed XIAO RP2350 | sensor fusion, the navigation solution, UWB tag | `Position_MCU/position_mcu.ino` |
-| **Guidance / Navigation** | Seeed XIAO RP2350 | guidance, ignition timing, TVC, pyros | `Navigation_MCU/navigation_mcu.ino` |
-| **Ground station** | Raspberry Pi Pico 2 | LoRa receive, OLED, USB uplink to the laptop | `Ground_Station/ground_station.ino` |
-| **UWB anchor ×4** | Seeed XIAO RP2350 | fixed ground ranging beacon | `Uwb_Anchor/uwb_anchor.ino` |
+| **Control / Master** | Raspberry Pi Pico 2 W | mission state machine, all servos, flash log, LoRa, arming | `Master_MCU/Master_MCU.ino` |
+| **Position** | Seeed XIAO RP2350 | sensor fusion, the navigation solution, UWB tag | `Position_MCU/Position_MCU.ino` |
+| **Guidance / Navigation** | Seeed XIAO RP2350 | guidance, ignition timing, TVC, pyros | `Navigation_MCU/Navigation_MCU.ino` |
+| **Ground station** | Raspberry Pi Pico 2 | LoRa receive, OLED, USB uplink to the laptop | `Ground_Station/Ground_Station.ino` |
+| **UWB anchor ×4** | Seeed XIAO RP2350 | fixed ground ranging beacon | `Uwb_Anchor/Uwb_Anchor.ino` |
 
 ---
 
@@ -181,7 +181,7 @@ Four identical boards, one sketch, differing only in `ANCHOR_ID`.
 
 ### Anchor identity
 
-| ANCHOR_ID | EUI | short address | table row in `position_mcu.ino` |
+| ANCHOR_ID | EUI | short address | table row in `Position_MCU.ino` |
 |---|---|---|---|
 | 1 | `01:00:5B:D5:A9:9A:E2:9C` | `0x0001` | `s_uwb_anchors[0]` |
 | 2 | `02:00:5B:D5:A9:9A:E2:9C` | `0x0002` | `s_uwb_anchors[1]` |
@@ -218,7 +218,7 @@ All three inter-processor links run at **921600 baud**, 8N1, framed by the codec
 
 | item | where | note |
 |---|---|---|
-| 2S LiPo | Control MCU GP27 via a 3:1 divider | `VBAT_DIVIDER` in `master_mcu.ino` |
+| 2S LiPo | Control MCU GP27 via a 3:1 divider | `VBAT_DIVIDER` in `Master_MCU.ino` |
 | current | Control MCU GP26, ACS712 | 100 mV/A part, zero at 1.65 V |
 | RBF | Control MCU GP28, pull-up | tag fitted = pin grounded = pyros inhibited |
 | breakwire | Control MCU GP10, pull-up | broken = launch detected |

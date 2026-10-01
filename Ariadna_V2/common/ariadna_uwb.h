@@ -12,8 +12,12 @@
 //  including every degraded case.
 //
 //  No Arduino dependency, no link-header dependency, single precision
-//  throughout. Include it with a relative path:
-//      #include "../common/ariadna_uwb.h"
+//  throughout.
+//  Each sketch carries its own copy of this header in its folder (the
+//  Arduino builder compiles a sketch from a copy of its folder, so a
+//  "../common/" include does not resolve). This file is the original;
+//  `cd ../../test && make sync` checks the copies, `make sync-fix`
+//  refreshes them.
 //
 //  ---------------------------------------------------------------------
 //  THE PROBLEM

@@ -50,7 +50,7 @@
 #endif
 
 // =====================================================================
-//  1. PINS — identical to Position_MCU/position_mcu.ino
+//  1. PINS — identical to Position_MCU/Position_MCU.ino
 // =====================================================================
 static const uint8_t PIN_UWB_INT     = D0;
 static const uint8_t PIN_UWB_RST     = D1;   // OPEN DRAIN: never drive it high
