@@ -865,6 +865,10 @@ Adafruit_NeoPixel is optional in the same way: without it the annunciator calls 
 to nothing, which is what lets `make syntax` build the sketches against a stub Arduino
 header with no libraries at all.
 
+Before the first flight firmware goes on, flash the bench tests in
+[`Bench_Tests/`](Bench_Tests/README.md): one sketch per board that checks every sensor,
+servo, memory, radio and inter-board link and prints the verdicts on USB serial.
+
 Flash the four anchors from one sketch by changing `ANCHOR_ID` to 1, 2, 3, 4 in turn.
 **Write the number on the box** — an anchor whose ID does not match where it physically
 stands is the one failure in this system that produces a confident, wrong position

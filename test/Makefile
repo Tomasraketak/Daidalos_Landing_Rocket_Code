@@ -7,6 +7,8 @@
 #   make syntax   compile the sketches against a stub Arduino header
 #   make sync     verify the Navigation MCU's guidance copy has not drifted
 #   make pyfmt    verify ground_visualizer.py decodes the current packet
+#   make bench    Ariadna V2 bench-test link (ping / pong / routing)
+#   make bench-sync  verify the bench sketches' copies of bench_common.h
 #   make check    all of the above
 #
 # -Wdouble-promotion is not cosmetic here: the RP2350 has a single-precision
@@ -115,7 +117,35 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(NAV_DIR)/navigation_mcu.ino
 	@echo "sketches compile clean"
 
-check: all est uwb link sync pyfmt syntax
+# ---------------------------------------------------------------------
+# Ariadna V2 bench tests. The sketches in Bench_Tests/ exist to tell a
+# broken wire from a broken board, so the link they use to do it is
+# checked here. bench_common.h is copied into each sketch folder for the
+# same reason the guidance module is copied above; bench-sync checks the
+# copies, bench-sync-fix refreshes them.
+# ---------------------------------------------------------------------
+BENCH_DIR = $(V2)/Bench_Tests
+BENCH_H   = $(BENCH_DIR)/common/bench_common.h
+BENCH_SKETCHES = Master_Test Position_Test Navigation_Test
+
+bench: bench_test
+	./bench_test
+
+bench_test: bench_test.cpp $(BENCH_H) bench_stub/Arduino.h bench_stub/hardware/uart.h
+	$(CXX) $(CXXFLAGS) -Ibench_stub -o bench_test bench_test.cpp
+
+bench-sync:
+	@for s in $(BENCH_SKETCHES); do \
+	  cmp -s $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h \
+	    || { echo "$$s/bench_common.h has drifted - run 'make bench-sync-fix'"; exit 1; }; \
+	done
+	@echo "bench sketches' bench_common.h copies match the original"
+
+bench-sync-fix:
+	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
+	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
+
+check: all est uwb link sync pyfmt syntax bench bench-sync
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
