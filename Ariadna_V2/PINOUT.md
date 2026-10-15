@@ -219,7 +219,7 @@ All three inter-processor links run at **921600 baud**, 8N1, framed by the codec
 | item | where | note |
 |---|---|---|
 | 2S LiPo | Control MCU GP27 via a 3:1 divider | `VBAT_DIVIDER` in `master_mcu.ino` |
-| current | Control MCU GP26, ACS712 | 100 mV/A part, zero at 1.65 V |
+| current | Control MCU GP26, ACS712 | 5 V part, 100 mV/A, 2:1 divider — zero at 1.252 V on the pin |
 | RBF | Control MCU GP28, pull-up | tag fitted = pin grounded = pyros inhibited |
 | breakwire | Control MCU GP10, pull-up | broken = launch detected |
 | pyro arming | Navigation MCU, `pyro_permitted()` | requires the Master's armed state |

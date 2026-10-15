@@ -149,9 +149,12 @@ static const uint8_t PIN_RBF     = 28;  // ADC2, Remove-Before-Flight
 static const float ADC_VREF        = 3.30f;
 static const float ADC_FULL_SCALE  = 4095.0f;
 static const float VBAT_DIVIDER    = 3.00f;    // e.g. 20k over 10k
-static const float ACS712_ZERO_V   = 1.65f;    // output at 0 A, after divider
+// The ACS712 runs from 5 V behind a 2:1 divider: the bench read 1.252 V
+// at GP26 with no current flowing, i.e. 2.504 V at the sensor's output.
+// Its zero is ratiometric (Vcc/2), so re-measure if the 5 V rail changes.
+static const float ACS712_ZERO_V   = 2.504f;   // output at 0 A, at the sensor
 static const float ACS712_V_PER_A  = 0.100f;   // 20 A part: 100 mV/A
-static const float ACS712_DIVIDER  = 1.00f;    // 1.0 if the part runs at 3V3
+static const float ACS712_DIVIDER  = 0.50f;    // pin volts / sensor volts
 
 // RBF: pin pulled to ground while the tag is fitted. Removing it lets the
 // pull-up take the pin high, which is the ARMED-permissive state. Fail
