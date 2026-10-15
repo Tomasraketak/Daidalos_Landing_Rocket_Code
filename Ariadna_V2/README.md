@@ -775,7 +775,7 @@ This matters more than anything else in this README.
 | **link codec** | 111 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
 | **navigation filter** | 47 checks: `make est`, including the barometer trim observer. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
 | **UWB multilateration** | 108 checks: `make uwb`. Every degraded case — four anchors down to one and none, NaN and negative ranges, coincident and collinear anchors, a 10 m reflection, a 600-trial Monte Carlo the quoted σ must match, the whole descent profile from 50 m/s down, and the vertical envelope to the ground. `ariadna_uwb.h` likewise compiles unchanged into both. |
-| **guidance copy** | `make sync` proves the Navigation MCU's copy is byte-identical to the verified original. |
+| **header copies** | `make sync` proves every sketch's copy of the guidance module and of `common/` is byte-identical to the original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
 | **DMA channel setup** | ⚠️ **not testable off-target.** The ring it drives is tested; the channel configuration is not. |
@@ -784,7 +784,7 @@ This matters more than anything else in this README.
 | **UWB anchor survey** | ⚠️ **cannot be verified in software at all.** The boot self test catches duplicated addresses, anchors closer than a metre and a geometry that cannot solve; it cannot catch an anchor that is simply not where the table says. Measure it, and watch the post-fit residual. |
 | **UWB driver** | ⚠️ **not host-compiled with the radio present** — the ranging library is absent from the host build. The geometry is fully tested; the SPI and IRQ handling is not. |
 | **body→pad rotation** | ⚠️ **not verified.** Three conventions have to agree and only one is ours. |
-| **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. Build them in Arduino IDE. |
+| **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. All five sketches build clean with `arduino-cli` (arduino-pico 6.2.0, `--warnings all`); nothing in `make check` does that. |
 
 The three ⚠️ rows share a failure mode: they do not produce a plausible-but-wrong number,
 they mirror an axis. A mirrored axis turns the attitude loop into positive feedback, which
@@ -794,7 +794,7 @@ optional.**
 ### There is no longer a 3D→planar bridge
 
 `guidance.cpp` now solves the full three-dimensional problem with a two-axis gimbal, so
-section 6 of `navigation_mcu.ino` is almost a **copy** rather than a transform: the link's `u`
+section 6 of `Navigation_MCU.ino` is almost a **copy** rather than a transform: the link's `u`
 vector is `dg_nav_t.b` and the link's `w` is `dg_nav_t.w`, identically defined at both ends.
 
 The one thing it derives is the airframe's **roll orientation**. The TVC servos are bolted to
@@ -833,15 +833,15 @@ make          # 124 guidance checks against the simulation
 make est      # 47 navigation filter and barometer-trim checks
 make uwb      # 108 UWB checks: degraded constellations and a moving vehicle
 make link     # 111 link codec checks, the transmit ring, and the link budget
-make sync     # the Navigation MCU's guidance copy has not drifted
+make sync     # every sketch's copy of guidance and common/ matches the original
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled
 make check    # all of it
 ```
 
-`make sync-fix` re-copies `guidance.h` / `guidance.cpp` into `Navigation_MCU/` after a change
-to the original. Arduino cannot compile a `.cpp` outside the sketch folder, which is why the
-copy exists — and why it is *checked* rather than trusted.
+`make sync-fix` re-copies the guidance module and the `common/` headers into every sketch
+folder after a change to an original. Arduino cannot reach anything outside the sketch
+folder, which is why the copies exist — and why they are *checked* rather than trusted.
 
 ---
 
@@ -851,28 +851,42 @@ Arduino IDE 2, board package **arduino-pico** (earlephilhower).
 
 | sketch | board | libraries |
 |---|---|---|
-| `Master_MCU/master_mcu.ino` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU/position_mcu.ino` | Seeed XIAO RP2350 | [Voltino TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library), [arduino-dw1000](https://github.com/thotro/arduino-dw1000)\*, Adafruit_NeoPixel |
-| `Navigation_MCU/navigation_mcu.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
-| `Ground_Station/ground_station.ino` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
-| `Uwb_Anchor/uwb_anchor.ino` | Seeed XIAO RP2350 ×4 | arduino-dw1000, Adafruit_NeoPixel |
+| `Master_MCU/Master_MCU.ino` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
+| `Position_MCU/Position_MCU.ino` | Seeed XIAO RP2350 | [Voltino TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library), [arduino-dw1000](https://github.com/thotro/arduino-dw1000)\*, Adafruit_NeoPixel |
+| `Navigation_MCU/Navigation_MCU.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
+| `Ground_Station/Ground_Station.ino` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
+| `Uwb_Anchor/Uwb_Anchor.ino` | Seeed XIAO RP2350 ×4 | arduino-dw1000, Adafruit_NeoPixel |
 
-\* **Optional.** The Position MCU detects `DW1000Ranging.h` with `__has_include` and
-compiles the entire UWB path out if it is absent, flying on GPS, barometer and IMU
-exactly as it did before. Set `ARIADNA_UWB_ENABLED` to 0 by hand to do the same thing
-deliberately — for instance to rule the radio out while chasing an SPI fault.
+\* **Optional.** Without arduino-dw1000, set `ARIADNA_UWB_ENABLED` to 0 at the top of
+`Position_MCU.ino`: the entire UWB path compiles out and the board flies on GPS, barometer
+and IMU exactly as it did before. The same switch rules the radio out deliberately — for
+instance while chasing an SPI fault. It is a plain switch rather than a `__has_include`
+probe because the Arduino builder only adds a library's include path once it sees a real
+`#include`, so the probe always read "absent" and the radio was compiled out silently.
+
+The registry release of arduino-dw1000 (0.9.0) does not build on arduino-pico as shipped:
+`DW1000RangingClass::detectMessageType()` in `DW1000Ranging.cpp` can fall off its end, which
+this core compiles with `-Werror=return-type`. Add `return -1;` as its last line.
+
 Adafruit_NeoPixel is optional in the same way: without it the annunciator calls compile
 to nothing, which is what lets `make syntax` build the sketches against a stub Arduino
 header with no libraries at all.
+
+Before the first flight firmware goes on, flash the bench tests in
+[`Bench_Tests/`](Bench_Tests/README.md): one sketch per board that checks every sensor,
+servo, memory, radio and inter-board link and prints the verdicts on USB serial.
 
 Flash the four anchors from one sketch by changing `ANCHOR_ID` to 1, 2, 3, 4 in turn.
 **Write the number on the box** — an anchor whose ID does not match where it physically
 stands is the one failure in this system that produces a confident, wrong position
 rather than no position.
 
-The sketches reach the shared headers by relative path (`#include "../common/ariadna_link.h"`).
-Arduino IDE 2 resolves quoted includes relative to the including file, so one copy serves all
-four. Keep the directory layout as it is.
+Each sketch folder is self-contained: it carries its own copy of the `common/` headers it
+uses (and the Master a copy of `guidance.h`), because the Arduino builder compiles a sketch
+from a copy of its folder and a `"../common/…"` include does not resolve there. `common/`
+holds the originals. Edit those, then `cd ../test && make sync-fix`; `make sync` (part of
+`make check`) fails if any copy has drifted. The `.ino` in each folder carries the folder's
+name, which Arduino also requires.
 
 `common/` holds five headers, and the split is deliberate:
 
@@ -884,7 +898,7 @@ four. Keep the directory layout as it is.
 | `ariadna_uwb.h` | the UWB multilateration | `make uwb` |
 | `ariadna_rgb.h` | the annunciator pattern engine | `make syntax` |
 
-The arithmetic is kept out of `position_mcu.ino` for the same reason `guidance.cpp` is
+The arithmetic is kept out of `Position_MCU.ino` for the same reason `guidance.cpp` is
 kept out of the Navigation MCU's sketch. Anything inside a `.ino` can only be tested by
 flashing a board, and the Position MCU sketch cannot be host-compiled at all because it
 pulls in TriSense. The filter and the multilateration can be, and are — and the headers
@@ -1074,7 +1088,7 @@ Suggested order:
 3. **⚠️ Check the TVC signs.** Loop running, dummy thrust estimate, no motor. Deflect the
    airframe by hand along +x and confirm the nozzle swings to **oppose** the motion. Then
    along +y. Then both. If it follows instead, `TVC_SIGN_X` / `TVC_SIGN_Y` in
-   `master_mcu.ino` are wrong, and the vehicle will diverge in under a second. Test **both**
+   `Master_MCU.ino` are wrong, and the vehicle will diverge in under a second. Test **both**
    axes — testing one and assuming the other is how a sign error reaches the pad. **This test
    catches the single most dangerous class of bug in the whole repository.**
 

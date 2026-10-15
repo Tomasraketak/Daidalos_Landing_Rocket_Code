@@ -5,8 +5,10 @@
 #   make uwb      Ariadna V2 UWB multilateration
 #   make link     Ariadna V2 inter-processor link codec
 #   make syntax   compile the sketches against a stub Arduino header
-#   make sync     verify the Navigation MCU's guidance copy has not drifted
+#   make sync     verify the sketches' copies of guidance and common/ headers
 #   make pyfmt    verify ground_visualizer.py decodes the current packet
+#   make bench    Ariadna V2 bench-test link (ping / pong / routing)
+#   make bench-sync  verify the bench sketches' copies of bench_common.h
 #   make check    all of the above
 #
 # -Wdouble-promotion is not cosmetic here: the RP2350 has a single-precision
@@ -42,7 +44,7 @@ link_test: link_test.cpp $(LINK_H)
 
 # ---------------------------------------------------------------------
 # Ariadna V2 navigation filter. ariadna_kf.h compiles unchanged into
-# this test and unchanged into position_mcu.ino, so the arithmetic that
+# this test and unchanged into Position_MCU.ino, so the arithmetic that
 # is checked here is the arithmetic that flies. The sketch itself cannot
 # be host-compiled — it pulls in TriSense — which is precisely why the
 # filter was moved out of it.
@@ -56,7 +58,7 @@ est_test: est_test.cpp $(KF_H)
 # ---------------------------------------------------------------------
 # Ariadna V2 UWB multilateration. Same discipline as the filter above:
 # ariadna_uwb.h compiles unchanged into this test and unchanged into
-# position_mcu.ino.
+# Position_MCU.ino.
 #
 # This one earns its place more than most. The solver's whole job is to
 # behave sensibly when the constellation is INCOMPLETE, and a partial
@@ -71,23 +73,47 @@ uwb_test: uwb_test.cpp $(UWB_H)
 	$(CXX) $(CXXFLAGS) -o uwb_test uwb_test.cpp -lm
 
 # ---------------------------------------------------------------------
-# Arduino cannot compile a .cpp that lives outside the sketch folder, so
-# the Navigation MCU sketch carries its own copy of the guidance module.
+# The Arduino builder compiles a sketch from a copy of its own folder, so
+# nothing outside that folder can be reached — not a .cpp, and not a
+# "../common/x.h" include either. Every sketch therefore carries its own
+# copy of the guidance module and of the common/ headers it uses.
+#
 # A copy that silently drifts from the verified original is exactly the
-# failure this repository exists to prevent, so the copy is checked rather
-# than trusted. `make sync-fix` refreshes it.
+# failure this repository exists to prevent, so the copies are checked
+# rather than trusted. `make sync-fix` refreshes them all.
 # ---------------------------------------------------------------------
+GUIDANCE_SRC = ../Daidalos_Landing_Guidance
+
+# original:copy pairs, relative to this directory
+SYNC_PAIRS = \
+  $(GUIDANCE_SRC)/guidance.h:$(NAV_DIR)/guidance.h \
+  $(GUIDANCE_SRC)/guidance.cpp:$(NAV_DIR)/guidance.cpp \
+  $(GUIDANCE_SRC)/guidance.h:$(V2)/Master_MCU/guidance.h \
+  $(V2)/common/ariadna_link.h:$(V2)/Master_MCU/ariadna_link.h \
+  $(V2)/common/ariadna_uart_dma.h:$(V2)/Master_MCU/ariadna_uart_dma.h \
+  $(V2)/common/ariadna_rgb.h:$(V2)/Master_MCU/ariadna_rgb.h \
+  $(V2)/common/ariadna_link.h:$(V2)/Position_MCU/ariadna_link.h \
+  $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
+  $(V2)/common/ariadna_kf.h:$(V2)/Position_MCU/ariadna_kf.h \
+  $(V2)/common/ariadna_uwb.h:$(V2)/Position_MCU/ariadna_uwb.h \
+  $(V2)/common/ariadna_rgb.h:$(V2)/Position_MCU/ariadna_rgb.h \
+  $(V2)/common/ariadna_link.h:$(NAV_DIR)/ariadna_link.h \
+  $(V2)/common/ariadna_uart_dma.h:$(NAV_DIR)/ariadna_uart_dma.h \
+  $(V2)/common/ariadna_rgb.h:$(NAV_DIR)/ariadna_rgb.h \
+  $(V2)/common/ariadna_link.h:$(V2)/Ground_Station/ariadna_link.h \
+  $(V2)/common/ariadna_rgb.h:$(V2)/Uwb_Anchor/ariadna_rgb.h
+
 sync:
-	@cmp -s ../Daidalos_Landing_Guidance/guidance.h   $(NAV_DIR)/guidance.h \
-	  || { echo "guidance.h in $(NAV_DIR) has drifted - run 'make sync-fix'"; exit 1; }
-	@cmp -s ../Daidalos_Landing_Guidance/guidance.cpp $(NAV_DIR)/guidance.cpp \
-	  || { echo "guidance.cpp in $(NAV_DIR) has drifted - run 'make sync-fix'"; exit 1; }
-	@echo "Navigation MCU guidance copy matches the verified original"
+	@fail=0; for p in $(SYNC_PAIRS); do \
+	  src=$${p%%:*}; dst=$${p#*:}; \
+	  cmp -s $$src $$dst || { echo "$$dst has drifted from $$src"; fail=1; }; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "run 'make sync-fix'"; exit 1; fi
+	@echo "every sketch's copy of guidance and common/ matches the original"
 
 sync-fix:
-	cp ../Daidalos_Landing_Guidance/guidance.h   $(NAV_DIR)/guidance.h
-	cp ../Daidalos_Landing_Guidance/guidance.cpp $(NAV_DIR)/guidance.cpp
-	@echo "guidance module re-synced into $(NAV_DIR)"
+	@for p in $(SYNC_PAIRS); do cp $${p%%:*} $${p#*:}; done
+	@echo "guidance module and common/ headers re-synced into the sketches"
 
 # ---------------------------------------------------------------------
 # The ground station's Python client decodes the downlink with a struct
@@ -103,7 +129,7 @@ pyfmt:
 # main().
 #
 # Only the two sketches whose dependencies are the Arduino core itself are
-# checked. master_mcu.ino, position_mcu.ino and ground_station.ino pull in
+# checked. Master_MCU.ino, Position_MCU.ino and Ground_Station.ino pull in
 # LoRa, Adafruit_SSD1306 and TriSense; stubbing those faithfully would be
 # more code than the sketches, and a stub that drifts from the real library
 # gives false confidence rather than none. Build those in Arduino IDE.
@@ -112,10 +138,38 @@ syntax: $(INO) stub/Arduino.h
 	$(CXX) $(CXXFLAGS) -Istub -I../Daidalos_Landing_Guidance \
 	    -x c++ -fsyntax-only $(INO)
 	$(CXX) $(CXXFLAGS) -Istub -I$(NAV_DIR) \
-	    -x c++ -fsyntax-only $(NAV_DIR)/navigation_mcu.ino
+	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
 	@echo "sketches compile clean"
 
-check: all est uwb link sync pyfmt syntax
+# ---------------------------------------------------------------------
+# Ariadna V2 bench tests. The sketches in Bench_Tests/ exist to tell a
+# broken wire from a broken board, so the link they use to do it is
+# checked here. bench_common.h is copied into each sketch folder for the
+# same reason the guidance module is copied above; bench-sync checks the
+# copies, bench-sync-fix refreshes them.
+# ---------------------------------------------------------------------
+BENCH_DIR = $(V2)/Bench_Tests
+BENCH_H   = $(BENCH_DIR)/common/bench_common.h
+BENCH_SKETCHES = Master_Test Position_Test Navigation_Test
+
+bench: bench_test
+	./bench_test
+
+bench_test: bench_test.cpp $(BENCH_H) bench_stub/Arduino.h bench_stub/hardware/uart.h
+	$(CXX) $(CXXFLAGS) -Ibench_stub -o bench_test bench_test.cpp
+
+bench-sync:
+	@for s in $(BENCH_SKETCHES); do \
+	  cmp -s $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h \
+	    || { echo "$$s/bench_common.h has drifted - run 'make bench-sync-fix'"; exit 1; }; \
+	done
+	@echo "bench sketches' bench_common.h copies match the original"
+
+bench-sync-fix:
+	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
+	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
+
+check: all est uwb link sync pyfmt syntax bench bench-sync
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py

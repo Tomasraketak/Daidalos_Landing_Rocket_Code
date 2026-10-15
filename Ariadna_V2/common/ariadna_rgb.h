@@ -46,6 +46,11 @@
 //  nothing and every call is a no-op. That is deliberate: `make syntax`
 //  compiles the sketches against a stub Arduino header with no libraries
 //  at all, and an annunciator is not worth breaking that over.
+//
+//  The probe below CANNOT find the library by itself in an Arduino build:
+//  the builder only adds a library's include path after it has seen a
+//  real #include of it. Every sketch therefore also includes
+//  <Adafruit_NeoPixel.h> itself, before this header.
 // =====================================================================
 #ifndef ARIADNA_RGB_H
 #define ARIADNA_RGB_H

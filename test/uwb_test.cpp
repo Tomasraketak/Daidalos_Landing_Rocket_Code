@@ -2,7 +2,7 @@
 //  Ariadna V2 — UWB multilateration checks
 //
 //  ../Ariadna_V2/common/ariadna_uwb.h compiles UNCHANGED into this test
-//  and unchanged into position_mcu.ino, so what is checked here is what
+//  and unchanged into Position_MCU.ino, so what is checked here is what
 //  flies. Same discipline as est_test.cpp and host_test.cpp.
 //
 //  What this establishes:

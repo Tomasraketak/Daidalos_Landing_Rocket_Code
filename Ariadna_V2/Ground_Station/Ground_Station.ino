@@ -52,7 +52,7 @@
 //    core 1   OLED and the buttons — may block as much as it likes
 // =====================================================================
 
-#include "../common/ariadna_link.h"
+#include "ariadna_link.h"
 
 #include <SPI.h>
 #include <LoRa.h>

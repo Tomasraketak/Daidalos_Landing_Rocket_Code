@@ -3,7 +3,7 @@
 Pin ground_visualizer.py's packet decoder against the C definition.
 
 The downlink packet is defined once, in ariadna_link.h, and decoded twice —
-by ground_station.ino (which just memcpy's it, so it cannot be wrong) and by
+by Ground_Station.ino (which just memcpy's it, so it cannot be wrong) and by
 ground_visualizer.py (which uses a struct format string, which very much
 can). link_test.cpp checks the C side. This checks the Python side against
 the same header, so the two cannot drift apart without a test failing.

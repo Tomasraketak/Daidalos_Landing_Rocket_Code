@@ -35,7 +35,7 @@ static void check(bool cond, const char *what)
     }
 }
 
-// Tuning mirrored from Estimator in position_mcu.ino. Not shared with it
+// Tuning mirrored from Estimator in Position_MCU.ino. Not shared with it
 // — these are the numbers the checks below are written against, and if
 // the sketch moves away from them the checks still say something true
 // about the filter, just not about the flight configuration.
