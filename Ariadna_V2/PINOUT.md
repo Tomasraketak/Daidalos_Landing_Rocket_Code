@@ -109,8 +109,8 @@ wins, and the firmware follows the third column.
    selected, the module drives SCK and MOSI itself. A second SPI device on these
    wires is corrupted (this is why the DWM1000 moved to its own board), and an MCU
    that drives SCK/MOSI between transfers is in a short circuit with the module,
-   roughly 15–25 mA per line. TriSense library **1.6.0+** releases the two pins
-   between transfers on the RP2350; older versions do not.
+   roughly 15–25 mA per line. The TriSense library must release the two pins
+   between transfers; the Position bench test does so itself.
 2. **The UWB tag is an I2C slave on the sensor bus**, address `0x2A`, reached
    through the I2CP uSup connector (GND, 3V3, PSDA, PSCL). The bus runs at 400 kHz
    so the tag's 74-byte frame costs 1.7 ms of core 0, not 6.8 ms. The tag board

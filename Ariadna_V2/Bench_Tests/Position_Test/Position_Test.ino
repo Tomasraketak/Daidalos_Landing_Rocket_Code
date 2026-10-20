@@ -23,9 +23,9 @@
 //  re-probed every few seconds (so it can be plugged in live), and the GPS
 //  is serviced a few bytes at a time.
 //
-//  The IMU's SPI pins are released between transfers, exactly as the
-//  TriSense library (1.6.0+) does in flight: the module drives SCK and
-//  MOSI itself whenever the IMU is not selected, so the MCU must not.
+//  The IMU's SPI pins are released between transfers: the module drives
+//  SCK and MOSI itself whenever the IMU is not selected, so the MCU must
+//  not. In flight that is the TriSense library's job.
 //
 //  USB serial, 115200 baud. Commands: h help, p summary, i I2C scan,
 //  g raw GPS echo on/off.

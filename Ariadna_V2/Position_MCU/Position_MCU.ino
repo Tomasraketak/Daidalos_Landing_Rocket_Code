@@ -2184,10 +2184,10 @@ static bool sensors_begin(void)
     //
     // THE IMU'S SPI BUS IS ITS OWN. The module drives SCK and MOSI itself
     // whenever the IMU is not selected, so nothing else may sit on those
-    // wires, and the MCU must not drive them between transfers either.
-    // TriSense 1.6.0 and later releases SCK/MOSI between transfers on the
-    // RP2350 by itself; an older library leaves the two drivers fighting
-    // (tens of mA, and switching noise next to the barometer).
+    // wires, and the MCU must not drive them between transfers either —
+    // releasing SCK/MOSI between transfers is the TriSense library's job.
+    // A library that keeps them driven leaves two drivers fighting (tens
+    // of mA, and switching noise next to the barometer).
     bool ok = sensor.beginAll(MODE_HYBRID, PIN_TRISENSE_CS, TRISENSE_SPI_HZ, SENSOR_I2C);
 
     // 400 kHz, not the core's 100 kHz default, which beginAll() leaves in
