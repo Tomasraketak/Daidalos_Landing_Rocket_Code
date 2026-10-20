@@ -3,6 +3,7 @@
 #   make          numerical check of the algorithm against the Python model
 #   make est      Ariadna V2 navigation filter
 #   make uwb      Ariadna V2 UWB multilateration
+#   make uwblink  Ariadna V2 UWB tag I2C frame codec
 #   make link     Ariadna V2 inter-processor link codec
 #   make syntax   compile the sketches against a stub Arduino header
 #   make sync     verify the sketches' copies of guidance and common/ headers
@@ -24,6 +25,7 @@ NAV_DIR = $(V2)/Navigation_MCU
 LINK_H  = $(V2)/common/ariadna_link.h
 KF_H    = $(V2)/common/ariadna_kf.h
 UWB_H   = $(V2)/common/ariadna_uwb.h
+UWBL_H  = $(V2)/common/ariadna_uwb_link.h
 
 all: host_test
 	./host_test
@@ -73,6 +75,18 @@ uwb_test: uwb_test.cpp $(UWB_H)
 	$(CXX) $(CXXFLAGS) -o uwb_test uwb_test.cpp -lm
 
 # ---------------------------------------------------------------------
+# The UWB tag's I2C frame. The tag board and the Position MCU are built
+# separately and flashed separately, so this header is the only thing that
+# keeps them agreeing; a bus that answers 0xFF, a short read and a flipped
+# bit are all checked here, where they are easy to produce.
+# ---------------------------------------------------------------------
+uwblink: uwb_link_test
+	./uwb_link_test
+
+uwb_link_test: uwb_link_test.cpp $(UWBL_H)
+	$(CXX) $(CXXFLAGS) -o uwb_link_test uwb_link_test.cpp -lm
+
+# ---------------------------------------------------------------------
 # The Arduino builder compiles a sketch from a copy of its own folder, so
 # nothing outside that folder can be reached — not a .cpp, and not a
 # "../common/x.h" include either. Every sketch therefore carries its own
@@ -96,6 +110,10 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
   $(V2)/common/ariadna_kf.h:$(V2)/Position_MCU/ariadna_kf.h \
   $(V2)/common/ariadna_uwb.h:$(V2)/Position_MCU/ariadna_uwb.h \
+  $(V2)/common/ariadna_uwb_link.h:$(V2)/Position_MCU/ariadna_uwb_link.h \
+  $(V2)/common/ariadna_uwb_link.h:$(V2)/Uwb_Tag/ariadna_uwb_link.h \
+  $(V2)/common/ariadna_rgb.h:$(V2)/Uwb_Tag/ariadna_rgb.h \
+  $(V2)/common/ariadna_uwb_link.h:$(V2)/Bench_Tests/Position_Test/ariadna_uwb_link.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Position_MCU/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(NAV_DIR)/ariadna_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(NAV_DIR)/ariadna_uart_dma.h \
@@ -169,7 +187,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all est uwb link sync pyfmt syntax bench bench-sync
+check: all est uwb uwblink link sync pyfmt syntax bench bench-sync
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -177,5 +195,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test link_test est_test uwb_test
-.PHONY: all est uwb link sync sync-fix pyfmt syntax check golden clean
+	rm -f host_test link_test est_test uwb_test uwb_link_test
+.PHONY: all est uwb uwblink link sync sync-fix pyfmt syntax check golden clean

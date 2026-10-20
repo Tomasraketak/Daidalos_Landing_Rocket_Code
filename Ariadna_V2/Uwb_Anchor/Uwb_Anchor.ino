@@ -7,8 +7,9 @@
 //  Four of these stand on the ground around the pad. Each answers
 //  two-way ranging requests from the tag on the vehicle; the tag turns
 //  the four distances into a position. This sketch is the ANCHOR half —
-//  the tag half lives in ../Position_MCU/Position_MCU.ino, and the
-//  geometry that consumes both is ../common/ariadna_uwb.h.
+//  the tag half lives in ../Uwb_Tag/Uwb_Tag.ino (an anchor PCB carried in
+//  the vehicle), and the geometry that consumes both is
+//  ../common/ariadna_uwb.h, run on the Position MCU.
 //
 //  ---------------------------------------------------------------------
 //  FLASHING FOUR BOARDS FROM ONE SKETCH

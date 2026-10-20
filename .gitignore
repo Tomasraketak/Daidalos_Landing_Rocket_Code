@@ -10,3 +10,4 @@ __pycache__/
 test/est_test
 test/uwb_test
 test/bench_test
+test/uwb_link_test

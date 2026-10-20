@@ -25,7 +25,7 @@
 //  ---------------------------------------------------------------------
 //  CORE ALLOCATION
 //  ---------------------------------------------------------------------
-//    core 0   ALL sensor I/O — TriSense fusion, barometer — plus the
+//    core 0   ALL sensor I/O — TriSense fusion, barometer, UWB tag — plus the
 //             estimator AND every outgoing packet. Every I2C and SPI
 //             transaction in the vehicle's sensor stack happens on this
 //             core, so there is no bus arbitration to get wrong, and the
@@ -94,6 +94,7 @@
 #include "ariadna_uart_dma.h"
 #include "ariadna_kf.h"
 #include "ariadna_uwb.h"
+#include "ariadna_uwb_link.h"
 // Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
 // library's include path only when it sees a real #include of it, so the
 // header's __has_include probe on its own always reads "absent" and the
@@ -139,15 +140,13 @@ static const uint8_t PIN_I2C_SCL       = D5;
 // harness, which is not a bench jumper.
 static const uint32_t TRISENSE_SPI_HZ  = 10000000;
 
-// ---- UWB DWM1000, shares the SPI bus with the IMU -----------------------
+// ---- UWB tag: an I2C slave on the sensor bus ---------------------------
 //
-// D0 and D1 are the spreadsheet's "UART0 TX / RX" pins. They are NOT used
-// as a UART: the pinout sheet names the peripheral in its third column,
-// and the peripheral on those two pins is the DWM1000's interrupt and
-// reset lines. RST is driven open-drain — see UwbTag::begin().
-static const uint8_t PIN_UWB_INT       = D0;
-static const uint8_t PIN_UWB_RST       = D1;
-static const uint8_t PIN_UWB_CS        = D2;
+// The DWM1000 is no longer on this board. The TriSense module drives SCK
+// and MOSI itself whenever its IMU is not selected, so nothing else can
+// share the IMU's SPI bus. The tag now runs on an anchor PCB flashed with
+// ../Uwb_Tag and plugged into the I2CP uSup connector (PSDA/PSCL = D4/D5),
+// at ARIADNA_UWB_I2C_ADDR. D0, D1 and D2 are free.
 
 // ---- link to the Master ------------------------------------------------
 // The spreadsheet labels D6/D7 "UART1". On the arduino-pico core Serial1
@@ -189,16 +188,15 @@ static const uint32_t ESTIMATOR_HZ = ARIADNA_NAV_STATE_HZ;   // 240 Hz
 // Barometer sampling. NOT the estimator rate, and deliberately far below
 // it.
 //
-// The BMP580 will run at 240 Hz, but only at minimum oversampling. This
-// build uses OSR x16 on pressure for the altitude noise floor, which caps
-// the achievable rate far lower — so 50 Hz is what the sensor can actually
-// deliver at this quality, and asking for more would mean asking for a
-// noisier altitude.
+// The SENSOR runs at its maximum, 240 Hz (see sensors_begin()), with its
+// IIR averaging the light oversampling that rate allows; the estimator
+// takes one of those samples every 20 ms.
 //
-// That costs nothing. The vertical filter believes the barometer below
-// about 0.3 Hz and the accelerometer above it, so 50 Hz is already more
-// than a hundred times oversampled for the job the barometer is doing.
-// A quieter sample at 50 Hz beats a noisier one at 240 Hz here, every time.
+// Fusing all 240 would buy nothing but bus time. The vertical filter
+// believes the barometer below about 0.3 Hz and the accelerometer above
+// it, so 50 Hz is already more than a hundred times oversampled for the
+// job the barometer is doing — and BARO_SIGMA is the atmosphere, which is
+// correlated over seconds and does not average down with more samples.
 static const uint32_t BARO_HZ = 50;
 
 // Diagnostics only. printf promotes float to double by language rule and
@@ -232,34 +230,22 @@ static bool     s_post_pass  = false;
 //
 //    TF Luna lidar   NOT IMPLEMENTED. Declared, wired into the pipeline
 //                    and deliberately inert; see the class.
-//    DWM1000 UWB     IMPLEMENTED. Ranges to four surveyed ground anchors
-//                    and multilaterates a position in the pad frame,
-//                    which the estimator fuses alongside GPS.
+//    DWM1000 UWB     IMPLEMENTED. A separate tag board ranges to four
+//                    surveyed ground anchors and hands the ranges over
+//                    I2C; this board multilaterates a position in the
+//                    pad frame, which the estimator fuses alongside GPS.
 // =====================================================================
 
 // ---------------------------------------------------------------------
-//  Is the ranging library present?
+//  Is UWB flown at all?
 //
-//  The UWB stack needs arduino-dw1000 (thotro), which is not a
-//  dependency of anything else in this repository. Set
-//  ARIADNA_UWB_ENABLED to 0 if it is not installed: the whole UWB path
-//  then compiles out and the board flies exactly as it did before — GPS,
-//  barometer, IMU. The same switch rules the radio out deliberately, for
-//  instance while chasing an SPI fault.
-//
-//  This is a plain switch, not __has_include, on purpose. The Arduino
-//  builder only adds a library's include path once it has seen a real
-//  #include of it, so a __has_include probe ALWAYS reads "absent" — the
-//  radio was compiled out with no warning even with the library
-//  installed. A missing library is now a build error that names it.
+//  The ranging library now lives on the tag board, so this board needs
+//  nothing extra to build. ARIADNA_UWB_ENABLED 0 still rules UWB out
+//  deliberately: the tag is never addressed and the board flies exactly
+//  as it did before UWB existed — GPS, barometer, IMU.
 // ---------------------------------------------------------------------
 #ifndef ARIADNA_UWB_ENABLED
 #  define ARIADNA_UWB_ENABLED 1
-#endif
-
-#if ARIADNA_UWB_ENABLED
-#  include <DW1000Ranging.h>
-#  include <DW1000.h>
 #endif
 
 /** One range measurement, from whichever sensor produced it. */
@@ -403,7 +389,16 @@ static ariadna_uwb_anchor_t s_uwb_anchors[ARIADNA_UWB_MAX_ANCHORS] = {
 static const uint8_t UWB_ANCHOR_COUNT = 4;
 
 /**
- * DWM1000 tag driver.
+ * Client for the UWB tag board.
+ *
+ * The DWM1000 and its ranging stack run on a separate XIAO (../Uwb_Tag)
+ * that answers on the sensor I2C bus at ARIADNA_UWB_I2C_ADDR with the
+ * latest range to every anchor it hears, each with its age. This class
+ * reads that frame, decides which ranges are new, and from there on is
+ * the same driver it always was: per-anchor slots, the jump test, the
+ * sigma model, the snapshot for the solver. Everything that judges a
+ * range stays on this board, next to the anchor table and the speed
+ * estimate it needs.
  *
  * ---------------------------------------------------------------------
  * ROBUSTNESS IS THE WHOLE DESIGN, NOT A FEATURE OF IT
@@ -412,7 +407,8 @@ static const uint8_t UWB_ANCHOR_COUNT = 4;
  * hardware that is not bolted to the vehicle. Anchors run off their own
  * batteries, sit in the grass, and are line-of-sight devices pointed at
  * something that is about to light a rocket motor between them. Assume
- * they will fail, individually and together, at the worst moment.
+ * they will fail, individually and together, at the worst moment — and
+ * now the tag board and its cable can fail too.
  *
  * So every layer here is written to degrade rather than break:
  *
@@ -422,124 +418,57 @@ static const uint8_t UWB_ANCHOR_COUNT = 4;
  *   * A range that is not finite, is negative, or jumps further than the
  *     vehicle could have moved is dropped at the slot, before it can
  *     reach the solver.
- *   * The library's callbacks are static and take a device pointer that
- *     CAN be null. Every one of them checks.
- *   * A hardware fault at begin() leaves _ok false and every later call
- *     becomes a cheap no-op. There is no path from a dead radio to a
- *     stalled estimator.
- *   * Nothing here allocates, blocks, or waits on the radio.
+ *   * A frame that is short, fails its CRC or comes from a different
+ *     protocol version is discarded whole. A tag that is unplugged,
+ *     unpowered or rebooting is a NACK, which costs tens of
+ *     microseconds; every slot then ages out and the solver is simply
+ *     not run.
+ *   * Nothing here allocates. The one blocking call is the frame read,
+ *     about 1.7 ms at 400 kHz, bounded by the Wire timeout set in
+ *     sensors_begin().
  *
  * ---------------------------------------------------------------------
- * THE VOLTINOLABS HARDWARE WORKAROUNDS
+ * SHARING THE SENSOR BUS
  * ---------------------------------------------------------------------
- * Three of them, all from the working anchor example, all necessary on
- * this board and all easy to lose in a refactor:
- *
- *   1. OPEN-DRAIN RESET. The DWM1000's RST is not a push-pull input.
- *      Driving it high can damage the module, so it is pulled LOW to
- *      reset and then released to a floating INPUT. The library is told
- *      the reset pin is 255 precisely so that it never drives it itself.
- *   2. EXPLICIT SPI PIN SELECTION. The RP2350 can put SPI on many pins
- *      and the core's default is not this board's wiring.
- *   3. NO ATTACHED INTERRUPT. The library's ISR path is not reliable on
- *      this core; the IRQ line is polled instead, from poll() below.
- *
- * ---------------------------------------------------------------------
- * SHARING THE SPI BUS WITH THE IMU
- * ---------------------------------------------------------------------
- * The ICM42688P is on the same three wires at 10 MHz. Both drivers use
- * SPI transactions with their own SPISettings, so the clock and mode are
- * re-established per transfer and neither can inherit the other's. What
- * would break this is a driver that calls SPI.setClockDivider() once at
- * startup and assumes it holds — neither of these does.
- *
- * Both devices are also driven from CORE 0 ONLY, which is what makes the
- * bus safe without a lock. If you ever move UWB polling to core 1, you
- * must add one.
+ * The tag sits on the same I2C wires as the BMP580 and the AK09918C, all
+ * of them driven from CORE 0 ONLY, which is what makes the bus safe
+ * without a lock. If you ever move a reader of any of them to core 1,
+ * you must add one.
  */
 class UwbTag {
 public:
     /**
-     * Bring the radio up. Returns false, harmlessly, if the library is
-     * absent or the module does not answer.
+     * Remember the bus and try the tag once, so the POST can report it.
+     * A tag that comes up later — it boots its radio for a few hundred
+     * milliseconds — is picked up by poll(); nothing here is final.
      */
-    bool begin(uint8_t cs, uint8_t rst, uint8_t irq)
+    bool begin(TwoWire &wire)
     {
-        _cs = cs; _rst = rst; _irq = irq;
-        _ok = false;
+        _wire = &wire;
         _fresh = 0;
         _gen = 0;
+        _last_good_ms = 0;
+        _flags = 0;
         for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) slot_clear(i);
-
-        // Deselect before anything else touches the bus: this device
-        // shares SPI with the IMU and a floating CS is a corrupted IMU
-        // transaction.
-        pinMode(_cs, OUTPUT);
-        digitalWrite(_cs, HIGH);
-
+        for (uint8_t i = 0; i < ARIADNA_UWB_LINK_SLOTS; i++) {
+            _seen_addr[i] = 0;
+            _seen_count[i] = 0;
+        }
 #if ARIADNA_UWB_ENABLED
-        // --- workaround 1: open-drain reset ---------------------------
-        pinMode(_rst, OUTPUT);
-        digitalWrite(_rst, LOW);
-        delay(20);
-        pinMode(_rst, INPUT);        // release, do NOT drive high
-        delay(150);
-
-        // --- workaround 2: explicit SPI pins --------------------------
-        SPI.setSCK(PIN_SPI_SCK);
-        SPI.setRX(PIN_SPI_MISO);
-        SPI.setTX(PIN_SPI_MOSI);
-        SPI.begin();
-        pinMode(_irq, INPUT);
-
-        // 255 as the reset pin keeps the library away from RST entirely.
-        DW1000Ranging.initCommunication(255, _cs, _irq);
-
-        // --- workaround 3: no background interrupt --------------------
-        detachInterrupt(digitalPinToInterrupt(_irq));
-
-        DW1000Ranging.attachNewRange(&UwbTag::on_range);
-        DW1000Ranging.attachNewDevice(&UwbTag::on_device);
-        DW1000Ranging.attachInactiveDevice(&UwbTag::on_inactive);
-
-        // startAsTag's third argument is randomShortAddress. False, so
-        // the tag's own address is deterministic too — an anchor that
-        // logs who it ranged with then logs something meaningful.
-        DW1000Ranging.startAsTag((char *)UWB_TAG_EUI,
-                                 DW1000.MODE_LONGDATA_RANGE_ACCURACY, false);
-        _ok = true;
-#else
-        pinMode(_rst, INPUT);
-        pinMode(_irq, INPUT);
+        read_frame();
 #endif
-        s_self = this;
-        return _ok;
+        return present();
     }
 
     /**
-     * Service the ranging stack. Cheap, non-blocking, and safe to call
-     * as often as the loop can manage.
-     *
-     * CALL IT OFTEN. Two-way ranging is a request/response protocol, and
-     * its throughput is set by how promptly the tag answers. At the
-     * estimator's 240 Hz alone the constellation would range at a few
-     * hertz; polled from the idle path as well, it reaches the ten hertz
-     * per anchor the filter is tuned for. The internal throttle below is
-     * what makes the idle-path call safe — the RP2350 will otherwise
-     * hammer the DWM1000 harder than it can answer, which the module
-     * responds to by dropping exchanges.
+     * Read the tag's frame and take in every range that is new since the
+     * last read. Call it right before the solve, so the solver sees the
+     * freshest ranges there are.
      */
     void poll(void)
     {
 #if ARIADNA_UWB_ENABLED
-        if (!_ok) return;
-        const uint32_t now = micros();
-        if ((uint32_t)(now - _last_poll_us) < UWB_POLL_MIN_US) return;
-        _last_poll_us = now;
-
-        // Manual IRQ service, standing in for the attached interrupt.
-        if (digitalRead(_irq) == HIGH) DW1000.handleInterrupt();
-        DW1000Ranging.loop();
+        read_frame();
 #endif
     }
 
@@ -583,20 +512,27 @@ public:
     /**
      * Tell the driver roughly how fast the vehicle is going.
      *
-     * Used only by the jump test in accept(). Written from core 0 at the
-     * solve rate and read from the ranging callback on the same core, so
-     * there is nothing to synchronise.
+     * Used only by the jump test in accept(). Written and read on core 0
+     * at the solve rate, so there is nothing to synchronise.
      */
     void set_speed_hint(float mps)
     {
         _speed_hint = (mps == mps && mps > 0.0f && mps < 200.0f) ? mps : 0.0f;
     }
 
-    bool     healthy(void)   const { return _ok && _fresh > 0; }
-    bool     present(void)   const { return _ok; }
-    uint32_t generation(void) const { return _gen; }
-    uint8_t  fresh(void)     const { return _fresh; }
-    uint32_t rejected(void)  const { return _rejected; }
+    /** The tag answered a good frame within the last second and its
+     *  radio is up. */
+    bool present(void) const
+    {
+        return _last_good_ms != 0 &&
+               (uint32_t)(millis() - _last_good_ms) < UWB_LINK_TIMEOUT_MS &&
+               (_flags & ARIADNA_UWB_LF_RADIO_UP);
+    }
+    bool     healthy(void)     const { return present() && _fresh > 0; }
+    uint32_t generation(void)  const { return _gen; }
+    uint8_t  fresh(void)       const { return _fresh; }
+    uint32_t rejected(void)    const { return _rejected; }
+    uint32_t link_errors(void) const { return _link_errors; }
 
     /** Age out slots. Called once per solve, so `fresh` is never stale. */
     void age(uint32_t now_ms)
@@ -614,14 +550,8 @@ public:
     }
 
 private:
-    // The tag's own EUI. Only its first two bytes matter to the anchors,
-    // and only if they were started with a deterministic short address.
-    static constexpr const char *UWB_TAG_EUI = "AA:00:5B:D5:A9:9A:E2:9C";
-
-    // Minimum microseconds between two services of the ranging stack.
-    // The anchor example uses 300 us; this is the same number, expressed
-    // as a rate limit rather than a delay so that nothing ever blocks.
-    static const uint32_t UWB_POLL_MIN_US = 250;
+    // No good frame for this long and the tag counts as gone.
+    static const uint32_t UWB_LINK_TIMEOUT_MS = 1000;
 
     // Ranging sigma. NOT the DWM1000 datasheet figure, which is about
     // 10 cm in a laboratory. This is what a range is worth on a launch
@@ -671,13 +601,57 @@ private:
     }
 
     /**
+     * One read of the tag's frame. A range is new when its tag slot shows
+     * a different anchor or a different count than the last read did;
+     * the same range read twice is fed in once.
+     *
+     * The range's time is THIS board's clock at the end of the read,
+     * minus the age the tag reported. The two boards share no clock, and
+     * this is the only place the difference matters.
+     */
+    void read_frame(void)
+    {
+        if (!_wire) return;
+        uint8_t buf[ARIADNA_UWB_LINK_FRAME_SIZE];
+        const size_t want = sizeof(buf);
+        const size_t got  = _wire->requestFrom((uint8_t)ARIADNA_UWB_I2C_ADDR, want);
+        size_t n = 0;
+        while (_wire->available()) {
+            const int c = _wire->read();
+            if (n < want) buf[n++] = (uint8_t)c;
+        }
+        const uint32_t t_done = millis();
+
+        ariadna_uwb_link_frame_t f;
+        if (got != want || n != want ||
+            ariadna_uwb_link_decode(buf, n, &f) != ARIADNA_UWB_LINK_OK) {
+            // Nobody there is a NACK and got == 0. Counted only once the
+            // tag has been seen, so an absent tag does not read as a
+            // stream of errors.
+            if (_last_good_ms != 0 || got != 0) _link_errors++;
+            return;
+        }
+        _last_good_ms = t_done ? t_done : 1;
+        _flags = f.flags;
+
+        for (uint8_t i = 0; i < ARIADNA_UWB_LINK_SLOTS; i++) {
+            const ariadna_uwb_link_slot_t &s = f.slot[i];
+            if (!s.valid) { _seen_addr[i] = 0; continue; }
+            if (s.addr == _seen_addr[i] && s.count == _seen_count[i]) continue;
+            _seen_addr[i]  = s.addr;
+            _seen_count[i] = s.count;
+            accept(s.addr, s.range_m, (float)s.rxp_dbm, t_done - s.age_ms);
+        }
+    }
+
+    /**
      * Accept one range into an anchor's slot.
      *
      * This is where a bad measurement is stopped. Everything downstream
      * — the solver, the innovation gate, the filter — is cheaper and more
      * honest if nonsense never gets past here.
      */
-    void accept(uint16_t addr, float range_m, float rx_power_dbm)
+    void accept(uint16_t addr, float range_m, float rx_power_dbm, uint32_t t_ms)
     {
         const int slot = ariadna_uwb_find(s_uwb_anchors, UWB_ANCHOR_COUNT, addr);
         if (slot < 0) { _rejected++; return; }     // not one of ours
@@ -685,7 +659,6 @@ private:
         if (!(range_m == range_m)) { _rejected++; return; }          // NaN
         if (!(range_m > 0.05f && range_m < 300.0f)) { _rejected++; return; }
 
-        const uint32_t now = millis();
         Slot &s = _slot[slot];
 
         // Jump test, but only against a RECENT previous range. After a
@@ -693,16 +666,16 @@ private:
         // to re-acquire an anchor that went quiet for a second would turn
         // a momentary outage into a permanent one.
         const float gap_s = (s.last_ms != 0)
-                                ? (float)(uint32_t)(now - s.last_ms) * 1e-3f
+                                ? (float)(uint32_t)(t_ms - s.last_ms) * 1e-3f
                                 : 0.0f;
         const float allowed = UWB_JUMP_BASE_M +
                               (_speed_hint + UWB_JUMP_MARGIN_MS) * gap_s;
 
-        if (s.last_ms != 0 && (uint32_t)(now - s.last_ms) < 500u &&
+        if (s.last_ms != 0 && (uint32_t)(t_ms - s.last_ms) < 500u &&
             fabsf(range_m - s.last_range) > allowed) {
             _rejected++;
             s.last_range = range_m;    // but remember it: two agreeing
-            s.last_ms    = now;        // outliers are a real move
+            s.last_ms    = t_ms;       // outliers are a real move
             return;
         }
 
@@ -716,56 +689,25 @@ private:
 
         s.range_m    = range_m;
         s.sigma_m    = sigma;
-        s.t_ms       = now;
+        s.t_ms       = t_ms;
         s.last_range = range_m;
-        s.last_ms    = now;
+        s.last_ms    = t_ms;
         s.have       = true;
         _gen++;
     }
 
-    // --- library callbacks ---------------------------------------------
-    //
-    // The arduino-dw1000 API is C-style: it takes function pointers with
-    // no context, so the driver instance is reached through a file-scope
-    // pointer. There is exactly one tag on this board, which is what
-    // makes that acceptable. Every callback tolerates a null device
-    // pointer and a null instance — the library has been observed to call
-    // back during teardown.
-#if ARIADNA_UWB_ENABLED
-    static void on_range(void)
-    {
-        if (!s_self) return;
-        DW1000Device *d = DW1000Ranging.getDistantDevice();
-        if (!d) return;
-        s_self->accept(d->getShortAddress(), d->getRange(), d->getRXPower());
-    }
-
-    /** A new anchor answered. The slot machinery needs nothing from us. */
-    static void on_device(DW1000Device *d) { (void)d; }
-
-    /**
-     * An anchor stopped answering. Also nothing: the slot ages out on its
-     * own timestamp, which is the mechanism that has to work anyway when
-     * the library does not notice. Attached only so that the library does
-     * not fall back to its default handler, which prints to Serial from
-     * inside the ranging path.
-     */
-    static void on_inactive(DW1000Device *d) { (void)d; }
-#endif
-
-    uint8_t  _cs = 0, _rst = 0, _irq = 0;
-    bool     _ok = false;
+    TwoWire *_wire = nullptr;
+    uint8_t  _flags = 0;
     uint8_t  _fresh = 0;
     uint32_t _gen = 0;
     uint32_t _rejected = 0;
-    uint32_t _last_poll_us = 0;
+    uint32_t _link_errors = 0;
+    uint32_t _last_good_ms = 0;
     float    _speed_hint = 0.0f;
     Slot     _slot[ARIADNA_UWB_MAX_ANCHORS];
-
-    static UwbTag *s_self;
+    uint16_t _seen_addr[ARIADNA_UWB_LINK_SLOTS];
+    uint8_t  _seen_count[ARIADNA_UWB_LINK_SLOTS];
 };
-
-UwbTag *UwbTag::s_self = nullptr;
 
 static LidarTFLuna s_lidar;
 static UwbTag      s_uwb;
@@ -1771,7 +1713,7 @@ public:
     static constexpr float BIAS_LIMIT     = 1.5f;    // m/s^2, as before
 
     // BARO_SIGMA is set from the ATMOSPHERE, not from the BMP580's noise
-    // figure. Per sample the sensor contributes centimetres at OSR x16.
+    // figure. Per sample the sensor contributes centimetres even at 240 Hz.
     // What does not average down is the air — gusts, the vehicle's own
     // wake, ground effect near the pad — which is correlated over
     // seconds. Quoting the sensor's number here would make the filter
@@ -2238,7 +2180,26 @@ static bool sensors_begin(void)
 
     // Hybrid: the IMU on SPI at 10 MHz where the bandwidth matters, the
     // barometer and magnetometer on I2C where it does not.
+    //
+    // THE IMU'S SPI BUS IS ITS OWN. The module drives SCK and MOSI itself
+    // whenever the IMU is not selected, so nothing else may sit on those
+    // wires, and the MCU must not drive them between transfers either —
+    // releasing SCK/MOSI between transfers is the TriSense library's job.
+    // A library that keeps them driven leaves two drivers fighting (tens
+    // of mA, and switching noise next to the barometer).
     bool ok = sensor.beginAll(MODE_HYBRID, PIN_TRISENSE_CS, TRISENSE_SPI_HZ, SENSOR_I2C);
+
+    // 400 kHz, not the core's 100 kHz default, which beginAll() leaves in
+    // place. The UWB tag's 74-byte frame shares this bus and takes 1.7 ms
+    // at 400 kHz against 6.8 ms at 100 kHz — on the core that runs the
+    // 240 Hz estimator. The BMP580, the AK09918C and the TF Luna are all
+    // fast-mode parts.
+    //
+    // The timeout bounds every transaction on this bus: a tag that hangs
+    // with SCL stretched, or a stuck slave, costs at most 10 ms and
+    // resets the I2C block, instead of stalling core 0.
+    SENSOR_I2C.setClock(400000);
+    SENSOR_I2C.setTimeout(10, true);
 
     s_sensor_ok = 0;
     if (ok) s_sensor_ok |= ARIADNA_SENS_IMU | ARIADNA_SENS_BARO | ARIADNA_SENS_MAG;
@@ -2252,17 +2213,24 @@ static bool sensors_begin(void)
     sensor.imu.setFIFOMode(FIFO_16BIT);
 
     // ---- barometer ---------------------------------------------------
-    // Heavy pressure oversampling, light temperature oversampling, and a
-    // short IIR. The BMP580 is the only absolute altitude reference above
-    // the height a lidar would work at, so its noise floor is worth paying
-    // for in conversion time.
+    // The highest output rate the BMP580 has, 240 Hz, and therefore the
+    // oversampling that rate allows: OSR_P x2 with OSR_T x1. Not every pair
+    // is possible. The datasheet's table 7 (BST-BMP580-DS004, "maximum
+    // nominal ODR setting per OSR settings in NORMAL mode") caps 240 Hz at
+    // OSR_P x2; the x16 this used to ask for is good for 80 Hz at most. An
+    // impossible pair is NOT refused — the part keeps the ODR, quietly drops
+    // BOTH oversampling rates to x1 and clears OSR_EFF.odr_is_valid — so the
+    // old setting was in fact flying at x1/x1 while the comments here
+    // described x16.
     //
-    // The IIR is deliberately mild: the estimator in section 7 is already a
-    // filter, and filtering twice adds phase lag that the vertical channel
-    // then has to fight. Anything past IIR_3 here shows up as lag in vz.
-    sensor.bmp.setOversampling(BMP580_OSR_x16, BMP580_OSR_x2);
+    // The IIR stays mild: at 240 Hz IIR_3 averages over a few samples, which
+    // buys back most of the oversampling, while the estimator in section 7
+    // is already a filter, and filtering twice adds phase lag that the
+    // vertical channel then has to fight. Anything past IIR_3 here shows up
+    // as lag in vz.
+    sensor.bmp.setOversampling(BMP580_OSR_x2, BMP580_OSR_x1);
     sensor.bmp.setIIRFilter(BMP580_IIR_3, BMP580_IIR_OFF);
-    sensor.bmp.setODR(BMP580_ODR_240Hz);   // free-running well above BARO_HZ
+    sensor.bmp.setODR(BMP580_ODR_240Hz);   // max ODR; valid with x2/x1
 
     // ---- fusion ------------------------------------------------------
     // Mount orientation: TriSense Z-up on a vehicle standing on the pad.
@@ -2668,10 +2636,6 @@ void setup()
 {
     Serial.begin(ARIADNA_CONSOLE_BAUD);
 
-    pinMode(PIN_UWB_CS, OUTPUT);
-    digitalWrite(PIN_UWB_CS, HIGH);      // deselect before SPI comes up:
-                                         // it shares the bus with the IMU
-
     // The annunciator first: from here on every failure below has a
     // colour, and a board that dies in sensors_begin() still says so.
     ariadna_rgb_begin(&s_rgb, POS_RGB_BRIGHTNESS, ARIADNA_RGB_POWER_PIN);
@@ -2683,7 +2647,7 @@ void setup()
 
     ariadna_uwb_cfg_default(&s_uwb_cfg);
     memset(&s_uwb_fix, 0, sizeof(s_uwb_fix));
-    const bool uwb_ok = s_uwb.begin(PIN_UWB_CS, PIN_UWB_RST, PIN_UWB_INT);
+    const bool uwb_ok = s_uwb.begin(SENSOR_I2C);
     s_lidar.begin();
 
     // Level the attitude estimate against gravity. The vehicle must be
@@ -2695,12 +2659,16 @@ void setup()
     }
 
     s_post_pass = self_test() && sensors;
-    POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s, UWB %s)\n",
+    // The tag is a separate board that may still be booting its radio, so
+    // "not answering yet" is not a POST failure; the status packet's
+    // ARIADNA_SENS_UWB bit says when it is actually ranging.
+    POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s, UWB tag %s)\n",
               s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL",
-              uwb_ok ? "up" : (ARIADNA_UWB_ENABLED ? "FAIL" : "not built"));
-    if (uwb_ok)
-        POS_PRINT("# UWB: %u anchors configured, solve at %lu Hz\n",
-                  (unsigned)UWB_ANCHOR_COUNT, (unsigned long)UWB_SOLVE_HZ);
+              uwb_ok ? "up" : (ARIADNA_UWB_ENABLED ? "not answering yet" : "not built"));
+    if (ARIADNA_UWB_ENABLED)
+        POS_PRINT("# UWB: tag at I2C 0x%02X, %u anchors configured, read + solve at %lu Hz\n",
+                  (unsigned)ARIADNA_UWB_I2C_ADDR, (unsigned)UWB_ANCHOR_COUNT,
+                  (unsigned long)UWB_SOLVE_HZ);
 
     // The Master link belongs to core 0: it transmits, so it owns the DMA
     // ring. Core 1 only receives, which needs no state of its own.
@@ -2734,17 +2702,11 @@ void loop()
 
     // ---- the idle path ---------------------------------------------------
     //
-    // Everything below the estimator's tick rate happens HERE, in the time
-    // between steps, because two-way ranging throughput is set by how
-    // promptly the tag answers an anchor. Polled only once per 240 Hz tick
-    // the constellation would range at a few hertz; polled from the idle
-    // path it reaches the ten hertz per anchor the filter is tuned for.
-    //
-    // Both calls are internally rate limited and neither blocks, so this
-    // costs the idle core and nothing else. THE ORDER MATTERS: the return
-    // below is what makes this the idle path, so anything placed after it
-    // runs at 240 Hz instead.
-    s_uwb.poll();
+    // Only the annunciator lives here now. UWB ranging used to be polled
+    // from this path; it runs on its own board since the tag moved off the
+    // IMU's SPI bus, and is read once per solve instead. THE ORDER
+    // MATTERS: the return below is what makes this the idle path, so
+    // anything placed after it runs at 240 Hz instead.
     ariadna_rgb_service(&s_rgb);
 
     if ((int32_t)(now - next_us) < 0) return;
@@ -2934,9 +2896,9 @@ void loop()
 
     // ---- UWB --------------------------------------------------------------
     //
-    // Ranges arrive asynchronously into the driver's per-anchor slots at
-    // roughly 10 Hz each; the multilateration runs at UWB_SOLVE_HZ and
-    // only when something has actually changed. Solving faster than the
+    // The tag board ranges at roughly 10 Hz per anchor; this board reads
+    // its frame once per solve, at UWB_SOLVE_HZ, right before solving, and
+    // the multilateration runs only when something has actually changed. Solving faster than the
     // ranges arrive would re-fuse the same measurement repeatedly, which
     // is the same mistake the barometer's baro_fresh flag exists to
     // prevent, with the same consequence: a filter that believes it has
@@ -2946,9 +2908,10 @@ void loop()
     // Nothing here counts anchors or branches on how many answered — the
     // solver reports what the geometry supported and the estimator
     // weights it. A dead anchor costs accuracy and nothing else.
-    if (s_uwb.present() && (uint32_t)(now_ms - last_uwb_solve_ms) >=
-                               (1000u / UWB_SOLVE_HZ)) {
+    if (ARIADNA_UWB_ENABLED &&
+        (uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
         last_uwb_solve_ms = now_ms;
+        s_uwb.poll();                    // ~1.7 ms of I2C at 400 kHz
         s_uwb.age(now_ms);
 
         if (s_uwb.fresh() == 0) {
