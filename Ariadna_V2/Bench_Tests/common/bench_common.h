@@ -88,7 +88,7 @@ enum {
 };
 static const char *const POSITION_TEST_NAME[PT_N] = {
     "I2C_BUS", "IMU_ID", "IMU_DATA", "BARO_ID", "BARO_DATA",
-    "MAG_ID", "MAG_DATA", "LIDAR", "GPS_NMEA", "GPS_FIX", "UWB_ID",
+    "MAG_ID", "MAG_DATA", "LIDAR", "GPS_NMEA", "GPS_FIX", "UWB_TAG",
     "UWB_RANGE", "CORE1", "LINK_MASTER", "LINK_NAV"
 };
 

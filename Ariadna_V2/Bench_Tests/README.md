@@ -8,13 +8,13 @@ over it afterwards.
 | sketch | board | libraries |
 |---|---|---|
 | `Master_Test/Master_Test.ino` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_Test/Position_Test.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel, arduino-dw1000\* |
+| `Position_Test/Position_Test.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Navigation_Test/Navigation_Test.ino` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 
-\* Set `UWB_LIB` to 0 in `Position_Test.ino` if arduino-dw1000 is not installed: the
-DWM1000 is still identified by its DEV_ID register, only ranging is skipped. The
-registry version (0.9.0) does not build on arduino-pico as shipped — add `return -1;`
-as the last line of `DW1000RangingClass::detectMessageType()` in `DW1000Ranging.cpp`.
+The Position test no longer needs arduino-dw1000: UWB is read from the tag board over
+I²C, and the tag board (`../Uwb_Tag`) is the one that needs the library. The registry
+version (0.9.0) does not build on arduino-pico as shipped — add `return -1;` as the last
+line of `DW1000RangingClass::detectMessageType()` in `DW1000Ranging.cpp`.
 
 Each sketch folder is self-contained (no `../` includes), so it opens and builds in
 Arduino IDE or `arduino-cli` directly. Console: **115200 baud**, any terminal.
@@ -54,8 +54,10 @@ one passes or fails on its own: I²C idle levels and scan, ICM42688P (WHO_AM_I a
 10 MHz, retried at 1 MHz to tell a wiring problem from a dead chip; |a| ≈ 1 g at rest,
 frozen-data detection), BMP580 (CHIP_ID, pressure, temperature, noise in Pa and cm),
 AK09918C (WIA, |B|, overflow), TF Luna (optional), LK76 GPS (auto-baud 9600 / 115200 /
-38400 / 57600, checksummed NMEA, fix, satellites, HDOP), DWM1000 (DEV_ID, then ranging
-to anchors 1–4), core 1, links to Master and to Navigation.
+38400 / 57600, checksummed NMEA, fix, satellites, HDOP), the UWB tag board at I²C
+`0x2A` (`UWB_TAG`: frame CRC, the tag's radio up; `UWB_RANGE`: ranges to anchors 1–4),
+core 1, links to Master and to Navigation. The IMU's SCK and MOSI are released between
+transfers, as the TriSense library does in flight.
 
 **Navigation** — pyro continuity on all three channels (raw ADC counts, present /
 open, and a floating input flagged by its noise), pyro outputs held LOW and read back,

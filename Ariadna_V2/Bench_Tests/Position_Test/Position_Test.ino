@@ -2,9 +2,8 @@
 //  Ariadna V2 — POSITION MCU bench test
 //
 //  Target: Seeed XIAO RP2350, arduino-pico core.
-//  Needs:  Adafruit_NeoPixel, arduino-dw1000 (thotro). Without the latter
-//          set UWB_LIB to 0: the UWB chip is still identified, only
-//          ranging is skipped.
+//  Needs:  Adafruit_NeoPixel. Nothing for UWB: the tag is a separate
+//          board (../../Uwb_Tag) read over I2C.
 //
 //  Every sensor is talked to by its raw registers, not through TriSense,
 //  so each one passes or fails ON ITS OWN and a dead chip cannot take the
@@ -16,12 +15,17 @@
 //    AK09918C    WIA, field strength                       I2C 0x0C
 //    TF Luna     distance / signal (optional sensor)       I2C 0x10
 //    LK76 GPS    NMEA at 9600 or 115200 (auto), fix, sats  PIO UART D11/D12
-//    DWM1000     DEV_ID, then ranging to the 4 anchors     SPI, CS D2
+//    UWB tag     frame from the tag board, ranges to the   I2C 0x2A
+//                4 anchors (flash ../../Uwb_Tag on it)
 //    RGB LED, core 1, link to the Master, link to Navigation (via Master)
 //
 //  NOTHING BLOCKS. I2C has a 10 ms timeout, every sensor that fails is
 //  re-probed every few seconds (so it can be plugged in live), and the GPS
-//  and UWB are serviced a few bytes / one step at a time.
+//  is serviced a few bytes at a time.
+//
+//  The IMU's SPI pins are released between transfers, exactly as the
+//  TriSense library (1.6.0+) does in flight: the module drives SCK and
+//  MOSI itself whenever the IMU is not selected, so the MCU must not.
 //
 //  USB serial, 115200 baud. Commands: h help, p summary, i I2C scan,
 //  g raw GPS echo on/off.
@@ -34,27 +38,12 @@
 #include <math.h>
 #include "bench_common.h"
 
-// UWB ranging needs arduino-dw1000 (thotro). Set to 0 if it is not
-// installed: the DW1000 is then still identified by its DEV_ID register,
-// only the ranging test is skipped.
-//
-// This is a plain switch on purpose. `__has_include` does NOT work for
-// this: the Arduino builder only adds a library's include path when it
-// sees a real #include, so a __has_include guard always reads "absent"
-// and the radio would be compiled out without a word.
-#define UWB_LIB 1
-
-#if UWB_LIB
-#  include <DW1000Ranging.h>
-#  include <DW1000.h>
-#endif
+#include "ariadna_uwb_link.h"
 
 // =====================================================================
 //  1. PINS — identical to Position_MCU/Position_MCU.ino
 // =====================================================================
-static const uint8_t PIN_UWB_INT     = D0;
-static const uint8_t PIN_UWB_RST     = D1;   // OPEN DRAIN: never drive it high
-static const uint8_t PIN_UWB_CS      = D2;
+// D0, D1, D2 are free: the DWM1000 moved to its own board on I2C.
 static const uint8_t PIN_IMU_CS      = D3;   // TriSense ICM42688P
 static const uint8_t PIN_I2C_SDA     = D4;
 static const uint8_t PIN_I2C_SCL     = D5;
@@ -73,10 +62,9 @@ static const uint8_t PIN_RGB_POWER   = 23;
 // pins are ever moved.
 static TwoWire &I2C = (((PIN_I2C_SDA >> 1) & 1) ? Wire1 : Wire);
 
-// The UWB chip and the IMU share SPI0; every transfer sets its own speed.
+// SPI0 belongs to the IMU alone.
 static SPISettings s_imu_spi(10000000, MSBFIRST, SPI_MODE0);   // flight speed
 static SPISettings s_imu_spi_slow(1000000, MSBFIRST, SPI_MODE0);
-static SPISettings s_uwb_spi(2000000, MSBFIRST, SPI_MODE0);    // DW1000 before PLL lock
 
 static const uint8_t ADDR_BMP_A  = 0x47;
 static const uint8_t ADDR_BMP_B  = 0x46;
@@ -85,9 +73,8 @@ static const uint8_t ADDR_LIDAR  = 0x10;
 
 static const uint32_t GPS_BAUDS[] = { 9600, 115200, 38400, 57600 };
 
-// The anchors' short addresses (Uwb_Anchor sketch, ANCHOR_ID 1..4) and the
-// tag identity the flight firmware uses.
-static const char *UWB_TAG_EUI __attribute__((unused)) = "AA:00:5B:D5:A9:9A:E2:9C";
+// The anchors' short addresses are 0x0001..0x0004 (Uwb_Anchor sketch,
+// ANCHOR_ID 1..4); the tag board reports ranges by those addresses.
 
 // =====================================================================
 //  2. STATE
@@ -130,7 +117,8 @@ static const char *i2c_name(uint8_t a)
     case ADDR_BMP_A: case ADDR_BMP_B: return "BMP580";
     case ADDR_MAG:   return "AK09918C";
     case ADDR_LIDAR: return "TF-Luna";
-    case 0x68: case 0x69: return "ICM42688(I2C?)";
+    case 0x68: case 0x69: return "ICM42688(CS high)";
+    case ARIADNA_UWB_I2C_ADDR: return "UWB tag";
     default: return "?";
     }
 }
@@ -157,15 +145,28 @@ static bool     s_imu_slow = false;
 static float    s_ax, s_ay, s_az, s_gx, s_gy, s_gz, s_imu_t;
 static uint32_t s_imu_reads = 0, s_imu_fail = 0, s_imu_stuck = 0;
 
+// The TriSense level shifter on SCK/MOSI points AT the MCU while CS is
+// HIGH, so the MCU drives those pins only inside a transfer: CS low first
+// (the shifter turns round), then the pins; pins released first, then CS
+// high. Otherwise two push-pull drivers fight on each line, ~15-25 mA.
+static void spi_pins_release(void)
+{
+    gpio_set_function(PIN_SPI_SCK, GPIO_FUNC_NULL);
+    gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_NULL);
+}
+
 static void imu_rw(uint8_t reg, uint8_t *buf, uint8_t n, bool read)
 {
     SPI.beginTransaction(s_imu_slow ? s_imu_spi_slow : s_imu_spi);
     digitalWrite(PIN_IMU_CS, LOW);
+    gpio_set_function(PIN_SPI_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
     SPI.transfer(read ? (uint8_t)(reg | 0x80) : reg);
     for (uint8_t i = 0; i < n; i++) {
         uint8_t b = SPI.transfer(read ? 0x00 : buf[i]);
         if (read) buf[i] = b;
     }
+    spi_pins_release();
     digitalWrite(PIN_IMU_CS, HIGH);
     SPI.endTransaction();
 }
@@ -551,98 +552,116 @@ static void gps_service(void)
 }
 
 // =====================================================================
-//  9. DWM1000 UWB — DEV_ID by raw SPI, then (with the library) ranging
+//  9. UWB TAG — the separate tag board, read over I2C
+//
+//  The tag (an anchor PCB flashed with Uwb_Tag) sits on this bus at
+//  ARIADNA_UWB_I2C_ADDR and answers every read with a 74-byte frame: the
+//  latest range to each anchor it hears. UWB_TAG checks the link and the
+//  tag's radio, UWB_RANGE the ranges themselves.
 // =====================================================================
-static bool     s_uwb_id_ok = false;
-static bool     s_uwb_ranging __attribute__((unused)) = false;
+static ariadna_uwb_link_frame_t s_tag;
+static bool     s_tag_seen = false;
+static uint32_t s_tag_ok_ms = 0, s_tag_reads = 0, s_tag_bad = 0, s_tag_nack = 0;
+static uint16_t s_tag_seq_prev = 0;
+static uint32_t s_tag_seq_stuck = 0;
 static float    s_uwb_range[5];      // index = anchor short address 1..4
 static float    s_uwb_rxp[5];
-static uint32_t s_uwb_ms[5] __attribute__((unused)), s_uwb_count[5];
+static uint32_t s_uwb_ms[5], s_uwb_count[5];
+static uint8_t  s_uwb_last_count[5];
 
-static uint32_t uwb_dev_id(void)
+/** One frame read. Returns the decoder's verdict, or 1 for no answer. */
+static int tag_read(void)
 {
-    uint8_t b[4];
-    SPI.beginTransaction(s_uwb_spi);
-    digitalWrite(PIN_UWB_CS, LOW);
-    SPI.transfer(0x00);                   // read, register file 0x00 = DEV_ID
-    for (uint8_t i = 0; i < 4; i++) b[i] = SPI.transfer(0x00);
-    digitalWrite(PIN_UWB_CS, HIGH);
-    SPI.endTransaction();
-    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-}
-
-#if UWB_LIB
-static void uwb_on_range(void)
-{
-    DW1000Device *d = DW1000Ranging.getDistantDevice();
-    if (!d) return;
-    uint16_t a = d->getShortAddress();
-    if (a >= 1 && a <= 4) {
-        s_uwb_range[a] = d->getRange();
-        s_uwb_rxp[a]   = d->getRXPower();
-        s_uwb_ms[a]    = millis();
-        s_uwb_count[a]++;
+    uint8_t buf[ARIADNA_UWB_LINK_FRAME_SIZE];
+    const size_t got = I2C.requestFrom((uint8_t)ARIADNA_UWB_I2C_ADDR, sizeof(buf));
+    size_t n = 0;
+    while (I2C.available()) {
+        const int c = I2C.read();
+        if (n < sizeof(buf)) buf[n++] = (uint8_t)c;
     }
-}
-static void uwb_on_device(DW1000Device *d)
-{
-    bench_printf("[%8.2f s] EVENT UWB anchor 0x%04X joined\n", (double)bench_t_s(), d->getShortAddress());
-}
-static void uwb_on_inactive(DW1000Device *d)
-{
-    bench_printf("[%8.2f s] EVENT UWB anchor 0x%04X went quiet\n", (double)bench_t_s(), d->getShortAddress());
-}
-#endif
+    const uint32_t t_done = millis();
+    if (got == 0) { s_tag_nack++; return 1; }
+    s_tag_reads++;
 
-static void uwb_begin(void)
-{
-    // Open-drain reset: pull low, then RELEASE (input). Never drive it high.
-    pinMode(PIN_UWB_RST, OUTPUT);
-    digitalWrite(PIN_UWB_RST, LOW);
-    delay(2);
-    pinMode(PIN_UWB_RST, INPUT);
-    delay(10);
+    ariadna_uwb_link_frame_t f;
+    const int r = ariadna_uwb_link_decode(buf, n, &f);
+    if (r != ARIADNA_UWB_LINK_OK) { s_tag_bad++; return r; }
 
-    uint32_t id = uwb_dev_id();
-    if (id == 0xDECA0130) {
-        s_uwb_id_ok = true;
-        bench_set(PT_UWB_ID, ST_PASS, "DW1000 DEV_ID 0x%08lX", (unsigned long)id);
-    } else {
-        bench_set(PT_UWB_ID, ST_FAIL, "DEV_ID 0x%08lX, want 0xDECA0130 - CS D2, SPI, 3V3", (unsigned long)id);
-        return;
+    // A frame counter that never moves means the tag answers from a
+    // buffer it stopped refreshing - a hung core 0 on the tag.
+    if (s_tag_seen && f.seq == s_tag_seq_prev) s_tag_seq_stuck++;
+    s_tag_seq_prev = f.seq;
+    s_tag = f;
+    s_tag_seen = true;
+    s_tag_ok_ms = t_done;
+
+    for (uint8_t i = 0; i < ARIADNA_UWB_LINK_SLOTS; i++) {
+        const ariadna_uwb_link_slot_t &s = f.slot[i];
+        if (!s.valid) continue;
+        if (s.addr >= 1 && s.addr <= 4) {
+            const uint16_t a = s.addr;
+            if (s_uwb_count[a] == 0 || s.count != s_uwb_last_count[a]) {
+                s_uwb_count[a]++;
+                s_uwb_last_count[a] = s.count;
+            }
+            s_uwb_range[a] = s.range_m;
+            s_uwb_rxp[a]   = (float)s.rxp_dbm;
+            s_uwb_ms[a]    = t_done - s.age_ms;
+        } else {
+            static uint16_t reported = 0;
+            if (reported != s.addr) {
+                reported = s.addr;
+                bench_printf("[%8.2f s] EVENT UWB range from unknown anchor 0x%04X - "
+                             "ANCHOR_ID outside 1..4?\n", (double)bench_t_s(), s.addr);
+            }
+        }
     }
-#if UWB_LIB
-    DW1000Ranging.initCommunication(255, PIN_UWB_CS, PIN_UWB_INT);   // 255: library never touches RST
-    detachInterrupt(digitalPinToInterrupt(PIN_UWB_INT));             // IRQ is polled, as in flight
-    DW1000Ranging.attachNewRange(uwb_on_range);
-    DW1000Ranging.attachNewDevice(uwb_on_device);
-    DW1000Ranging.attachInactiveDevice(uwb_on_inactive);
-    DW1000Ranging.startAsTag((char *)UWB_TAG_EUI, DW1000.MODE_LONGDATA_RANGE_ACCURACY, false);
-    s_uwb_ranging = true;
-#endif
+    return r;
 }
 
 static void uwb_service(void)
 {
-    static uint32_t next_ms = 0, retry_ms = 0;
-    if (!s_uwb_id_ok) {
-        if (millis() >= retry_ms) { retry_ms = millis() + 5000; uwb_begin(); }
-        bench_set(PT_UWB_RANGE, ST_FAIL, "no DW1000");
+    static uint32_t next_read = 0, next_verdict = 0;
+    static int last = 1;
+    // 10 Hz: enough to see every range at the tag's ~10 Hz per anchor.
+    if (millis() >= next_read) {
+        next_read = millis() + 100;
+        last = tag_read();
+    }
+    if (millis() < next_verdict) return;
+    next_verdict = millis() + 500;
+
+    // --- UWB_TAG: link and radio ------------------------------------------
+    const bool fresh = s_tag_seen && millis() - s_tag_ok_ms < 1500;
+    if (!s_tag_seen) {
+        if (last == 1)
+            bench_set(PT_UWB_ID, millis() < 5000 ? ST_PEND : ST_FAIL,
+                      "no answer at 0x%02X - uSup cable to I2CP, tag powered, flashed with Uwb_Tag?",
+                      ARIADNA_UWB_I2C_ADDR);
+        else
+            bench_set(PT_UWB_ID, ST_FAIL, "answers at 0x%02X but frame bad (%s) - Uwb_Tag version?",
+                      ARIADNA_UWB_I2C_ADDR,
+                      last == ARIADNA_UWB_LINK_E_VERSION ? "protocol version" :
+                      last == ARIADNA_UWB_LINK_E_CRC ? "CRC" : "short/magic");
+    } else if (!fresh) {
+        bench_set(PT_UWB_ID, ST_FAIL, "tag stopped answering %lu ms ago - cable or tag reset?",
+                  (unsigned long)(millis() - s_tag_ok_ms));
+    } else if (!(s_tag.flags & ARIADNA_UWB_LF_RADIO_UP)) {
+        bench_set(PT_UWB_ID, ST_FAIL, "tag answers, but its DWM1000 is not up - tag's SPI/3V3/RST");
+    } else if (s_tag_bad > s_tag_reads / 20 + 1 || s_tag_seq_stuck > 2) {
+        bench_set(PT_UWB_ID, ST_WARN, "radio up, %lu frames, %lu bad, %lu stale - pull-ups/cable length?",
+                  (unsigned long)s_tag_reads, (unsigned long)s_tag_bad,
+                  (unsigned long)s_tag_seq_stuck);
+    } else {
+        bench_set(PT_UWB_ID, ST_PASS, "tag 0x%02X radio up, %lu frames, %lu bad",
+                  ARIADNA_UWB_I2C_ADDR, (unsigned long)s_tag_reads, (unsigned long)s_tag_bad);
+    }
+
+    // --- UWB_RANGE: what the anchors say ----------------------------------
+    if (!fresh || !(s_tag.flags & ARIADNA_UWB_LF_RADIO_UP)) {
+        bench_set(PT_UWB_RANGE, ST_FAIL, "no tag");
         return;
     }
-#if UWB_LIB
-    static uint32_t last_poll_us = 0;
-    if (s_uwb_ranging && micros() - last_poll_us >= 500) {
-        last_poll_us = micros();
-        if (digitalRead(PIN_UWB_INT) == HIGH) DW1000.handleInterrupt();
-        DW1000Ranging.loop();
-    }
-#endif
-    if (millis() < next_ms) return;
-    next_ms = millis() + 500;
-#if !UWB_LIB
-    bench_set(PT_UWB_RANGE, ST_SKIP, "arduino-dw1000 library not installed - chip ID only");
-#else
     char buf[72];
     int n = 0;
     uint8_t live = 0;
@@ -658,7 +677,6 @@ static void uwb_service(void)
         bench_set(PT_UWB_RANGE, ST_PEND, "listening for anchors...");
     else
         bench_set(PT_UWB_RANGE, ST_FAIL, "no anchor ranges - anchors on? flashed with ANCHOR_ID 1..4?");
-#endif
 }
 
 // =====================================================================
@@ -726,7 +744,8 @@ static void print_summary(void)
     bench_printf("  MAG  %+.1f %+.1f %+.1f uT | LIDAR %u cm sig %u | GPS %lu B q%d sats %d\n",
                  (double)s_mx, (double)s_my, (double)s_mz, s_lidar_cm, s_lidar_amp,
                  (unsigned long)s_gps_bytes, s_gps_fixq, s_gps_sats);
-    bench_printf("  UWB  %s", s_uwb_id_ok ? "" : "chip missing");
+    bench_printf("  UWB  %s", !s_tag_seen ? "no tag" :
+                 (s_tag.flags & ARIADNA_UWB_LF_RADIO_UP) ? "tag up " : "tag radio DOWN ");
     for (uint8_t a = 1; a <= 4; a++)
         if (s_uwb_count[a]) bench_printf("A%u %.2f m %.0f dBm (%lu)  ", a, (double)s_uwb_range[a],
                                          (double)s_uwb_rxp[a], (unsigned long)s_uwb_count[a]);
@@ -758,11 +777,8 @@ static void console_service(void)
 // =====================================================================
 void setup()
 {
-    // Both SPI chip selects high before anything touches the shared bus.
+    // IMU deselected before anything touches SPI.
     pinMode(PIN_IMU_CS, OUTPUT); digitalWrite(PIN_IMU_CS, HIGH);
-    pinMode(PIN_UWB_CS, OUTPUT); digitalWrite(PIN_UWB_CS, HIGH);
-    pinMode(PIN_UWB_RST, INPUT);
-    pinMode(PIN_UWB_INT, INPUT);
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(PIN_RGB_POWER, OUTPUT); digitalWrite(PIN_RGB_POWER, HIGH);
 
@@ -789,19 +805,20 @@ void setup()
     SPI.setRX(PIN_SPI_MISO);
     SPI.setTX(PIN_SPI_MOSI);
     SPI.begin();
+    spi_pins_release();                  // held only inside IMU transfers
 
     s_imu_ok = imu_begin();
     bmp_begin();
     s_mag_ok = mag_begin();
-    uwb_begin();
+    tag_read();
 
     GpsPort.begin(GPS_BAUDS[0]);
     s_gps_baud_t0 = millis();
 
     bench_port_begin(&s_master, Serial1, uart0, PIN_MASTER_TX, PIN_MASTER_RX, "UART0>MASTER");
 
-    bench_printf("\n=== Ariadna V2 POSITION bench test, proto v%d, UWB library %s ===\n",
-                 BENCH_PROTO_VERSION, UWB_LIB ? "present" : "ABSENT");
+    bench_printf("\n=== Ariadna V2 POSITION bench test, proto v%d, UWB tag at I2C 0x%02X ===\n",
+                 BENCH_PROTO_VERSION, ARIADNA_UWB_I2C_ADDR);
 }
 
 void loop()

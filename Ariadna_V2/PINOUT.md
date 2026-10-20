@@ -18,7 +18,8 @@ Derived from the pinout spreadsheet, sheet **"Přiřazení pinů 2"**.
 | board | MCU | role | sketch |
 |---|---|---|---|
 | **Control / Master** | Raspberry Pi Pico 2 W | mission state machine, all servos, flash log, LoRa, arming | `Master_MCU/Master_MCU.ino` |
-| **Position** | Seeed XIAO RP2350 | sensor fusion, the navigation solution, UWB tag | `Position_MCU/Position_MCU.ino` |
+| **Position** | Seeed XIAO RP2350 | sensor fusion, the navigation solution, UWB multilateration | `Position_MCU/Position_MCU.ino` |
+| **UWB tag** | Seeed XIAO RP2350 on an anchor PCB | two-way ranging, I2C slave to the Position MCU | `Uwb_Tag/Uwb_Tag.ino` |
 | **Guidance / Navigation** | Seeed XIAO RP2350 | guidance, ignition timing, TVC, pyros | `Navigation_MCU/Navigation_MCU.ino` |
 | **Ground station** | Raspberry Pi Pico 2 | LoRa receive, OLED, USB uplink to the laptop | `Ground_Station/Ground_Station.ino` |
 | **UWB anchor ×4** | Seeed XIAO RP2350 | fixed ground ranging beacon | `Uwb_Anchor/Uwb_Anchor.ino` |
@@ -82,23 +83,20 @@ the pinout in every sense that matters on a launch day.
 
 Pin names are the XIAO silkscreen aliases (`D0`…`D12`) that the arduino-pico board
 variant defines. The spreadsheet's second column names the *pin's function*; its
-third names *what is physically on it*. Where those two disagree — D0 and D1 are
-labelled "UART0" but carry the DWM1000's interrupt and reset — the third column
+third names *what is physically on it*. Where those two disagree, the third column
 wins, and the firmware follows the third column.
 
 | pin | function | peripheral | constant |
 |---|---|---|---|
-| D0 (A0) | digital in | **UWB DWM1000 IRQ** | `PIN_UWB_INT` |
-| D1 (A1) | open-drain out | **UWB DWM1000 RST** | `PIN_UWB_RST` |
-| D2 (A2) | digital out | **UWB DWM1000 CS** | `PIN_UWB_CS` |
+| D0–D2 | — | free (the DWM1000 footprint is no longer fitted) | — |
 | D3 (A3) | digital out | Voltino TriSense Pro CS (ICM42688P) | `PIN_TRISENSE_CS` |
-| D4 (A4) | I2C SDA | BMP580, AK09918C, TF Luna lidar | `PIN_I2C_SDA` |
+| D4 (A4) | I2C SDA (PSDA), 400 kHz | BMP580, AK09918C, TF Luna lidar, **UWB tag 0x2A** (I2CP) | `PIN_I2C_SDA` |
 | D5 (A5) | I2C SCL | same bus | `PIN_I2C_SCL` |
 | D6 (A6) | UART TX | Control MCU link, 921600 baud | `PIN_MASTER_TX` |
 | D7 (A7) | UART RX | Control MCU link | `PIN_MASTER_RX` |
-| D8 (A8) | SPI SCK | shared: DWM1000 **and** TriSense | `PIN_SPI_SCK` |
-| D9 (A9) | SPI MISO | shared | `PIN_SPI_MISO` |
-| D10 (A10) | SPI MOSI | shared | `PIN_SPI_MOSI` |
+| D8 (A8) | SPI SCK | TriSense **only** | `PIN_SPI_SCK` |
+| D9 (A9) | SPI MISO | TriSense only | `PIN_SPI_MISO` |
+| D10 (A10) | SPI MOSI | TriSense only | `PIN_SPI_MOSI` |
 | D11 | PIO UART TX | LK76 GPS module (to the module's RX) | `PIN_GPS_TX` |
 | D12 | PIO UART RX | LK76 GPS module (from the module's TX) | `PIN_GPS_RX` |
 | D13–D15 | — | free | — |
@@ -106,13 +104,17 @@ wins, and the firmware follows the third column.
 
 **Three notes that will cost you a bench session if you skip them.**
 
-1. **The SPI bus is shared** between the DWM1000 and the ICM42688P. Both drivers
-   use per-transaction `SPISettings`, so the clock and mode are re-established for
-   every transfer and neither can inherit the other's. Both are driven from **core 0
-   only**, which is what makes the bus safe without a lock.
-2. **The DWM1000's reset is open-drain.** It is pulled LOW to reset and then
-   *released to a floating input*. Driving it high can damage the module. The
-   ranging library is told the reset pin is `255` so that it never drives it either.
+1. **The SPI bus belongs to the TriSense alone.** On the module, SCK and MOSI pass
+   through an SN74LVC2T45 whose direction pin is CS: while the IMU is *not*
+   selected, the module drives SCK and MOSI itself. A second SPI device on these
+   wires is corrupted (this is why the DWM1000 moved to its own board), and an MCU
+   that drives SCK/MOSI between transfers is in a short circuit with the module,
+   roughly 15–25 mA per line. TriSense library **1.6.0+** releases the two pins
+   between transfers on the RP2350; older versions do not.
+2. **The UWB tag is an I2C slave on the sensor bus**, address `0x2A`, reached
+   through the I2CP uSup connector (GND, 3V3, PSDA, PSCL). The bus runs at 400 kHz
+   so the tag's 74-byte frame costs 1.7 ms of core 0, not 6.8 ms. The tag board
+   draws about 150–250 mA from 3V3 through that connector. See section 5b.
 3. **D11/D12 are not a hardware UART.** The GPS runs on a PIO state machine, which
    the RP2350 will put on any pin. If the module is silent, swap the two — the
    names describe the RP2350 end.
@@ -189,11 +191,38 @@ Four identical boards, one sketch, differing only in `ANCHOR_ID`.
 | 4 | `04:00:5B:D5:A9:9A:E2:9C` | `0x0004` | `s_uwb_anchors[3]` |
 
 The tag on the vehicle uses EUI `AA:00:5B:D5:A9:9A:E2:9C`, short address `0x00AA`.
+It runs on its own board — section 5b.
 
 > `startAsAnchor()` **must** be called with `false` as its third argument. The
 > library otherwise randomises the short address at every power-on, the tag matches
 > no row of the anchor table, and every range is silently discarded — the radios
 > work, the LEDs blink, and the navigation filter never sees a UWB fix.
+
+---
+
+## 5b. UWB tag — anchor PCB carried in the vehicle
+
+The same anchor PCB, flashed with `Uwb_Tag/Uwb_Tag.ino` instead of the anchor
+sketch. Ranging runs on core 0; core 1 answers the Position MCU as an I2C slave.
+
+| pin | function | peripheral | constant |
+|---|---|---|---|
+| D0 (A0) | digital in | DWM1000 IRQ (polled) | `PIN_UWB_INT` |
+| D1 (A1) | open-drain out | DWM1000 RST — never drive high | `PIN_UWB_RST` |
+| D2 (A2) | digital out | DWM1000 CS | `PIN_UWB_CS` |
+| D4 (A4) | I2C1 SDA, **slave 0x2A** | PSDA → I2CP → Position D4 | `PIN_I2C_SDA` |
+| D5 (A5) | I2C1 SCL | PSCL → I2CP → Position D5 | `PIN_I2C_SCL` |
+| D8–D10 | SPI0 | DWM1000 | `PIN_SPI_*` |
+| on-board | PIO | WS2812 tag annunciator | `ARIADNA_RGB_PIN` |
+
+- **Cable:** uSup from the anchor PCB's **I2CP** to **I2CP** on the flight computer
+  (pin 1 GND, 2 3V3, 3 PSDA, 4 PSCL). Keep it under ~30 cm: the anchor PCB's
+  10 kΩ pull-ups sit in parallel with the TriSense module's own.
+- **Power comes through that cable.** No 1S battery on this board while it is a
+  tag, or open solder jumper **R** behind its AP7361C. Do not plug USB into this
+  XIAO with the cable connected; unplug the cable to flash it.
+- **Frame:** `common/ariadna_uwb_link.h` — the latest range to each anchor with
+  its age at the moment of the read, CRC-16 protected, 74 bytes.
 
 ---
 

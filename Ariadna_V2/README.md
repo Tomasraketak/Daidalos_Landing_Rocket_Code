@@ -16,7 +16,8 @@ machine, and the ground segment.
 | board | hardware | owns |
 |---|---|---|
 | **Master** | Raspberry Pi Pico 2 W | mission state machine, all servos, flash log, LoRa downlink, arming |
-| **Position** | XIAO RP2350 | sensor fusion, the navigation solution, the UWB tag |
+| **Position** | XIAO RP2350 | sensor fusion, the navigation solution, UWB multilateration |
+| **UWB tag** | XIAO RP2350 on an anchor PCB | two-way ranging; an I²C slave on the Position MCU's sensor bus |
 | **Navigation** | XIAO RP2350 | guidance, ignition timing, TVC, pyros |
 | **Ground station** | Raspberry Pi Pico 2 | LoRa receive, OLED, USB uplink to the laptop |
 | **UWB anchor** ×4 | XIAO RP2350 | fixed ranging beacons on the ground around the pad |
@@ -67,15 +68,17 @@ is invisible from inside a single file.
 ### Position MCU — *where am I?*
 
 **Hardware:** XIAO RP2350. ICM42688P over SPI, BMP580 + AK09918C over I²C (all three
-on the Voltino TriSense), LK76 GPS on a PIO UART, DWM1000 UWB on the same SPI bus as
-the IMU, TF Luna lidar on the same I²C bus (declared, not implemented).
+on the Voltino TriSense), LK76 GPS on a PIO UART, the UWB tag board at I²C `0x2A` and a
+TF Luna lidar (declared, not implemented) on the same I²C bus. The IMU's SPI bus is the
+TriSense's alone: the module drives SCK and MOSI itself whenever the IMU is not
+selected, which is why the DWM1000 moved off it onto its own board.
 
 **Product:** exactly one thing — `ariadna_nav_state_t`, 88 bytes, emitted at 240 Hz.
 It makes no control decisions whatsoever.
 
 | core | runs | may block? |
 |---|---|---|
-| 0 | *all* sensor I/O, the estimator, the UWB tag, every outgoing packet | no |
+| 0 | *all* sensor I/O, the estimator, reading the UWB tag, every outgoing packet | no |
 | 1 | GPS NMEA parsing, receiving from the Master | yes, freely |
 
 Every I²C and SPI transaction in the vehicle's sensor stack happens on **core 0**, so
@@ -86,9 +89,8 @@ waits on the other.
 
 One estimator tick, in order:
 
-1. **service the UWB radio and the LED** — in the *idle path*, before the tick-rate
-   test, so ranging throughput is set by the core's spare time rather than by the
-   estimator's period;
+1. **service the LED** — in the *idle path*, before the tick-rate test (ranging runs
+   on the tag board, so nothing here sets its throughput any more);
 2. **drain the IMU FIFO** through the fusion library (240 Hz);
 3. **read the barometer** — but only every 20 ms, and the resulting correction is
    applied on exactly one tick per sample. Correcting on every tick would feed the
@@ -377,8 +379,10 @@ the Navigation MCU's sanity limits, at which point that board rejects the **whol
 
 #### UWB — the reason it can land *on* the pad
 
-Four DWM1000 anchors stand on the ground around the pad; the Position MCU carries the
-tag. Each anchor answers a two-way ranging exchange at about 10 Hz, and
+Four DWM1000 anchors stand on the ground around the pad; the vehicle carries the tag —
+an anchor PCB flashed with [`Uwb_Tag`](Uwb_Tag/Uwb_Tag.ino), which hands the Position MCU
+the latest range to each anchor over I²C, 25 times a second, each with its age
+([`common/ariadna_uwb_link.h`](common/ariadna_uwb_link.h)). Each anchor answers a two-way ranging exchange at about 10 Hz, and
 [`common/ariadna_uwb.h`](common/ariadna_uwb.h) turns the four distances into a
 position in the pad frame with an honest per-axis 1σ — which the Kalman filter then
 consumes exactly as it consumes a GPS fix.
