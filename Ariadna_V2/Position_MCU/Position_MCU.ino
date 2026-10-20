@@ -188,16 +188,15 @@ static const uint32_t ESTIMATOR_HZ = ARIADNA_NAV_STATE_HZ;   // 240 Hz
 // Barometer sampling. NOT the estimator rate, and deliberately far below
 // it.
 //
-// The BMP580 will run at 240 Hz, but only at minimum oversampling. This
-// build uses OSR x16 on pressure for the altitude noise floor, which caps
-// the achievable rate far lower — so 50 Hz is what the sensor can actually
-// deliver at this quality, and asking for more would mean asking for a
-// noisier altitude.
+// The SENSOR runs at its maximum, 240 Hz (see sensors_begin()), with its
+// IIR averaging the light oversampling that rate allows; the estimator
+// takes one of those samples every 20 ms.
 //
-// That costs nothing. The vertical filter believes the barometer below
-// about 0.3 Hz and the accelerometer above it, so 50 Hz is already more
-// than a hundred times oversampled for the job the barometer is doing.
-// A quieter sample at 50 Hz beats a noisier one at 240 Hz here, every time.
+// Fusing all 240 would buy nothing but bus time. The vertical filter
+// believes the barometer below about 0.3 Hz and the accelerometer above
+// it, so 50 Hz is already more than a hundred times oversampled for the
+// job the barometer is doing — and BARO_SIGMA is the atmosphere, which is
+// correlated over seconds and does not average down with more samples.
 static const uint32_t BARO_HZ = 50;
 
 // Diagnostics only. printf promotes float to double by language rule and
@@ -1714,7 +1713,7 @@ public:
     static constexpr float BIAS_LIMIT     = 1.5f;    // m/s^2, as before
 
     // BARO_SIGMA is set from the ATMOSPHERE, not from the BMP580's noise
-    // figure. Per sample the sensor contributes centimetres at OSR x16.
+    // figure. Per sample the sensor contributes centimetres even at 240 Hz.
     // What does not average down is the air — gusts, the vehicle's own
     // wake, ground effect near the pad — which is correlated over
     // seconds. Quoting the sensor's number here would make the filter
@@ -2214,17 +2213,24 @@ static bool sensors_begin(void)
     sensor.imu.setFIFOMode(FIFO_16BIT);
 
     // ---- barometer ---------------------------------------------------
-    // Heavy pressure oversampling, light temperature oversampling, and a
-    // short IIR. The BMP580 is the only absolute altitude reference above
-    // the height a lidar would work at, so its noise floor is worth paying
-    // for in conversion time.
+    // The highest output rate the BMP580 has, 240 Hz, and therefore the
+    // oversampling that rate allows: OSR_P x2 with OSR_T x1. Not every pair
+    // is possible. The datasheet's table 7 (BST-BMP580-DS004, "maximum
+    // nominal ODR setting per OSR settings in NORMAL mode") caps 240 Hz at
+    // OSR_P x2; the x16 this used to ask for is good for 80 Hz at most. An
+    // impossible pair is NOT refused — the part keeps the ODR, quietly drops
+    // BOTH oversampling rates to x1 and clears OSR_EFF.odr_is_valid — so the
+    // old setting was in fact flying at x1/x1 while the comments here
+    // described x16.
     //
-    // The IIR is deliberately mild: the estimator in section 7 is already a
-    // filter, and filtering twice adds phase lag that the vertical channel
-    // then has to fight. Anything past IIR_3 here shows up as lag in vz.
-    sensor.bmp.setOversampling(BMP580_OSR_x16, BMP580_OSR_x2);
+    // The IIR stays mild: at 240 Hz IIR_3 averages over a few samples, which
+    // buys back most of the oversampling, while the estimator in section 7
+    // is already a filter, and filtering twice adds phase lag that the
+    // vertical channel then has to fight. Anything past IIR_3 here shows up
+    // as lag in vz.
+    sensor.bmp.setOversampling(BMP580_OSR_x2, BMP580_OSR_x1);
     sensor.bmp.setIIRFilter(BMP580_IIR_3, BMP580_IIR_OFF);
-    sensor.bmp.setODR(BMP580_ODR_240Hz);   // free-running well above BARO_HZ
+    sensor.bmp.setODR(BMP580_ODR_240Hz);   // max ODR; valid with x2/x1
 
     // ---- fusion ------------------------------------------------------
     // Mount orientation: TriSense Z-up on a vehicle standing on the pad.
