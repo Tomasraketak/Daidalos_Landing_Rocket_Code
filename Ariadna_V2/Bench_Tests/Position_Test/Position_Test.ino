@@ -296,7 +296,12 @@ static bool bmp_begin(void)
     // standby disabled, so: STANDBY + deep_dis first, the mode bits last.
     bool ok = i2c_write8(s_bmp_addr, 0x37, 0x80)          // STANDBY, deep_dis, 240 Hz
            && i2c_write8(s_bmp_addr, 0x36, 0x48)          // press on, OSR_P x2, OSR_T x1
-           && i2c_write8(s_bmp_addr, 0x31, 0x10)          // DSP_IIR: P coef 3, T off
+           && i2c_write8(s_bmp_addr, 0x31, 0x10);         // DSP_IIR: P coef 3, T off
+    // DSP_CONFIG: filtered pressure to the data registers + FIFO, raw T.
+    // At reset the data registers show the UNFILTERED values.
+    uint8_t dsp = 0;
+    ok = ok && i2c_read(s_bmp_addr, 0x30, &dsp, 1)
+            && i2c_write8(s_bmp_addr, 0x30, (uint8_t)((dsp & ~0x78) | 0x60))
            && i2c_write8(s_bmp_addr, 0x37, 0x81);         // 240 Hz, normal mode
     delay(5);
     uint8_t odr = 0, eff = 0;
