@@ -288,16 +288,28 @@ static bool bmp_begin(void)
     }
     i2c_write8(s_bmp_addr, 0x7E, 0xB6);                  // soft reset
     delay(3);
-    bool ok = i2c_write8(s_bmp_addr, 0x36, 0x58)          // press on, OSR_P x8, OSR_T x1
-           && i2c_write8(s_bmp_addr, 0x37, 0xBD);         // 50 Hz, normal mode
-    uint8_t odr = 0;
-    ok = ok && i2c_read(s_bmp_addr, 0x37, &odr, 1) && (odr & 0x7F) == 0x3D;
+    // The FLIGHT configuration (Position_MCU sensors_begin()): 240 Hz,
+    // OSR_P x2, OSR_T x1, IIR coefficient 3 on pressure. The part does not
+    // refuse an impossible OSR/ODR pair, it silently drops to x1/x1 and
+    // clears OSR_EFF.odr_is_valid, so that bit is checked here.
+    bool ok = i2c_write8(s_bmp_addr, 0x36, 0x48)          // press on, OSR_P x2, OSR_T x1
+           && i2c_write8(s_bmp_addr, 0x31, 0x10)          // DSP_IIR: P coef 3, T off
+           && i2c_write8(s_bmp_addr, 0x37, 0x81);         // 240 Hz, normal mode
+    delay(5);
+    uint8_t odr = 0, eff = 0;
+    ok = ok && i2c_read(s_bmp_addr, 0x37, &odr, 1) && (odr & 0x7F) == 0x01
+            && i2c_read(s_bmp_addr, 0x38, &eff, 1);
     if (!ok) {
         bench_set(PT_BARO_ID, ST_FAIL, "BMP58%c at 0x%02X, config write failed", id == 0x50 ? '0' : '1', s_bmp_addr);
         s_bmp_addr = 0;
         return false;
     }
-    bench_set(PT_BARO_ID, ST_PASS, "BMP58%c at 0x%02X", id == 0x50 ? '0' : '1', s_bmp_addr);
+    if (!(eff & 0x80) || ((eff >> 3) & 0x07) != 1) {
+        bench_set(PT_BARO_ID, ST_WARN, "BMP58%c at 0x%02X, flight OSR/ODR NOT valid (OSR_EFF 0x%02X)",
+                  id == 0x50 ? '0' : '1', s_bmp_addr, eff);
+        return true;
+    }
+    bench_set(PT_BARO_ID, ST_PASS, "BMP58%c at 0x%02X, 240 Hz x2/x1 valid", id == 0x50 ? '0' : '1', s_bmp_addr);
     return true;
 }
 

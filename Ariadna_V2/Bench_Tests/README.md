@@ -35,7 +35,8 @@ A missing, dead or unplugged part is a `FAIL` line, never a hang:
 ## What is tested
 
 **Master** — PCA9685 (prescale written and read back), servos stepped one at a time
-(TVC X, TVC Y: trim → +5° → trim → −5° → trim; clamp: mid → closed → mid → open),
+(TVC X, TVC Y, fins 0–3 and the spare on channels 3–7: trim → +5° → trim → −5° → trim;
+clamp: mid → closed → mid → open),
 W25Q128 JEDEC ID and log usage, erase/write/verify/erase of the **last** sector (the
 flight log never reaches it, and it is left erased), LoRa init and a packet every 2 s
 with TX-done taken from the DIO0 interrupt, battery voltage, ACS712 current, RBF and
@@ -52,7 +53,8 @@ lost packet is visible. Transmit power is 10 dBm. **Never transmit without an an
 **Position** — every sensor through its own registers rather than TriSense, so each
 one passes or fails on its own: I²C idle levels and scan, ICM42688P (WHO_AM_I at
 10 MHz, retried at 1 MHz to tell a wiring problem from a dead chip; |a| ≈ 1 g at rest,
-frozen-data detection), BMP580 (CHIP_ID, pressure, temperature, noise in Pa and cm),
+frozen-data detection), BMP580 (CHIP_ID, the flight configuration 240 Hz / OSR x2/x1 / IIR 3 with
+`OSR_EFF.odr_is_valid` read back, pressure, temperature, noise in Pa and cm),
 AK09918C (WIA, |B|, overflow), TF Luna (optional), LK76 GPS (auto-baud 9600 / 115200 /
 38400 / 57600, checksummed NMEA, fix, satellites, HDOP), the UWB tag board at I²C
 `0x2A` (`UWB_TAG`: frame CRC, the tag's radio up; `UWB_RANGE`: ranges to anchors 1–4),
