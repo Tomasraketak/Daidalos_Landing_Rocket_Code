@@ -8,8 +8,10 @@
 //  (115200 baud):
 //
 //    PCA9685        found on I2C, prescale written and read back
-//    SERVOS         TVC X, TVC Y and the thrust clamp stepped one at a
-//                   time: trim -> +5 deg -> trim -> -5 deg -> trim
+//    SERVOS         all 8 flight channels stepped one at a time: TVC X,
+//                   TVC Y, fins 0-3, spare: trim -> +5 deg -> trim ->
+//                   -5 deg -> trim; the thrust clamp mid -> closed -> mid
+//                   -> open -> mid
 //    W25Q128        JEDEC ID, then erase / write / verify / erase of the
 //                   LAST sector (the flight log never reaches it)
 //    LoRa SX1278    init, then a telemetry-shaped packet every 2 s that
@@ -91,7 +93,7 @@ static const float ACS712_DIVIDER = 0.50f;   // 2:1 divider into GP26
 static const uint8_t PCA_ADDR   = 0x40;
 static const float   PCA_OSC_HZ = 25000000.0f;
 static const float   PCA_PWM_HZ = 339.0f;      // flight rate: DIGITAL servos only
-enum { CH_TVC_X = 0, CH_TVC_Y = 1, CH_CLAMP = 2, PCA_N_USED = 8 };
+enum { CH_TVC_X = 0, CH_TVC_Y = 1, CH_CLAMP = 2, CH_FIN_0 = 3, CH_SPARE = 7, PCA_N_USED = 8 };
 
 static const float TVC_TRIM_X_US   = 1500.0f;
 static const float TVC_TRIM_Y_US   = 1500.0f;
@@ -99,6 +101,8 @@ static const float TVC_US_PER_DEG  = 10.0f;
 static const float SERVO_TEST_DEG  = 5.0f;     // TVC travel used by the test
 static const float CLAMP_US_CLOSED = 1150.0f;
 static const float CLAMP_US_OPEN   = 1900.0f;
+static const float FIN_TRIM_US     = 1500.0f;   // fins 3-6 and spare 7, as in flight
+static const float FIN_US_PER_DEG  = 10.0f;
 static const float SERVO_US_MIN    = 900.0f;
 static const float SERVO_US_MAX    = 2100.0f;
 static const uint32_t SERVO_STEP_MS = 700;
@@ -299,12 +303,17 @@ static void servo_service(void)
     next_ms = millis() + SERVO_STEP_MS;
 
     if (s_servo_test) {
-        static const char *const NAME[3] = { "TVC_X", "TVC_Y", "CLAMP" };
+        static const char *const NAME[PCA_N_USED] =
+            { "TVC_X", "TVC_Y", "CLAMP", "FIN_0", "FIN_1", "FIN_2", "FIN_3", "SPARE" };
         static const float TVC_STEP[5]   = { 0.0f, +1.0f, 0.0f, -1.0f, 0.0f };
         float us;
         if (ch < 2) {
             const float trim = ch == 0 ? TVC_TRIM_X_US : TVC_TRIM_Y_US;
             us = trim + TVC_STEP[step] * SERVO_TEST_DEG * TVC_US_PER_DEG;
+            bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", ch, NAME[ch],
+                         (double)(TVC_STEP[step] * SERVO_TEST_DEG), (double)us);
+        } else if (ch >= CH_FIN_0) {
+            us = FIN_TRIM_US + TVC_STEP[step] * SERVO_TEST_DEG * FIN_US_PER_DEG;
             bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", ch, NAME[ch],
                          (double)(TVC_STEP[step] * SERVO_TEST_DEG), (double)us);
         } else {
@@ -315,7 +324,7 @@ static void servo_service(void)
         }
         servos_neutral();
         s_counts[ch] = us_to_counts(us);
-        if (++step >= 5) { step = 0; ch = (uint8_t)((ch + 1) % 3); }
+        if (++step >= 5) { step = 0; ch = (uint8_t)((ch + 1) % PCA_N_USED); }
     }
 
     if (!pca_write_all()) {
