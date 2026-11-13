@@ -10,6 +10,7 @@
 #   make pyfmt    verify ground_visualizer.py decodes the current packet
 #   make bench    Ariadna V2 bench-test link (ping / pong / routing)
 #   make bench-sync  verify the bench sketches' copies of bench_common.h
+#   make actcon   Actuator Console pyro bridge: arming / firing safety rules
 #   make check    all of the above
 #
 # -Wdouble-promotion is not cosmetic here: the RP2350 has a single-precision
@@ -26,6 +27,8 @@ LINK_H  = $(V2)/common/ariadna_link.h
 KF_H    = $(V2)/common/ariadna_kf.h
 UWB_H   = $(V2)/common/ariadna_uwb.h
 UWBL_H  = $(V2)/common/ariadna_uwb_link.h
+EX_DIR  = $(V2)/Examples
+ACT_H   = $(V2)/common/actcon_pyro.h
 
 all: host_test
 	./host_test
@@ -119,7 +122,11 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_uart_dma.h:$(NAV_DIR)/ariadna_uart_dma.h \
   $(V2)/common/ariadna_rgb.h:$(NAV_DIR)/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Ground_Station/ariadna_link.h \
-  $(V2)/common/ariadna_rgb.h:$(V2)/Uwb_Anchor/ariadna_rgb.h
+  $(V2)/common/ariadna_rgb.h:$(V2)/Uwb_Anchor/ariadna_rgb.h \
+  $(V2)/common/ariadna_link.h:$(EX_DIR)/Actuator_Console/ariadna_link.h \
+  $(V2)/common/actcon_pyro.h:$(EX_DIR)/Actuator_Console/actcon_pyro.h \
+  $(V2)/common/ariadna_link.h:$(EX_DIR)/Pyro_Companion/ariadna_link.h \
+  $(V2)/common/actcon_pyro.h:$(EX_DIR)/Pyro_Companion/actcon_pyro.h
 
 sync:
 	@fail=0; for p in $(SYNC_PAIRS); do \
@@ -157,7 +164,22 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(INO)
 	$(CXX) $(CXXFLAGS) -Istub -I$(NAV_DIR) \
 	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
+	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Actuator_Console \
+	    -x c++ -fsyntax-only $(EX_DIR)/Actuator_Console/Actuator_Console.ino
+	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Pyro_Companion \
+	    -x c++ -fsyntax-only $(EX_DIR)/Pyro_Companion/Pyro_Companion.ino
 	@echo "sketches compile clean"
+
+# ---------------------------------------------------------------------
+# Actuator Console (Examples/Actuator_Console + Examples/Pyro_Companion).
+# An example, but one that can fire an igniter, so its arming, heartbeat
+# and pulse rules are tested here like flight code.
+# ---------------------------------------------------------------------
+actcon: actcon_test
+	./actcon_test
+
+actcon_test: actcon_test.cpp $(ACT_H) $(LINK_H)
+	$(CXX) $(CXXFLAGS) -o actcon_test actcon_test.cpp
 
 # ---------------------------------------------------------------------
 # Ariadna V2 bench tests. The sketches in Bench_Tests/ exist to tell a
@@ -187,7 +209,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all est uwb uwblink link sync pyfmt syntax bench bench-sync
+check: all est uwb uwblink link sync pyfmt syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -195,5 +217,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test link_test est_test uwb_test uwb_link_test
-.PHONY: all est uwb uwblink link sync sync-fix pyfmt syntax check golden clean
+	rm -f host_test link_test est_test uwb_test uwb_link_test actcon_test
+.PHONY: all est uwb uwblink link sync sync-fix pyfmt syntax check golden clean actcon

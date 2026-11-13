@@ -7,6 +7,8 @@ afterwards. Console: **115200 baud**, line ending *Newline*.
 | sketch | board | libraries | what it does |
 |---|---|---|---|
 | `Servo_RGB_Demo/Servo_RGB_Demo.ino` | Master — Raspberry Pi Pico 2 W | Adafruit_NeoPixel | servos 1–8 (PCA9685 ch 0–7) to a typed angle, or oscillating between two typed angles: fast, 5 s, fast back, 3 s, slow at 5 °/s, 3 s, slow back, 5 s, repeat; the RGB LED shows what the servos are doing |
+| `Actuator_Console/Actuator_Console.ino` + `gui/actuator_gui.py` | Master — Raspberry Pi Pico 2 W | Adafruit_NeoPixel; PyQt6 + pyserial on the laptop | Python GUI for TVC X/Y, clamp, aerocover lock/unlock and four fins (channel map, min/centre/max, sliders, buttons, direct entry, one screen) plus pyro continuity, arming and firing — see [its README](Actuator_Console/README.md) |
+| `Pyro_Companion/Pyro_Companion.ino` | Navigation — Seeed XIAO RP2350 | Adafruit_NeoPixel | the pyro half of the Actuator Console: continuity report, armed / heartbeat / pulse safety rules (`make actcon`) |
 
 ## Servo_RGB_Demo
 
