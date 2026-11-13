@@ -15,36 +15,27 @@ driven from a Python GUI over USB. Styled with the VoltinoLabs design system.
 Both sketches need **Adafruit_NeoPixel**; nothing else. Like the bench tests, they
 replace the flight firmware and are flashed back over afterwards.
 
-### Install and run with one command
-
-**Windows** — paste into `cmd` (Win+R → `cmd` → Enter). It installs Python 3.12 with
-winget if there is none, downloads the GUI into `%USERPROFILE%\DaidalosConsole`,
-installs PyQt6 and pyserial, writes `start.bat` there for next time, and opens the
-window:
+### Install, run, update (Windows `cmd`)
 
 ```bat
-(where py >nul 2>&1 || winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements) & set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Python\Launcher" & mkdir "%USERPROFILE%\DaidalosConsole" 2>nul & cd /d "%USERPROFILE%\DaidalosConsole" && curl -fsSLO https://raw.githubusercontent.com/Tomasraketak/Daidalos_Landing_Rocket_Code/main/Ariadna_V2/Examples/Actuator_Console/gui/actuator_gui.py && curl -fsSLO https://raw.githubusercontent.com/Tomasraketak/Daidalos_Landing_Rocket_Code/main/Ariadna_V2/Examples/Actuator_Console/gui/requirements.txt && py -m pip install -q --disable-pip-version-check -r requirements.txt && (echo @py "%USERPROFILE%\DaidalosConsole\actuator_gui.py")>start.bat && py actuator_gui.py
+:: install (once)
+git clone https://github.com/Tomasraketak/Daidalos_Landing_Rocket_Code.git
+cd Daidalos_Landing_Rocket_Code\Ariadna_V2\Examples\Actuator_Console\gui
+python -m pip install -r requirements.txt
+
+:: run
+python actuator_gui.py
+python actuator_gui.py --demo
+
+:: update (from inside the gui folder)
+git pull
+python -m pip install -r requirements.txt
 ```
 
-Running it again updates the GUI to the latest version and keeps your
-`actuator_config.json`. After that, double-click `start.bat`; *Simulace (bez hardwaru)* in the port list runs without a board. If
-Python was only just installed and `py` is not found, close the window and paste the
-line into a new one.
-
-**macOS / Linux:**
-
-```sh
-U=https://raw.githubusercontent.com/Tomasraketak/Daidalos_Landing_Rocket_Code/main/Ariadna_V2/Examples/Actuator_Console/gui; mkdir -p ~/DaidalosConsole && cd ~/DaidalosConsole && curl -fsSLO $U/actuator_gui.py && curl -fsSLO $U/requirements.txt && python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt && .venv/bin/python actuator_gui.py
-```
-
-### From a clone
-
-```
-cd gui
-pip install -r requirements.txt
-python actuator_gui.py            # choose the Master's port in the window
-python actuator_gui.py --demo     # try it without hardware (simulated board)
-```
+`--demo` runs against a simulated board, no hardware needed. The servo map is saved
+to `gui/actuator_config.json`. Git ignores that file, so `git pull` never overwrites
+it. On macOS / Linux the commands are the same, with `/` in the path and
+`python3` instead of `python`.
 
 ## What is on the screen
 
