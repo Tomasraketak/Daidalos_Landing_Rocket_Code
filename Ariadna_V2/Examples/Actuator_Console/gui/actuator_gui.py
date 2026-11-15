@@ -46,7 +46,8 @@ APP_NAME = "Daidalos · Aktuátory a pyro"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "actuator_config.json")
 N_CH = 16
-ABS_US_MIN, ABS_US_MAX = 500, 2500
+ABS_US_MIN, ABS_US_MAX = 500, 3500   # same as the board; wide-range servos go to 3500
+PERIOD_GAP_US = 200                    # the board keeps a pulse this far below the PWM period
 
 # ---------------------------------------------------------------------------
 #  VoltinoLabs design tokens (artifact "VoltinoLabs", tokens.json)
@@ -247,18 +248,20 @@ class AppConfig:
     pwm_hz: int = 50
     pulse_ms: list[int] = field(default_factory=lambda: [250, 250, 250])
     port: str = ""
+    idle_ms: int = 500          # servo pulse stops after this long without a change, 0 = never
 
     def servo(self, key: str) -> ServoCfg:
         return next(s for s in self.servos if s.key == key)
 
     def to_json(self) -> dict:
-        return {"version": 1, "pwm_hz": self.pwm_hz, "pulse_ms": self.pulse_ms,
+        return {"version": 1, "pwm_hz": self.pwm_hz, "pulse_ms": self.pulse_ms, "idle_ms": self.idle_ms,
                 "port": self.port, "servos": [asdict(s) for s in self.servos]}
 
     @classmethod
     def from_json(cls, d: dict) -> "AppConfig":
         cfg = cls()
         cfg.pwm_hz = int(d.get("pwm_hz", 50))
+        cfg.idle_ms = max(0, min(60000, int(d.get("idle_ms", 500))))
         pm = list(d.get("pulse_ms", []))
         cfg.pulse_ms = [max(20, min(1000, int(x))) for x in (pm + [250, 250, 250])[:3]]
         cfg.port = d.get("port", "")
@@ -310,6 +313,13 @@ class SimBoard:
         self.last_rx = time.monotonic()
         self.next_tlm = 0.0
         self.rbf = 1
+        self.idle_ms = 500
+        self.moved = [0.0] * N_CH
+        self.awake = [False] * N_CH
+        self.amps_hist: list[tuple[float, float]] = []
+
+    def max_us(self) -> int:
+        return int(min(ABS_US_MAX, 1e6 / self.hz - PERIOD_GAP_US))
 
     def ms(self) -> int:
         return int((time.monotonic() - self.t0) * 1000)
@@ -330,7 +340,11 @@ class SimBoard:
             self.q.put("# simulated board (--demo): no hardware is driven")
         elif c == "SET" and len(p) == 3:
             ch = int(p[1])
-            self.us[ch] = max(self.lo[ch], min(self.hi[ch], int(p[2])))
+            self.us[ch] = max(self.lo[ch], min(self.hi[ch], self.max_us(), int(p[2])))
+            self.awake[ch], self.moved[ch] = True, now
+        elif c == "IDLE" and len(p) == 2:
+            self.idle_ms = max(0, min(60000, int(p[1])))
+            self.q.put(f"OK IDLE {self.idle_ms}")
         elif c == "OFF":
             if p[1].upper().startswith("A"):
                 self.us = [0] * N_CH
@@ -345,6 +359,7 @@ class SimBoard:
             self.q.put(f"OK LIM {ch} {lo} {hi}")
         elif c == "PWM":
             self.hz = int(p[1])
+            self.us = [min(u, self.max_us()) for u in self.us]
             self.q.put(f"OK PWM {self.hz}")
         elif c == "ARM":
             if not self.rbf:
@@ -375,12 +390,25 @@ class SimBoard:
         if self.armed_until and now - self.last_rx > 1.5:
             self.armed_until, self.fire_ch = 0, -1
             self.q.put("# GUI silent - pyros disarmed, servos hold")
+        on = 0
+        moving = 0
+        for ch in range(N_CH):
+            if self.awake[ch] and self.us[ch] and self.idle_ms and now - self.moved[ch] >= self.idle_ms / 1000:
+                self.awake[ch] = False
+            if self.awake[ch] and self.us[ch]:
+                on |= 1 << ch
+                moving += now - self.moved[ch] < 0.3
         if now >= self.next_tlm:
             self.next_tlm = now + 0.1
+            # a made-up servo rail: 0.15 A idle board, 0.12 A per held servo, 0.9 A per moving one
+            amps = 0.15 + 0.12 * bin(on).count("1") + 0.9 * moving + 0.02 * ((now * 53) % 3)
+            self.amps_hist = [(tt, a) for tt, a in self.amps_hist if now - tt < 10] + [(now, amps)]
             armed = 1 if (self.armed_until > now or self.fire_ch >= 0) else 0
             left = max(0.0, self.armed_until - now) if armed else 0.0
             noise = int((now * 37) % 9)
             t = {"t": self.ms(), "pca": 1, "hz": self.hz, "rbf": self.rbf, "vbat": 7.84,
+                 "i": round(amps, 2), "imax": round(max(a for _, a in self.amps_hist), 2),
+                 "idle": self.idle_ms, "maxus": self.max_us(), "on": on,
                  "us": self.us, "nav": 1, "arm": armed, "arm_left": round(left, 1),
                  "cont": [2930 + noise, 2915 + noise, 41 + noise], "thr": 1200, "cmask": 3,
                  "fired": self.fired, "firing": (1 << self.fire_ch) if self.fire_ch >= 0 else 0,
@@ -788,8 +816,13 @@ class AxisControl(QtWidgets.QWidget):
     def _readout(self, us: int) -> None:
         self.deg.setText(f"≈ {cz(self.cfg.deg(us))}°")
 
-    def set_board(self, us: int | None) -> None:
-        txt = "deska: —" if us is None else ("deska: vyp." if us == 0 else f"deska: {us} µs")
+    def set_board(self, us: int | None, awake: bool = True) -> None:
+        if us is None:
+            txt = "deska: —"
+        elif us == 0:
+            txt = "deska: vyp."
+        else:
+            txt = f"deska: {us} µs" + ("" if awake else " · spí")
         if self.board.text() != txt:
             self.board.setText(txt)
 
@@ -942,6 +975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for k, v in asdict(s_new).items():
                 setattr(s_old, k, v)
         self.cfg.pwm_hz, self.cfg.pulse_ms = new.pwm_hz, new.pulse_ms
+        self.idle_spin.setValue(new.idle_ms)
         self._fill_config_table()
         for s in self.cfg.servos:
             self._cfg_changed(s, send_pos=False)
@@ -954,8 +988,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_header(self) -> QtWidgets.QWidget:
         h = QtWidgets.QFrame()
         h.setObjectName("header")
-        lay = QtWidgets.QHBoxLayout(h)
-        lay.setContentsMargins(20, 12, 20, 12)
+        lay = QtWidgets.QHBoxLayout()
         lay.setSpacing(10)
         brand = QtWidgets.QVBoxLayout()
         brand.setSpacing(0)
@@ -966,8 +999,8 @@ class MainWindow(QtWidgets.QMainWindow):
         word.addWidget(label(" Console", "wordAccent"))
         word.addStretch(1)
         brand.addLayout(word)
-        lay.addLayout(brand)
-        lay.addSpacing(18)
+        brand.addStretch(1)
+        brand_box = brand
 
         self.port_box = QtWidgets.QComboBox()
         self.port_box.setMinimumWidth(190)
@@ -990,21 +1023,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pwm_box.currentIndexChanged.connect(self._pwm_changed)
         lay.addWidget(self.pwm_box)
 
+        self.idle_spin = QtWidgets.QSpinBox()
+        self.idle_spin.setRange(0, 10000)
+        self.idle_spin.setSingleStep(100)
+        self.idle_spin.setSuffix(" ms")
+        self.idle_spin.setPrefix("uspat po ")
+        self.idle_spin.setSpecialValueText("uspávání vyp.")
+        self.idle_spin.setKeyboardTracking(False)
+        self.idle_spin.setValue(self.cfg.idle_ms)
+        self.idle_spin.setMinimumWidth(150)
+        self.idle_spin.setToolTip("Servo, jehož poloha se nezmění déle než tuto dobu, dostane vypnutý pulz\n"
+                                  "(nebzučí, nebere proud). Dalším pohybem se samo zapne. 0 = nikdy.")
+        self.idle_spin.valueChanged.connect(self._idle_changed)
+        lay.addWidget(self.idle_spin)
+
         lay.addStretch(1)
-        self.chip_board = chip("Deska")
-        self.chip_pca = chip("PCA9685")
-        self.chip_nav = chip("Navigation")
-        self.chip_rbf = chip("RBF")
-        self.chip_bat = chip("Baterie")
-        for c_ in (self.chip_board, self.chip_pca, self.chip_nav, self.chip_rbf, self.chip_bat):
-            lay.addWidget(c_)
-        lay.addSpacing(8)
         self.all_center_btn = button("Vše na střed", "primary", "Všechna serva na nastavený střed (zapne výstupy)")
         self.all_center_btn.clicked.connect(self.all_center)
         lay.addWidget(self.all_center_btn)
         self.all_off_btn = button("Vypnout serva", tip="Zastaví pulzy na všech kanálech (serva povolí)")
         self.all_off_btn.clicked.connect(self.all_off)
         lay.addWidget(self.all_off_btn)
+
+        # second line: board status
+        self.chip_board = chip("Deska")
+        self.chip_pca = chip("PCA9685")
+        self.chip_nav = chip("Navigation")
+        self.chip_rbf = chip("RBF")
+        self.chip_bat = chip("Baterie")
+        self.chip_amp = chip("Proud")
+        self.chip_amp.setToolTip("Odběr z ACS712: průměr za posledních 100 ms")
+        self.chip_ampmax = chip("Max 10 s")
+        self.chip_ampmax.setToolTip("Nejvyšší odběr za posledních 10 s (filtrováno ~4 ms)")
+        status = QtWidgets.QHBoxLayout()
+        status.setSpacing(8)
+        status.addStretch(1)
+        for c_ in (self.chip_board, self.chip_pca, self.chip_nav, self.chip_rbf, self.chip_bat,
+                   self.chip_amp, self.chip_ampmax):
+            status.addWidget(c_)
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(8)
+        right.addLayout(lay)
+        right.addLayout(status)
+        outer = QtWidgets.QHBoxLayout(h)
+        outer.setContentsMargins(20, 12, 20, 12)
+        outer.setSpacing(18)
+        outer.addLayout(brand_box)
+        outer.addLayout(right, 1)
         return h
 
     # ------------------------------------------------------------------ TVC
@@ -1427,6 +1492,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg_warn.setStyleSheet(f"color: {C['danger']};")
         else:
             self.cfg_warn.setText("")
+        maxus = self.tlm.get("maxus")
+        over = [s.name for s in self.cfg.servos if maxus and s.max_us > maxus]
+        if over and not dup:
+            self.cfg_warn.setText(f"Při {self.tlm.get('hz')} Hz deska pustí nejvýš {maxus} µs "
+                                  f"(perioda PWM) — omezí: {', '.join(over)}. Pro dlouhé pulzy dejte 50 Hz.")
+            self.cfg_warn.setStyleSheet(f"color: {C['accent']};")
 
     def _send_lim(self, s: ServoCfg) -> None:
         # Two servos on one channel (a mistake, flagged in the table) get the
@@ -1506,10 +1577,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.port = self.port_box.currentData() or ""
             self.link.send("HELLO")
             self.link.send(f"PWM {self.pwm_box.currentData()}")
+            self.link.send(f"IDLE {self.idle_spin.value()}")
             self.send_limits()
             self.log("# serva zůstávají vypnutá, dokud jimi nepohnete nebo nedáte „Vše na střed“")
         self._update_controls_enabled()
         self._refresh_status()
+
+    def _idle_changed(self, v: int) -> None:
+        self.cfg.idle_ms = v
+        self._dirty = True
+        if self.link.is_open:
+            self.link.send(f"IDLE {v}")
 
     def _pwm_changed(self) -> None:
         hz = self.pwm_box.currentData()
@@ -1578,12 +1656,16 @@ class MainWindow(QtWidgets.QMainWindow):
         us = t.get("us") or []
         for r, s in enumerate(self.cfg.servos):
             v = us[s.ch] if s.ch < len(us) else None
-            self.axes[s.key].set_board(v)
+            awake = bool(t.get("on", 0xFFFF) & (1 << s.ch))
+            self.axes[s.key].set_board(v, awake)
             it = self.table.item(r, 9)
             if it is not None:
-                txt = "—" if v is None else ("vyp." if v == 0 else f"{v} µs")
+                txt = "—" if v is None else ("vyp." if v == 0 else f"{v} µs" + ("" if awake else " · spí"))
                 if it.text() != txt:
                     it.setText(txt)
+        if t.get("maxus") != getattr(self, "_last_maxus", None):
+            self._last_maxus = t.get("maxus")
+            self._check_conflicts()
         cont = t.get("cont") or [0, 0, 0]
         cmask, fired, firing = t.get("cmask", 0), t.get("fired", 0), t.get("firing", 0)
         nav = bool(t.get("nav"))
@@ -1622,9 +1704,14 @@ class MainWindow(QtWidgets.QMainWindow):
             v = float(t.get("vbat", 0))
             set_chip(self.chip_bat, f"Baterie: {cz(v, 2, sign=False)} V",
                      "" if v < 0.5 else ("bad" if v < 7.0 else "ok"))
+            if "i" in t:
+                set_chip(self.chip_amp, f"Proud: {cz(float(t['i']), 2, sign=False)} A", "")
+                set_chip(self.chip_ampmax, f"Max 10 s: {cz(float(t.get('imax', 0)), 2, sign=False)} A", "")
         else:
             set_chip(self.chip_rbf, "RBF: —", "")
             set_chip(self.chip_bat, "Baterie: —", "")
+            set_chip(self.chip_amp, "Proud: —", "")
+            set_chip(self.chip_ampmax, "Max 10 s: —", "")
 
         armed = bool(t.get("arm"))
         if armed:

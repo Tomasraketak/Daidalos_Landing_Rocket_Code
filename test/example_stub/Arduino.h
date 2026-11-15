@@ -33,6 +33,7 @@ inline int      digitalRead(uint8_t) { return HIGH; }
 inline int      analogRead(uint8_t) { return 0; }
 inline void     analogReadResolution(int) {}
 inline uint32_t millis(void) { return 0; }
+inline uint32_t micros(void) { return 0; }
 inline void     delay(uint32_t) {}
 inline void     tone(uint8_t, uint32_t) {}
 inline void     noTone(uint8_t) {}

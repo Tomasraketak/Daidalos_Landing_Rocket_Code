@@ -16,6 +16,18 @@
 //  Every channel starts with NO PULSE (PCA9685 full-off) and stays that
 //  way until the GUI commands it, so nothing moves at power-up.
 //
+//  Idle off: a channel whose command has not changed for IDLE (default
+//  500 ms) stops its pulse, so a servo resting at a position does not sit
+//  there buzzing and drawing holding current. The next SET wakes it.
+//  `IDLE 0` keeps every servo powered.
+//
+//  Pulses go up to 3500 us for servos that use the wide range, but never
+//  closer than PERIOD_GAP_US to the PWM period (at 339 Hz the period is
+//  2950 us, so 2750 us is the most a pulse can be there).
+//
+//  Current: the ACS712 on GP26, sampled every millisecond. Telemetry
+//  carries the mean over the last 100 ms and the peak over the last 10 s.
+//
 //  The pyros are on the Navigation MCU. The Master forwards ARM / DISARM /
 //  FIRE to it over UART1 (actcon_pyro.h) and relays its continuity report
 //  back to the GUI. Interlocks here, on top of the Navigation MCU's own:
@@ -32,6 +44,7 @@
 //    LIM <ch> <min> <max>  per-channel pulse window, us
 //    SET <ch> <us>         pulse on channel 0..15, clamped to its window
 //    OFF <ch> | OFF ALL    stop the pulse (servo goes limp / holds)
+//    IDLE <ms>             idle-off time, 0 = never, max 60000
 //    ARM | DISARM          pyro arming on the Navigation MCU
 //    FIRE <ch> <ms>        pyro channel 1..3, pulse 20..1000 ms
 //    HB                    heartbeat (any line counts as one)
@@ -60,6 +73,7 @@ static const uint8_t PIN_NAV_RX  = 5;
 static const uint8_t PIN_PCA_OE  = 6;    // PCA9685 /OE: LOW = outputs on
 static const uint8_t PIN_I2C_SDA = 8;
 static const uint8_t PIN_I2C_SCL = 9;
+static const uint8_t PIN_I_SENSE = 26;   // ADC0, ACS712
 static const uint8_t PIN_V_BAT   = 27;   // ADC1, 2S through a 3:1 divider
 static const uint8_t PIN_RBF     = 28;   // HIGH = tag removed
 
@@ -72,13 +86,19 @@ static const uint8_t PIN_RBF     = 28;   // HIGH = tag removed
 static const float ADC_VREF       = 3.30f;
 static const float ADC_FULL_SCALE = 4095.0f;
 static const float VBAT_DIVIDER   = 3.00f;
+// ACS712: same constants as Master_MCU.ino. CHECK THEM AGAINST YOUR BOARD:
+// the zero is ratiometric to the sensor's 5 V, re-measure if that changes.
+static const float ACS712_ZERO_V  = 2.504f;    // sensor output at 0 A
+static const float ACS712_V_PER_A = 0.100f;    // 20 A part: 100 mV/A
+static const float ACS712_DIVIDER = 0.50f;     // pin volts / sensor volts
 
 // ---- PCA9685 -------------------------------------------------------------
 static const uint8_t  PCA_ADDR    = 0x40;
 static const float    PCA_OSC_HZ  = 25000000.0f;
 static const uint8_t  N_CH        = 16;
 static const float    ABS_US_MIN  = 500.0f;    // nothing outside this, ever
-static const float    ABS_US_MAX  = 2500.0f;
+static const float    ABS_US_MAX  = 3500.0f;   // wide-range servos
+static const float    PERIOD_GAP_US = 200.0f;  // pulse never closer to the period
 static const float    DEF_US_MIN  = 900.0f;    // window until the GUI sends LIM
 static const float    DEF_US_MAX  = 2100.0f;   // = the flight travel guard
 
@@ -87,6 +107,7 @@ static const uint32_t GUI_TIMEOUT_MS = 1500;
 static const uint32_t NAV_TIMEOUT_MS = 300;
 static const uint32_t TLM_PERIOD_MS  = 100;
 static const uint32_t PCA_CHECK_MS   = 1000;
+static const uint32_t IDLE_DEFAULT_MS = 500;
 
 // =====================================================================
 //  state
@@ -96,6 +117,9 @@ static Adafruit_NeoPixel s_px(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
 static bool     s_pca_ok  = false;
 static float    s_pwm_hz  = 50.0f;
 static uint16_t s_us[N_CH];            // commanded pulse, 0 = off
+static bool     s_awake[N_CH];         // pulse actually output (not idled off)
+static uint32_t s_moved_ms[N_CH];      // last time the command changed
+static uint32_t s_idle_ms = IDLE_DEFAULT_MS;
 static uint16_t s_lim_lo[N_CH];
 static uint16_t s_lim_hi[N_CH];
 
@@ -110,6 +134,8 @@ static uint32_t s_pyro_seq = 1;
 
 static bool  s_rbf_out = false;
 static float s_vbat    = 0.0f;
+static float s_amps_now = 0.0f;        // mean of the last telemetry period
+static float s_amps_max = 0.0f;        // peak over the last 10 s
 
 // =====================================================================
 //  PCA9685
@@ -139,12 +165,19 @@ static uint16_t us_to_counts(float us)
     return (uint16_t)c;
 }
 
-/** One channel: a pulse of s_us[ch], or full-off when it is 0. */
+/** Longest pulse the current PWM frequency allows. */
+static float max_pulse_us(void)
+{
+    const float lim = 1e6f / s_pwm_hz - PERIOD_GAP_US;
+    return lim < ABS_US_MAX ? lim : ABS_US_MAX;
+}
+
+/** One channel: a pulse of s_us[ch], or full-off when it is 0 or idled. */
 static bool pca_write_ch(uint8_t ch)
 {
     Wire.beginTransmission(PCA_ADDR);
     Wire.write((uint8_t)(0x06 + 4 * ch));          // LEDn_ON_L, auto-increment
-    if (s_us[ch] == 0) {
+    if (s_us[ch] == 0 || !s_awake[ch]) {
         Wire.write(0); Wire.write(0);
         Wire.write(0); Wire.write(0x10);           // OFF_H bit 4: full off
     } else {
@@ -236,6 +269,54 @@ static void nav_service(void)
 // =====================================================================
 //  sensors, annunciators
 // =====================================================================
+/** ACS712, every millisecond: 100 ms mean, and the peak in 1 s buckets x10. */
+static void current_service(void)
+{
+    static uint32_t next_us = 0, bucket_t0 = 0;
+    static float    acc = 0.0f, filt = 0.0f;
+    static uint16_t n = 0;
+    static float    bucket[10];
+    static uint8_t  bi = 0;
+    const uint32_t  t = micros();
+    if ((int32_t)(t - next_us) < 0) return;
+    next_us = t + 1000;
+
+    const float pin  = (float)analogRead(PIN_I_SENSE) * (ADC_VREF / ADC_FULL_SCALE);
+    const float amps = (pin / ACS712_DIVIDER - ACS712_ZERO_V) / ACS712_V_PER_A;
+    filt += 0.25f * (amps - filt);                 // ~4 ms: keeps a stall, drops ADC noise
+    acc  += amps;
+    n++;
+
+    const uint32_t ms = millis();
+    if (filt > bucket[bi]) bucket[bi] = filt;
+    if (ms - bucket_t0 >= 1000) {                  // next 1 s bucket
+        bucket_t0 = ms;
+        bi = (uint8_t)((bi + 1) % 10);
+        bucket[bi] = filt;
+    }
+    if (n >= TLM_PERIOD_MS) {
+        s_amps_now = acc / (float)n;
+        acc = 0.0f;
+        n = 0;
+    }
+    float m = bucket[0];
+    for (uint8_t i = 1; i < 10; i++) if (bucket[i] > m) m = bucket[i];
+    s_amps_max = m;
+}
+
+/** Stop the pulse of every servo whose command has not changed for s_idle_ms. */
+static void idle_service(void)
+{
+    if (!s_idle_ms || !s_pca_ok) return;
+    const uint32_t now = millis();
+    for (uint8_t ch = 0; ch < N_CH; ch++) {
+        if (s_awake[ch] && s_us[ch] && now - s_moved_ms[ch] >= s_idle_ms) {
+            s_awake[ch] = false;
+            if (!pca_write_ch(ch)) { pca_lost("write failed"); return; }
+        }
+    }
+}
+
 static void sense_service(void)
 {
     static float vf = -1.0f;
@@ -284,11 +365,16 @@ static void annunciate(void)
 // =====================================================================
 static void telemetry(void)
 {
-    char buf[400];
+    char buf[480];
+    uint16_t on = 0;
+    for (uint8_t ch = 0; ch < N_CH; ch++)
+        if (s_us[ch] && s_awake[ch]) on = (uint16_t)(on | (1u << ch));
     int n = snprintf(buf, sizeof(buf),
-        "T {\"t\":%lu,\"pca\":%d,\"hz\":%.0f,\"rbf\":%d,\"vbat\":%.2f,\"us\":[",
+        "T {\"t\":%lu,\"pca\":%d,\"hz\":%.0f,\"rbf\":%d,\"vbat\":%.2f,"
+        "\"i\":%.2f,\"imax\":%.2f,\"idle\":%lu,\"maxus\":%.0f,\"on\":%u,\"us\":[",
         (unsigned long)millis(), s_pca_ok ? 1 : 0, (double)s_pwm_hz,
-        s_rbf_out ? 1 : 0, (double)s_vbat);
+        s_rbf_out ? 1 : 0, (double)s_vbat, (double)s_amps_now, (double)s_amps_max,
+        (unsigned long)s_idle_ms, (double)max_pulse_us(), on);
     for (uint8_t ch = 0; ch < N_CH && n < (int)sizeof(buf); ch++)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%u", ch ? "," : "", s_us[ch]);
     if (n < (int)sizeof(buf))
@@ -308,6 +394,7 @@ static uint16_t clamp_us(uint8_t ch, long us)
 {
     if (us < s_lim_lo[ch]) us = s_lim_lo[ch];
     if (us > s_lim_hi[ch]) us = s_lim_hi[ch];
+    if (us > (long)max_pulse_us()) us = (long)max_pulse_us();
     return (uint16_t)us;
 }
 
@@ -347,7 +434,9 @@ static void handle_line(char *line)
 
     if (!strcmp(cmd, "SET")) {
         if (!parse_ch(a1, &ch) || !a2) { Serial.println("ERR SET <ch> <us>"); return; }
-        s_us[ch] = clamp_us(ch, strtol(a2, nullptr, 10));
+        s_us[ch]       = clamp_us(ch, strtol(a2, nullptr, 10));
+        s_awake[ch]    = true;                     // any SET wakes an idled servo
+        s_moved_ms[ch] = millis();
         if (s_pca_ok && !pca_write_ch(ch)) pca_lost("write failed");
         return;                                    // silent: the GUI streams these
     }
@@ -362,6 +451,13 @@ static void handle_line(char *line)
         s_us[ch] = 0;
         if (s_pca_ok && !pca_write_ch(ch)) pca_lost("write failed");
         Serial.printf("OK OFF %u\n", ch);
+        return;
+    }
+    if (!strcmp(cmd, "IDLE")) {
+        const long ms = a1 ? strtol(a1, nullptr, 10) : -1;
+        if (ms < 0 || ms > 60000) { Serial.println("ERR IDLE 0..60000 ms"); return; }
+        s_idle_ms = (uint32_t)ms;
+        Serial.printf("OK IDLE %ld\n", ms);
         return;
     }
     if (!strcmp(cmd, "LIM")) {
@@ -383,6 +479,8 @@ static void handle_line(char *line)
         const long hz = a1 ? strtol(a1, nullptr, 10) : 0;
         if (hz < 40 || hz > 400) { Serial.println("ERR PWM 40..400"); return; }
         s_pwm_hz = (float)hz;
+        for (uint8_t i = 0; i < N_CH; i++)         // a shorter period may cut the window
+            if (s_us[i]) s_us[i] = clamp_us(i, s_us[i]);
         if (s_pca_ok && !pca_begin()) pca_lost("prescale write failed");
         Serial.printf("OK PWM %ld\n", hz);
         return;
@@ -448,6 +546,7 @@ void setup()
 
     for (uint8_t ch = 0; ch < N_CH; ch++) {
         s_us[ch] = 0;
+        s_awake[ch] = false;
         s_lim_lo[ch] = (uint16_t)DEF_US_MIN;
         s_lim_hi[ch] = (uint16_t)DEF_US_MAX;
     }
@@ -480,6 +579,8 @@ void loop()
     console_service();
     nav_service();
     sense_service();
+    current_service();
+    idle_service();
 
     if (s_gui_alive && (int32_t)(now - next_hb) >= 0) {
         next_hb = now + ACTCON_HB_PERIOD_MS;
