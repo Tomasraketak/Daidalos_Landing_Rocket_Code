@@ -13,3 +13,4 @@ test/bench_test
 test/uwb_link_test
 test/actcon_test
 Ariadna_V2/Examples/Actuator_Console/gui/actuator_config.json
+guid_test
