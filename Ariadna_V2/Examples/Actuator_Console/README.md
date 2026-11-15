@@ -50,7 +50,12 @@ it. On macOS / Linux the commands are the same, with `/` in the path and
 | **Záznam** | everything the board says except telemetry, and a line to type raw commands |
 
 Every servo widget also shows **what the board is actually putting out**
-(`deska: 1560 µs` / `vyp.`), taken from the telemetry, not from the GUI's own idea.
+(`deska: 1560 µs`, `· spí` when idled off, `vyp.`), taken from the telemetry, not
+from the GUI's own idea.
+
+The top bar shows, next to the board status, the **current draw** from the ACS712
+(mean over the last 100 ms) and the **peak over the last 10 s**, and has the
+**uspat po … ms** setting (below).
 
 ## Safety
 
@@ -63,7 +68,19 @@ flagged in red, and the board gets the intersection of their windows. The defaul
 are conservative: TVC ±100 µs (the flight code's ±10° at 10 µs/°), clamp 1150–1900 µs
 (`CLAMP_US_CLOSED` / `CLAMP_US_OPEN`), fins 1200–1800 µs, aerocover 1000–2000 µs with
 1200 / 1800 µs as locked / unlocked. **Measure your linkages and set the real limits
-before the first move.** If the GUI goes away, servos hold their last pulse.
+before the first move.** If the GUI goes away, servos hold their last pulse (until
+the idle-off below stops it).
+
+**Idle off.** A servo whose commanded position has not changed for 500 ms
+(*uspat po … ms* in the top bar, saved in the config, 0 = never) gets its pulse
+stopped, so it does not buzz or draw holding current. Only that channel stops;
+the next move turns it back on. A servo under load will be pushed back while
+it sleeps, so set 0 when something has to be held.
+
+**Wide-range servos.** Pulses go up to **3500 µs** (min/max in the table accept
+500–3500). A pulse cannot be longer than the PWM period, so the board keeps it at
+least 200 µs shorter: at 50 Hz the full 3500 µs is available, at 333/339 Hz the
+limit is about 2800/2750 µs and the GUI says which servos it cuts.
 
 PWM is 50 Hz by default (any servo). 333 / 339 Hz is for digital servos only and is
 global to all sixteen channels.
@@ -111,12 +128,14 @@ flash amber.
 | `LIM <ch> <min> <max>` | pulse window of channel 0–15, µs |
 | `SET <ch> <us>` | pulse, clamped to the window (no reply, the GUI streams these) |
 | `OFF <ch>` / `OFF ALL` | no pulse |
+| `IDLE <ms>` | idle-off time, 0 = never (default 500) |
 | `ARM` / `DISARM` | pyro arming on the Navigation MCU |
 | `FIRE <ch> <ms>` | pyro channel 1–3 |
 | `HB` | heartbeat (any line counts) |
 | `STATUS` | telemetry now |
 
-Every 100 ms the board prints `T {json}` with `pca`, `hz`, `rbf`, `vbat`, `us[16]`,
+Every 100 ms the board prints `T {json}` with `pca`, `hz`, `rbf`, `vbat`, `i` and
+`imax` (A), `idle`, `maxus`, `on` (bitmask of channels actually pulsing), `us[16]`,
 `nav`, `arm`, `arm_left`, `cont[3]`, `thr`, `cmask`, `fired`, `firing`, `rej`.
 Replies are `OK …` / `ERR …`; log lines start with `#`. Any serial terminal works
 too, so the GUI is optional.
