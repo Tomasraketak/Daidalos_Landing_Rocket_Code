@@ -59,6 +59,7 @@ public:
     size_t write(const uint8_t *, size_t) { return 0; }
     size_t write(uint8_t) { return 0; }
     size_t print(const char *) { return 0; }
+    size_t print(char) { return 0; }
     size_t println(const char *) { return 0; }
     size_t println(void) { return 0; }
     void   flush(void) {}

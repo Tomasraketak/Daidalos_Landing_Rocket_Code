@@ -59,6 +59,9 @@ seq_test: seq_test.cpp $(V2)/common/ariadna_seq.h $(V2)/common/ariadna_params.h 
 	$(CXX) $(CXXFLAGS) -o seq_test seq_test.cpp $(GUID_SRC) -lm
 
 SIM ?= ../../LandSim_Light
+# Library checkouts, for the Position MCU syntax check (optional).
+TRISENSE ?= ../../Voltino_TriSense_Library
+INSLIB   ?= ../../TriSenseINSLIB
 tables:
 	python3 ../tools/gen_guidance_tables.py --sim $(SIM)
 
@@ -201,6 +204,13 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
 	$(CXX) $(CXXFLAGS) -DARDUINO=100 -Ifull_stub -I$(V2)/Master_MCU \
 	    -x c++ -fsyntax-only $(V2)/Master_MCU/Master_MCU.ino
+	@if [ -d "$(TRISENSE)/src" ] && [ -d "$(INSLIB)/src" ]; then \
+	  for ins in 1 0; do \
+	    $(CXX) -O2 -Wall -Wextra -std=c++17 -DARDUINO=100 -DARDUINO_ARCH_RP2350 -D__ARM_FP=4 \
+	      -DARIADNA_USE_INSLIB=$$ins -Ifull_stub -I$(TRISENSE)/src -I$(INSLIB)/src \
+	      -I$(V2)/Position_MCU -x c++ -fsyntax-only $(V2)/Position_MCU/Position_MCU.ino || exit 1; \
+	  done; echo "Position_MCU compiles against the TriSense and TriSenseINSLIB headers"; \
+	else echo "Position_MCU: skipped (set TRISENSE=... INSLIB=... to the library checkouts)"; fi
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Actuator_Console \
 	    -x c++ -fsyntax-only $(EX_DIR)/Actuator_Console/Actuator_Console.ino
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Pyro_Companion \

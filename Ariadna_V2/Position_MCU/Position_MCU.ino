@@ -95,6 +95,7 @@
 #include "ariadna_kf.h"
 #include "ariadna_uwb.h"
 #include "ariadna_uwb_link.h"
+#include "ariadna_params.h"
 // Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
 // library's include path only when it sees a real #include of it, so the
 // header's __has_include probe on its own always reads "absent" and the
@@ -109,6 +110,49 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <TriSense.h>
+
+// ---------------------------------------------------------------------
+//  WHERE THE ATTITUDE COMES FROM
+//
+//  1 = TriSenseINSLIB (https://github.com/Tomasraketak/TriSenseINSLIB):
+//      INSLIB's 15-state error-state Kalman INS, with its two AHRS filters
+//      as the fallback while there is no GNSS. This is the default, for
+//      two reasons that both matter on this vehicle:
+//
+//        * NON-1G FLIGHT. A complementary filter levels itself against the
+//          accelerometer on the assumption that it is measuring gravity.
+//          In free fall it measures drag, during the burn it measures
+//          thrust. A strapdown INS aided by GNSS velocity does not need
+//          that assumption: attitude errors show up as velocity errors
+//          under acceleration and are corrected from there.
+//        * NO EULER ANGLES. The rotation is taken as a matrix and turned
+//          into the pad frame by a fixed permutation, so there is no
+//          singularity anywhere in the flight.
+//
+//      It also takes each GNSS fix with its measured age, so a receiver
+//      that reports 50 ms late is compared against where the vehicle WAS.
+//
+//      LICENCE: INSLIB is AGPL-3.0, so firmware built with this switch on
+//      is AGPL-3.0 as well. See the library's README.
+//
+//  0 = the Voltino TriSense library's own AdvancedTriFusion, as before.
+//      Accelerometer and magnetometer corrections are switched OFF in
+//      flight (pos.att_gyro_only), for the reason given above.
+//
+//  Either way the position and velocity on the wire come from the
+//  estimator in section 7 (barometer, GPS, UWB, lidar). The attitude source
+//  supplies the rotation, the body rates and the world-frame acceleration
+//  that estimator integrates.
+// ---------------------------------------------------------------------
+#ifndef ARIADNA_USE_INSLIB
+#  define ARIADNA_USE_INSLIB 1
+#endif
+#if ARIADNA_USE_INSLIB
+#include <TriSenseINS.h>
+// One INSLIB epoch needs 6.8 kB of stack. arduino-pico splits its 8 kB in
+// two as soon as setup1()/loop1() exist; this gives each core its own 8 kB.
+bool core1_separate_stack = true;
+#endif
 
 #include <string.h>
 #include <stdlib.h>
@@ -206,7 +250,8 @@ static const uint32_t BARO_HZ = 50;
     do {                                                          \
         _Pragma("GCC diagnostic push")                            \
         _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")  \
-        Serial.printf(__VA_ARGS__);                               \
+        if (Serial && Serial.availableForWrite() > 120)           \
+            Serial.printf(__VA_ARGS__);                           \
         _Pragma("GCC diagnostic pop")                             \
     } while (0)
 
@@ -215,6 +260,16 @@ static const uint32_t BARO_HZ = 50;
 // =====================================================================
 TriSense          sensor;
 AdvancedTriFusion fusion(&sensor.imu, &sensor.mag);
+#if ARIADNA_USE_INSLIB
+TriSenseINS       ins(sensor);
+#endif
+
+// The parameter table, streamed by the Master on the ground. Written by
+// core 1 (the link), read by core 0; every entry is one aligned float.
+static ariadna_params_t s_params;
+static uint8_t          s_param_seen[(ARIADNA_PARAM_ID_MAX + 7) / 8];
+static volatile uint8_t s_params_seen_n = 0;
+#define PRM(NAME)       (s_params.v[ARIADNA_P_##NAME])
 
 static uint16_t s_sensor_ok  = 0;      // ARIADNA_SENS_* bits
 static uint8_t  s_cal_state  = 0;
@@ -228,8 +283,9 @@ static bool     s_post_pass  = false;
 //  worth very little, which is exactly where a lidar and a UWB
 //  constellation are worth a great deal.
 //
-//    TF Luna lidar   NOT IMPLEMENTED. Declared, wired into the pipeline
-//                    and deliberately inert; see the class.
+//    TF Luna lidar   IMPLEMENTED. Slant range to the ground, turned into
+//                    height with the tilt and fused into the vertical
+//                    channel below ~7 m; see the class.
 //    DWM1000 UWB     IMPLEMENTED. A separate tag board ranges to four
 //                    surveyed ground anchors and hands the ranges over
 //                    I2C; this board multilaterates a position in the
@@ -257,31 +313,88 @@ struct RangeFix {
 };
 
 /**
- * TF Luna lidar, I2C, shares the bus with the barometer and magnetometer.
+ * TF Luna lidar, I2C, on the sensor bus with the barometer, the
+ * magnetometer and the UWB tag.
  *
- * NOT IMPLEMENTED. Returns an invalid fix, so ARIADNA_NAV_LIDAR_OK stays
- * clear and the estimator ignores it.
+ * The register protocol is the one in
+ * https://github.com/Tomasraketak/TF-Luna-I2C-Library (TFLuna::read():
+ * nine bytes from register 0x00 - distance in cm, signal strength, chip
+ * temperature). That library is not instantiated here for one reason: its
+ * begin() re-initialises the global `Wire` on pins of its own, and this
+ * board's sensor bus is whichever of Wire / Wire1 the pinout puts on
+ * D4/D5, already running at 400 kHz with three other devices on it.
+ *
+ * WHAT IT IS FOR. Below about seven metres the barometer is inside the
+ * motor's plume and the altitude it reports is wrong by up to a metre.
+ * The lidar sees the ground directly, and the guidance drops its altitude
+ * margin the moment it does (ARIADNA_NAV_LIDAR_OK).
+ *
+ * A reading is used only when it can be believed: a plausible range, a
+ * signal neither too weak nor saturated, and a vehicle upright enough
+ * that the beam is hitting the ground under it and not the horizon.
  */
 class LidarTFLuna {
 public:
-    bool begin(uint8_t i2c_addr = 0x10)
+    bool begin(TwoWire &wire, uint8_t i2c_addr = 0x10)
     {
+        _wire = &wire;
         _addr = i2c_addr;
-        _ok   = false;          // no probe yet: nothing to probe
+        _fails = 0;
+        _ok = poll(0);
         return _ok;
     }
 
-    const RangeFix &read(void)
+    /** One read, ~0.35 ms at 400 kHz. Returns true on a fresh frame. */
+    bool poll(uint32_t now_ms)
     {
-        _fix.valid = false;     // until implemented, contributes nothing
-        return _fix;
+        // An absent or dead sensor is probed once a second, not fifty times.
+        if (_fails >= 10 && (uint32_t)(now_ms - _last_try_ms) < 1000u) return false;
+        _last_try_ms = now_ms;
+
+        _wire->beginTransmission(_addr);
+        _wire->write((uint8_t)0x00);
+        if (_wire->endTransmission() != 0)          { fail(); return false; }
+        if (_wire->requestFrom((int)_addr, 9) != 9) { fail(); return false; }
+        uint8_t b[9];
+        for (uint8_t i = 0; i < 9; i++) b[i] = (uint8_t)_wire->read();
+
+        _dist_cm  = (uint16_t)(b[0] | (b[1] << 8));
+        _strength = (uint16_t)(b[2] | (b[3] << 8));
+        _fails = 0;
+        _ok    = true;
+
+        // TF Luna: 0.2..8 m; below 100 the return is too weak to trust and
+        // 65535 means the receiver saturated.
+        const bool good = _dist_cm >= 20 && _dist_cm <= 800 &&
+                          _strength >= 100 && _strength != 65535;
+        _fix.range_m = (float)_dist_cm * 0.01f;
+        // 2 cm repeatability near, about 1 % of range far, and a floor that
+        // also covers grass and the pad not being a mirror.
+        _fix.sigma_m = 0.05f + 0.01f * _fix.range_m;
+        _fix.t_ms    = now_ms;
+        _fix.valid   = good;
+        return true;
     }
 
-    bool healthy(void) const { return _ok; }
+    const RangeFix &fix(void) const { return _fix; }
+    bool     healthy(void)  const { return _ok && _fails < 10; }
+    uint16_t strength(void) const { return _strength; }
+    float    range_m(void)  const { return (float)_dist_cm * 0.01f; }
 
 private:
+    void fail(void)
+    {
+        if (_fails < 255) _fails++;
+        if (_fails >= 10) _ok = false;
+        _fix.valid = false;
+    }
+
+    TwoWire *_wire = nullptr;
     uint8_t  _addr = 0x10;
     bool     _ok   = false;
+    uint8_t  _fails = 0;
+    uint32_t _last_try_ms = 0;
+    uint16_t _dist_cm = 0, _strength = 0;
     RangeFix _fix  = { 0.0f, 0.0f, 0, false };
 };
 
@@ -1478,10 +1591,46 @@ public:
      * goes live it should also relax the burn-time inflation that
      * set_baro_trust() currently applies.
      */
-    void fuse_range(const RangeFix &r)
+    /**
+     * Fold in a lidar range: HEIGHT ABOVE THE GROUND, measured directly.
+     *
+     * `cos_tilt` is the vertical component of the thrust axis: the beam
+     * looks along the body axis, so height = range * cos(tilt) + offset.
+     *
+     * The lidar has AUTHORITY over the vertical channel once it sees the
+     * ground. Everything else that feeds the altitude down here is either
+     * inside the plume (the barometer) or geometrically blind (UWB below
+     * two metres), and the simulation is explicit that the correction is
+     * best taken as a step: easing it in over a time constant measurably
+     * costs landings, because the planner can use a corrected altitude at
+     * once and cannot use one it knows to be stale. So a reading the gate
+     * refuses three times running RE-ANCHORS the altitude instead of being
+     * thrown away a fourth time.
+     */
+    void fuse_range(const RangeFix &r, float cos_tilt, float offset_m, uint32_t now_ms)
     {
-        if (!r.valid) return;
-        (void)r;      // NOT IMPLEMENTED — no sensor produces a valid fix yet
+        if (!r.valid || !_have_pad_ref) return;
+        const float h = r.range_m * cos_tilt + offset_m;
+        const float R = r.sigma_m * r.sigma_m;
+        if (ariadna_kf_correct(&_kz, 0, h, R, GATE_SIGMA)) {
+            _lidar_rejects = 0;
+            _last_lidar_ms = now_ms;
+            _lidar_seen    = true;
+        } else if (++_lidar_rejects >= 3) {
+            _kz.x[0]    = h;
+            _kz.P[0][0] = R;
+            _kz.P[0][1] = _kz.P[1][0] = 0.0f;
+            _kz.P[0][2] = _kz.P[2][0] = 0.0f;
+            _lidar_rejects = 0;
+            _last_lidar_ms = now_ms;
+            _lidar_seen    = true;
+        }
+    }
+
+    /** The altitude is lidar referenced: an accepted range within 300 ms. */
+    bool lidar_aided(uint32_t now_ms) const
+    {
+        return _lidar_seen && (uint32_t)(now_ms - _last_lidar_ms) < 300u;
     }
 
     /**
@@ -1877,6 +2026,9 @@ private:
     float    _uwb_resid   = 0.0f;
 
     bool     _baro_trusted   = true;
+    bool     _lidar_seen     = false;
+    uint8_t  _lidar_rejects  = 0;
+    uint32_t _last_lidar_ms  = 0;
     ariadna_baro_trim_t _trim;         // how much the barometer reads HIGH
     float    _last_h_baro    = 0.0f;   // m, RAW, before the trim
     uint32_t _last_h_baro_ms = 0;
@@ -1964,7 +2116,13 @@ static Estimator s_est;
  * an uncompensated 150 ms is 6 m of position error, and any value in the
  * right range removes most of it.
  */
-static const float GPS_LATENCY_S = 0.15f;
+// How late a GPS fix is when its sentence arrives: the receiver's own
+// processing plus the UART. A PARAMETER (pos.gps_latency_ms, default
+// 50 ms). The fix is compared against where the filter says the vehicle
+// was that long ago - Estimator::fuse_gps() ages it forward with the
+// filter's own velocity and acceleration - so a late fix is used at full
+// weight instead of dragging the solution back along the flight path.
+#define GPS_LATENCY_S  (PRM(POS_GPS_LATENCY) * 1e-3f)
 
 /** Measured specific force magnitude, in g. Includes gravity. */
 static float accel_magnitude_g(void)
@@ -1986,17 +2144,13 @@ static float accel_magnitude_g(void)
  * Read the ZUPT gating note at the call site before reusing this: on its
  * own, "1 g and not rotating" does NOT mean stationary.
  */
-static bool motion_is_quiet(float accel_g, uint32_t now_ms)
+static bool motion_is_quiet(float accel_g, float gsum, uint32_t now_ms)
 {
     static const float    ZUPT_ACC_TOL_G    = 0.04f;
     static const float    ZUPT_GYRO_TOL_DPS = 2.0f;
     static const uint32_t ZUPT_HOLD_MS      = 300;
 
     static uint32_t quiet_since_ms = 0;
-
-    const float gsum = fabsf((float)fusion.lastGx) +
-                       fabsf((float)fusion.lastGy) +
-                       fabsf((float)fusion.lastGz);
 
     if (fabsf(accel_g - 1.0f) < ZUPT_ACC_TOL_G && gsum < ZUPT_GYRO_TOL_DPS) {
         if (quiet_since_ms == 0) quiet_since_ms = now_ms ? now_ms : 1;
@@ -2006,6 +2160,177 @@ static bool motion_is_quiet(float accel_g, uint32_t now_ms)
 
     return quiet_since_ms != 0 &&
            (uint32_t)(now_ms - quiet_since_ms) >= ZUPT_HOLD_MS;
+}
+
+// =====================================================================
+//  7b. THE ATTITUDE SOURCE
+//
+//  One function, two implementations chosen at compile time by
+//  ARIADNA_USE_INSLIB (see the top of this file). Whatever is behind it,
+//  the rest of the sketch gets the same five things, all consistent with
+//  ONE body-to-pad rotation: the matrix, the same rotation as a
+//  quaternion, the gyro rates and the gravity-free acceleration in the pad
+//  frame, and an Euler triple for the telemetry.
+// =====================================================================
+struct Attitude {
+    float R[3][3];        // body (TriSense axes) -> pad-ENU
+    float q[4];           // the same rotation, w first
+    float w_pad[3];       // rad/s, measured rates rotated into the pad frame
+    float w_abs;          // |rate| in deg/s, for the standstill detector
+    float a_pad[3];       // m/s^2, gravity removed
+    float roll, pitch, heading;   // deg, telemetry only
+    float hz;             // update rate actually achieved
+    bool  fresh;
+};
+
+/** Rotation matrix -> quaternion (w, x, y, z), the numerically safe branch. */
+static void quat_from_matrix(const float R[3][3], float q[4])
+{
+    const float tr = R[0][0] + R[1][1] + R[2][2];
+    if (tr > 0.0f) {
+        float s = sqrtf(tr + 1.0f) * 2.0f;
+        q[0] = 0.25f * s;
+        q[1] = (R[2][1] - R[1][2]) / s;
+        q[2] = (R[0][2] - R[2][0]) / s;
+        q[3] = (R[1][0] - R[0][1]) / s;
+    } else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) {
+        float s = sqrtf(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f;
+        q[0] = (R[2][1] - R[1][2]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (R[0][1] + R[1][0]) / s;
+        q[3] = (R[0][2] + R[2][0]) / s;
+    } else if (R[1][1] > R[2][2]) {
+        float s = sqrtf(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f;
+        q[0] = (R[0][2] - R[2][0]) / s;
+        q[1] = (R[0][1] + R[1][0]) / s;
+        q[2] = 0.25f * s;
+        q[3] = (R[1][2] + R[2][1]) / s;
+    } else {
+        float s = sqrtf(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f;
+        q[0] = (R[1][0] - R[0][1]) / s;
+        q[1] = (R[0][2] + R[2][0]) / s;
+        q[2] = (R[1][2] + R[2][1]) / s;
+        q[3] = 0.25f * s;
+    }
+    float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (n > 1e-6f) { q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n; }
+    else           { q[0] = 1.0f; q[1] = q[2] = q[3] = 0.0f; }
+}
+
+/**
+ * INSLIB's rotation (body FRD -> NED) as this vehicle's (TriSense axes ->
+ * pad-ENU). Two fixed changes of basis and no angles:
+ *
+ *   TriSense -> FRD   diag(+1, -1, -1)   (the library's ComponentsUp mount)
+ *   NED -> ENU        East = N row 1, North = N row 0, Up = -(N row 2)
+ *
+ * Checked in self_test(): standing on the pad the thrust axis must come
+ * out as (0, 0, -1), and pointing the board's X axis East must put body X
+ * on pad +x.
+ */
+static void ins_to_pad(const float Rn[3][3], float R[3][3])
+{
+    for (uint8_t j = 0; j < 3; j++) {
+        const float m = (j == 0) ? 1.0f : -1.0f;
+        R[0][j] =  Rn[1][j] * m;
+        R[1][j] =  Rn[0][j] * m;
+        R[2][j] = -Rn[2][j] * m;
+    }
+}
+
+static Attitude s_att;
+
+static void attitude_begin(void)
+{
+    memset(&s_att, 0, sizeof(s_att));
+    s_att.R[0][0] = s_att.R[1][1] = s_att.R[2][2] = 1.0f;
+    s_att.q[0] = 1.0f;
+#if ARIADNA_USE_INSLIB
+    TriSenseINSConfig cfg;
+    cfg.navRateHz     = 200;
+    cfg.gnssLatencyMs = 50;            // refined per fix from pos.gps_latency_ms
+    cfg.autoZupt      = true;          // switched off at launch, see the loop
+    ins.setMounting(TriSenseINSMount::ComponentsUp);
+    ins.setDeclination(5.6f);          // until the first fix sets the WMM position
+    ins.begin(cfg);                    // calibrates the gyro: keep the vehicle still
+    // INSLIB set the barometer up for itself (50 Hz, OSR x8, no IIR), which
+    // is also what the estimator in section 7 samples at.
+#else
+    sensor.autoCalibrateGyro(1000);
+    fusion.initOrientation(200);
+#endif
+}
+
+static void attitude_recalibrate(void)
+{
+#if ARIADNA_USE_INSLIB
+    sensor.autoCalibrateGyro(1000);
+    ins.reset();
+#else
+    sensor.autoCalibrateGyro(1000);
+    fusion.initOrientation(200);
+#endif
+}
+
+/**
+ * `in_flight` is the Master's word that the vehicle has left the pad. From
+ * then until it is down, nothing may level the attitude against the
+ * accelerometer or pin the velocity to zero: a vehicle at terminal
+ * velocity reads exactly 1 g with a quiet gyro.
+ */
+static void attitude_update(bool in_flight)
+{
+    static bool was_in_flight = false;
+#if ARIADNA_USE_INSLIB
+    if (in_flight != was_in_flight) ins.setAutoZupt(!in_flight);
+    s_att.fresh = ins.update();
+
+    float Rn[3][3];
+    if (ins.getRotationMatrix(Rn)) {
+        ins_to_pad(Rn, s_att.R);
+        quat_from_matrix(s_att.R, s_att.q);
+    }
+    float wr = 0.0f, wp = 0.0f, wy = 0.0f;
+    if (ins.getAngularRate(wr, wp, wy)) {
+        // FRD -> TriSense axes is the same diag(+1, -1, -1)
+        const float wb[3] = { wr * (float)DEG_TO_RAD, -wp * (float)DEG_TO_RAD,
+                              -wy * (float)DEG_TO_RAD };
+        rotate(s_att.R, wb, s_att.w_pad);
+        s_att.w_abs = fabsf(wr) + fabsf(wp) + fabsf(wy);
+    }
+    float an = 0.0f, ae = 0.0f, ad = 0.0f;
+    if (ins.getAccelerationNED(an, ae, ad)) {
+        s_att.a_pad[0] = ae;  s_att.a_pad[1] = an;  s_att.a_pad[2] = -ad;
+    }
+    (void)ins.getRPY(s_att.roll, s_att.pitch, s_att.heading);
+    s_att.hz = (float)ins.getEpochRateHz();
+#else
+    if (in_flight != was_in_flight) {
+        // Gyro only in flight. The gyro was calibrated on the pad and the
+        // whole flight is under a minute; what the accelerometer would
+        // "correct" up there is not an error.
+        if (in_flight && PRM(POS_ATT_FREEZE) > 0.5f) fusion.setMaxGains(0.0f, 0.0f);
+        else                                         fusion.setMaxGains(0.1f, 0.05f);
+    }
+    s_att.fresh = fusion.update();
+    fusion.getOrientationDegrees(s_att.roll, s_att.pitch, s_att.heading);
+    build_rotation(s_att.roll, s_att.pitch, s_att.heading, s_att.R);
+    build_quaternion(s_att.roll, s_att.pitch, s_att.heading, s_att.q);
+    // Gyro rates straight from the sensor, ROTATED, never differentiated.
+    const float g_body[3] = { (float)fusion.lastGx * (float)DEG_TO_RAD,
+                              (float)fusion.lastGy * (float)DEG_TO_RAD,
+                              (float)fusion.lastGz * (float)DEG_TO_RAD };
+    rotate(s_att.R, g_body, s_att.w_pad);
+    s_att.w_abs = fabsf((float)fusion.lastGx) + fabsf((float)fusion.lastGy) +
+                  fabsf((float)fusion.lastGz);
+    // Body-frame linear acceleration (yaw independent by construction),
+    // rotated by the SAME matrix that produces u and w.
+    float ab[3];
+    fusion.getLinearAcceleration(ab[0], ab[1], ab[2], ACCEL_UNIT_MS2);
+    rotate(s_att.R, ab, s_att.a_pad);
+    s_att.hz = fusion.getActualFusionHz();
+#endif
+    was_in_flight = in_flight;
 }
 
 // =====================================================================
@@ -2041,6 +2366,20 @@ static void handle_command(const ariadna_cmd_t *c)
     }
 }
 
+/** One parameter from the Master. Ground only; never under a flight. */
+static void param_receive(const ariadna_param_pkt_t *p)
+{
+    if (s_have_master && s_master.state >= ARIADNA_STATE_ASCENT &&
+        s_master.state <= ARIADNA_STATE_LANDED) return;
+    if (p->count != ARIADNA_PARAM_COUNT || p->id >= ARIADNA_PARAM_ID_MAX) return;
+    if (!ariadna_param_set(&s_params, p->id, p->value)) return;
+    const uint8_t bit = (uint8_t)(1u << (p->id & 7));
+    if (!(s_param_seen[p->id >> 3] & bit)) {
+        s_param_seen[p->id >> 3] |= bit;
+        s_params_seen_n = (uint8_t)(s_params_seen_n + 1);
+    }
+}
+
 static void link_poll(void)
 {
     while (MASTER_PORT.available()) {
@@ -2062,6 +2401,11 @@ static void link_poll(void)
             ariadna_cmd_t c;
             if (!ariadna_unpack(pl, len, &c, sizeof(c))) break;
             handle_command(&c);
+            break;
+        }
+        case ARIADNA_PKT_PARAM: {
+            ariadna_param_pkt_t pp;
+            if (ariadna_unpack(pl, len, &pp, sizeof(pp))) param_receive(&pp);
             break;
         }
         default: break;
@@ -2228,9 +2572,17 @@ static bool sensors_begin(void)
     // is already a filter, and filtering twice adds phase lag that the
     // vertical channel then has to fight. Anything past IIR_3 here shows up
     // as lag in vz.
-    sensor.bmp.setOversampling(BMP580_OSR_x2, BMP580_OSR_x1);
+    //
+    // Voltino_TriSense 1.6: configure() writes OSR and ODR from STANDBY, the
+    // order the datasheet asks for, and reports odr_is_valid - the bit the
+    // part clears when it cannot meet the requested rate and silently runs
+    // at something else. The IIR is likewise written from STANDBY by the
+    // library now. With ARIADNA_USE_INSLIB the INS re-configures the
+    // barometer for itself afterwards (50 Hz, x8, no IIR).
     sensor.bmp.setIIRFilter(BMP580_IIR_3, BMP580_IIR_OFF);
-    sensor.bmp.setODR(BMP580_ODR_240Hz);   // max ODR; valid with x2/x1
+    if (!sensor.bmp.configure(BMP580_OSR_x2, BMP580_OSR_x1, BMP580_ODR_240Hz)) {
+        POS_PRINT("# BMP580 refused 240 Hz at OSR x2/x1 - running at its effective rate\n");
+    }
 
     // ---- fusion ------------------------------------------------------
     // Mount orientation: TriSense Z-up on a vehicle standing on the pad.
@@ -2269,6 +2621,49 @@ static bool sensors_begin(void)
 static bool self_test(void)
 {
     bool ok = true;
+
+    // ---- INSLIB frame conversion (section 7b) ----
+    // A sign error here mirrors an axis for the whole flight, so it is
+    // checked whichever attitude source is compiled in.
+    {
+        // Level, board X to the North: R_nb = I. Standing on the pad the
+        // thrust axis must point DOWN, and body X must be pad North (+y).
+        const float I3[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        float R[3][3], v[3], q[4], vq[3];
+        ins_to_pad(I3, R);
+        rotate(R, BODY_THRUST_AXIS, v);
+        const float bx[3] = { 1.0f, 0.0f, 0.0f };
+        float n[3];
+        rotate(R, bx, n);
+        if (fabsf(v[2] + 1.0f) > 1e-5f || fabsf(n[1] - 1.0f) > 1e-5f || fabsf(n[0]) > 1e-5f) {
+            POS_PRINT("POST ins_to_pad level: u=(%.2f %.2f %.2f) x=(%.2f %.2f %.2f)\n",
+                      v[0], v[1], v[2], n[0], n[1], n[2]);
+            ok = false;
+        }
+        // Yawed 90 deg clockwise seen from above (heading East): body X is
+        // East in NED, and must come out as pad +x.
+        const float Y90[3][3] = { { 0, -1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } };
+        ins_to_pad(Y90, R);
+        rotate(R, bx, n);
+        if (fabsf(n[0] - 1.0f) > 1e-5f || fabsf(n[1]) > 1e-5f) {
+            POS_PRINT("POST ins_to_pad east: x=(%.2f %.2f %.2f)\n", n[0], n[1], n[2]);
+            ok = false;
+        }
+        // The result must be a proper rotation, and the quaternion built
+        // from it must be the same rotation.
+        const float det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1])
+                        - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0])
+                        + R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+        quat_from_matrix(R, q);
+        const float t[3] = { 0.3f, -0.5f, 0.8f };
+        rotate(R, t, v);
+        rotate_q(q, t, vq);
+        if (fabsf(det - 1.0f) > 1e-4f || fabsf(v[0] - vq[0]) > 1e-4f ||
+            fabsf(v[1] - vq[1]) > 1e-4f || fabsf(v[2] - vq[2]) > 1e-4f) {
+            POS_PRINT("POST ins_to_pad: det %.4f, matrix and quaternion disagree\n", det);
+            ok = false;
+        }
+    }
 
     // --- rotation matrix -----------------------------------------------
     float R[3][3], u[3];
@@ -2642,19 +3037,21 @@ void setup()
     ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SOLID, 0);
     ariadna_rgb_service(&s_rgb);
 
+    ariadna_params_default(&s_params);
+    memset(s_param_seen, 0, sizeof(s_param_seen));
+
     bool sensors = sensors_begin();
     s_est.begin();
 
     ariadna_uwb_cfg_default(&s_uwb_cfg);
     memset(&s_uwb_fix, 0, sizeof(s_uwb_fix));
     const bool uwb_ok = s_uwb.begin(SENSOR_I2C);
-    s_lidar.begin();
+    const bool lidar_ok = s_lidar.begin(SENSOR_I2C);
 
     // Level the attitude estimate against gravity. The vehicle must be
     // still for this; it runs before the Master ever arms.
     if (sensors) {
-        sensor.autoCalibrateGyro(1000);
-        fusion.initOrientation(200);
+        attitude_begin();
         s_cal_state = 1;
     }
 
@@ -2662,9 +3059,11 @@ void setup()
     // The tag is a separate board that may still be booting its radio, so
     // "not answering yet" is not a POST failure; the status packet's
     // ARIADNA_SENS_UWB bit says when it is actually ranging.
-    POS_PRINT("\nAriadna V2 Position MCU — POST %s (sensors %s, UWB tag %s)\n",
-              s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL",
-              uwb_ok ? "up" : (ARIADNA_UWB_ENABLED ? "not answering yet" : "not built"));
+    POS_PRINT("\nAriadna V2 Position MCU fw %d — POST %s (sensors %s, UWB tag %s, lidar %s, attitude %s)\n",
+              ARIADNA_FW_VERSION, s_post_pass ? "PASS" : "FAIL", sensors ? "ok" : "FAIL",
+              uwb_ok ? "up" : (ARIADNA_UWB_ENABLED ? "not answering yet" : "not built"),
+              lidar_ok ? "up" : "not answering",
+              ARIADNA_USE_INSLIB ? "INSLIB" : "TriSense fusion");
     if (ARIADNA_UWB_ENABLED)
         POS_PRINT("# UWB: tag at I2C 0x%02X, %u anchors configured, read + solve at %lu Hz\n",
                   (unsigned)ARIADNA_UWB_I2C_ADDR, (unsigned)UWB_ANCHOR_COUNT,
@@ -2734,17 +3133,23 @@ void loop()
     }
     if (s_req_cal_gyro) {
         s_req_cal_gyro = false;
-        sensor.autoCalibrateGyro(1000);
-        fusion.initOrientation(200);
+        attitude_recalibrate();
         s_cal_state = 2;
     }
 
-    // ---- fusion ---------------------------------------------------------
-    // update() drains the IMU FIFO, so calling it at 200 Hz keeps up with a
-    // 1 kHz ODR without losing samples. It is the only place the IMU is
-    // read.
-    bool fused = fusion.update();
-    if (fused) s_sensor_ok |= ARIADNA_SENS_IMU;
+    // ---- attitude -------------------------------------------------------
+    // The only place the IMU FIFO is drained. `in_flight` comes from the
+    // Master: between leaving the pad and standing on the ground again the
+    // attitude source may neither level itself on the accelerometer nor
+    // assume the vehicle is still.
+    const bool in_flight = s_have_master &&
+                           s_master.state >= ARIADNA_STATE_ASCENT &&
+                           s_master.state <= ARIADNA_STATE_GUIDANCE;
+    attitude_update(in_flight);
+    if (s_att.fresh) s_sensor_ok |= ARIADNA_SENS_IMU;
+#if ARIADNA_USE_INSLIB
+    s_sensor_ok |= ARIADNA_SENS_INS;
+#endif
 
     // ---- barometer ------------------------------------------------------
     // baro_fresh is true for exactly ONE estimator step per sample.
@@ -2770,49 +3175,14 @@ void loop()
         }
     }
 
-    // ---- attitude and rates ---------------------------------------------
-    float roll, pitch, heading;
-    fusion.getOrientationDegrees(roll, pitch, heading);
-
-    float R[3][3], u[3], q[4];
-    build_rotation(roll, pitch, heading, R);
-    build_quaternion(roll, pitch, heading, q);
-    rotate(R, BODY_THRUST_AXIS, u);
-
-    // Gyro rates, straight from the sensor, rotated into the pad frame.
-    // ROTATED, NOT DIFFERENTIATED — see the note in ariadna_link.h. The
-    // library exposes them in deg/s.
-    const float g_body[3] = { (float)fusion.lastGx * (float)DEG_TO_RAD,
-                              (float)fusion.lastGy * (float)DEG_TO_RAD,
-                              (float)fusion.lastGz * (float)DEG_TO_RAD };
-    float w[3];
-    rotate(R, g_body, w);
-
-    // ---- acceleration ----------------------------------------------------
-    //
-    // BODY-frame linear acceleration, rotated into pad-ENU by the SAME
-    // matrix that produced u and w above.
-    //
-    // This used to call getGlobalLinearAcceleration() and relabel its X
-    // as North and Y as East. That was wrong, and wrong in the quietest
-    // possible way. The library builds its world frame as Rz(+heading)
-    // with heading a clockwise compass bearing, while pad-ENU azimuth
-    // runs counter-clockwise from East — the two agree along the body's
-    // +X axis and are MIRRORED for +Y. A bench test with the board
-    // pointed North, or tilted along +X only, passes either way; every
-    // other heading fed the horizontal channel an East component of the
-    // wrong sign.
-    //
-    // getLinearAcceleration() is yaw-independent by construction: the
-    // gravity vector it removes is the third row of the rotation matrix,
-    // a function of roll and pitch only. So it is safe to take from the
-    // library and rotate here, which also means this file now performs
-    // exactly ONE body-to-pad rotation and everything on the wire is
-    // consistent with it.
-    float ab[3];
-    fusion.getLinearAcceleration(ab[0], ab[1], ab[2], ACCEL_UNIT_MS2);
-    float a_pad[3];
-    rotate(R, ab, a_pad);
+    // ---- attitude, rates, acceleration -----------------------------------
+    // All from ONE rotation (section 7b), so u, q, w and a cannot disagree.
+    const float roll = s_att.roll, pitch = s_att.pitch, heading = s_att.heading;
+    float u[3];
+    rotate(s_att.R, BODY_THRUST_AXIS, u);
+    const float *q = s_att.q;
+    const float *w = s_att.w_pad;
+    const float *a_pad = s_att.a_pad;
 
     // ---- filter step ------------------------------------------------------
     // The mission clock is taken ONCE per tick and passed to everything
@@ -2848,6 +3218,27 @@ void loop()
                           + GPS_LATENCY_S;
         s_est.fuse_gps(gps, age_s, a_pad[0], a_pad[1], amag_g, now_ms);
         s_sensor_ok |= ARIADNA_SENS_GPS;
+#if ARIADNA_USE_INSLIB
+        // The same fix to the INS, with its age: INSLIB compares it against
+        // the state it had that long ago. This is what keeps the ATTITUDE
+        // honest while the vehicle is accelerating.
+        if (gps.fix >= 3) {
+            TriSenseGnssFix f;
+            f.latDeg   = (double)gps.lat_1e7 * 1e-7;
+            f.lonDeg   = (double)gps.lon_1e7 * 1e-7;
+            f.altMslM  = gps.alt_msl;
+            f.hdop     = (float)gps.hdop_x10 * 0.1f;
+            f.sats     = gps.sats;
+            f.speedMps = sqrtf(gps.vel_e * gps.vel_e + gps.vel_n * gps.vel_n);
+            float crs  = atan2f(gps.vel_e, gps.vel_n) * (float)RAD_TO_DEG;
+            f.courseDeg = crs < 0.0f ? crs + 360.0f : crs;
+            // on top of the 50 ms the INS was configured with
+            float extra = PRM(POS_GPS_LATENCY) - 50.0f;
+            if (extra < 0.0f) extra = 0.0f;
+            f.ageMs    = (uint32_t)(now_ms - gps.t_ms) + (uint32_t)extra;
+            (void)ins.feedGnss(f);
+        }
+#endif
     }
 
     // ---- zero-velocity update, ON THE PAD ONLY ----------------------------
@@ -2876,7 +3267,7 @@ void loop()
                          s_master.state == ARIADNA_STATE_ARMED ||
                          s_master.state == ARIADNA_STATE_TEST);
 
-    if (on_pad && motion_is_quiet(amag_g, now_ms)) s_est.fuse_zupt();
+    if (on_pad && motion_is_quiet(amag_g, s_att.w_abs, now_ms)) s_est.fuse_zupt();
     else                                           s_est.clear_zupt();
 
     // ---- horizontal speed prior, ~1 Hz while GPS is stale ----------------
@@ -2890,9 +3281,28 @@ void loop()
     }
 
     // ---- lidar ------------------------------------------------------------
-    // Returns an invalid fix today. The call is here so that the path from
-    // sensor to filter is exercised every tick and cannot rot.
-    s_est.fuse_range(s_lidar.read());
+    //
+    // Polled at 50 Hz on the way down and at 5 Hz otherwise (so the pad
+    // crew can see it is alive). FUSED only when all of these hold:
+    //   * the Master says the vehicle is descending - on the pad the nose,
+    //     and the lidar with it, points at the sky;
+    //   * the thrust axis is within 20 degrees of vertical, so the beam is
+    //     on the ground below and not on the horizon;
+    //   * the range is inside what the sensor is good for.
+    {
+        static uint32_t next_lidar_ms = 0;
+        const bool descending = s_have_master &&
+                                (s_master.state == ARIADNA_STATE_DESCENT ||
+                                 s_master.state == ARIADNA_STATE_GUIDANCE);
+        if (PRM(POS_LIDAR_EN) > 0.5f && (int32_t)(now_ms - next_lidar_ms) >= 0) {
+            next_lidar_ms = now_ms + (descending ? 20 : 200);
+            if (s_lidar.poll(now_ms) && descending && u[2] > 0.94f &&
+                s_lidar.fix().range_m <= PRM(POS_LIDAR_MAX))
+                s_est.fuse_range(s_lidar.fix(), u[2], PRM(POS_LIDAR_OFFSET), now_ms);
+        }
+        if (s_lidar.healthy()) s_sensor_ok |= ARIADNA_SENS_LIDAR;
+        else                   s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR;
+    }
 
     // ---- UWB --------------------------------------------------------------
     //
@@ -2908,7 +3318,7 @@ void loop()
     // Nothing here counts anchors or branches on how many answered — the
     // solver reports what the geometry supported and the estimator
     // weights it. A dead anchor costs accuracy and nothing else.
-    if (ARIADNA_UWB_ENABLED &&
+    if (ARIADNA_UWB_ENABLED && PRM(POS_UWB_EN) > 0.5f &&
         (uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
         last_uwb_solve_ms = now_ms;
         s_uwb.poll();                    // ~1.7 ms of I2C at 400 kHz
@@ -3024,6 +3434,7 @@ void loop()
     // the filter accepted what it produced.
     if (s_uwb.healthy())                 st.flags |= ARIADNA_NAV_UWB_OK;
     if (s_est.uwb_aided(now_ms))         st.flags |= ARIADNA_NAV_UWB_AIDED;
+    if (s_est.lidar_aided(now_ms))       st.flags |= ARIADNA_NAV_LIDAR_OK;
 
     // VALID is what unlocks control on the Navigation MCU, so it demands
     // everything the guidance law actually depends on: an attitude, a
@@ -3049,7 +3460,7 @@ void loop()
         ps.t_ms         = millis();
         ps.rx_ok        = s_rx.rx_ok;
         ps.rx_bad       = s_rx.rx_crc + s_rx.rx_len;
-        ps.fusion_hz    = fusion.getActualFusionHz();
+        ps.fusion_hz    = s_att.hz;
         ps.pad_pressure = s_est.pad_pressure();
         ps.pad_alt_msl  = (have_gps && gps.valid) ? gps.alt_msl : 0.0f;
         ps.roll         = roll;
@@ -3068,6 +3479,18 @@ void loop()
         ps.uwb_mode     = s_uwb_fix.mode;
         ps.uwb_rejects  = s_est.uwb_rejects();
         ps.baro_trim    = s_est.baro_trim();
+        ps.lidar_m      = s_lidar.healthy() ? s_lidar.range_m() : 0.0f;
+        ps.lidar_strength = (uint8_t)(s_lidar.strength() > 65279 ? 255 : s_lidar.strength() >> 8);
+        ps.fw_version   = ARIADNA_FW_VERSION;
+        ps.param_crc    = ariadna_params_crc(&s_params);
+        ps.params_seen  = s_params_seen_n;
+#if ARIADNA_USE_INSLIB
+        ps.ins_mode     = (uint8_t)ins.getMode();
+        ps.att_src      = 1;
+#else
+        ps.ins_mode     = 255;
+        ps.att_src      = 0;
+#endif
 
         if (have_gps && gps.valid) {
             ps.lat      = gps.lat_1e7;
