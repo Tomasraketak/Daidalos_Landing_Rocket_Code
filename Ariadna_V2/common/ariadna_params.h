@@ -58,7 +58,7 @@
     X(13, G_ZETA_TVC,       "g.zeta_tvc",         0.719831f, 0.3f, 3.0f, "-",  'N') \
     X(14, G_SCHED_TVC,      "g.sched_tvc",        0.33202f, -1.0f, 1.0f, "-",  'N') \
     X(15, G_ATT_KI,         "g.att_ki",           2.0f,  0.0f,  4.0f, "1/s",  'N') \
-    X(16, G_ATT_I_LIM,      "g.att_i_lim",        0.05f, 0.0f,  0.2f, "rad s", 'N') \
+    X(16, G_ATT_I_LIM,      "g.att_i_lim",        0.05f, 0.0f,  0.2f, "rad*s", 'N') \
     /* ---- guidance: fin attitude loop ---- */ \
     X(17, G_WN_FIN,         "g.wn_fin",           6.538963f, 1.0f, 20.0f, "rad/s", 'N') \
     X(18, G_ZETA_FIN,       "g.zeta_fin",         1.585314f, 0.3f, 3.0f, "-",  'N') \
