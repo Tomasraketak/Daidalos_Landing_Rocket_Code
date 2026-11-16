@@ -90,6 +90,13 @@
 #endif
 
 // EUIs differ only in the first byte, which becomes the short address.
+// Antenna delay of each anchor's DW1000, in device time units (1 unit is
+// ~4.69 mm of range). 0 = the library's default (16384). Measure it per
+// board: CALIBRATION_MANUAL.md chapter 5.3. If a range at a surveyed 5.00 m
+// reads e metres long, ADD e / 0.00469 / 2 here (the delay counts on both
+// ends of the exchange; the tag carries its own in Uwb_Tag.ino).
+static const uint16_t ANCHOR_ANTENNA_DELAY[4] = { 0, 0, 0, 0 };
+
 static const char *ANCHOR_EUI[4] = {
     "01:00:5B:D5:A9:9A:E2:9C",   // short address 0x0001
     "02:00:5B:D5:A9:9A:E2:9C",   // 0x0002
@@ -226,6 +233,8 @@ void setup()
     DW1000Ranging.startAsAnchor((char *)ANCHOR_EUI[ANCHOR_ID - 1],
                                 DW1000.MODE_LONGDATA_RANGE_ACCURACY,
                                 false);
+    if (ANCHOR_ANTENNA_DELAY[ANCHOR_ID - 1])
+        DW1000.setAntennaDelay(ANCHOR_ANTENNA_DELAY[ANCHOR_ID - 1]);
     s_up = true;
 
     Serial.print("\nAriadna V2 UWB anchor ");

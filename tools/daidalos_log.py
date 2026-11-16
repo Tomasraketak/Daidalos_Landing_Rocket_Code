@@ -4,6 +4,7 @@ Download the Master's flight log over USB and write it as CSV.
 
     python tools/daidalos_log.py --port COM5 --out flight.csv      # whole log
     python tools/daidalos_log.py --port /dev/ttyACM0 --info         # how much is there
+    python tools/daidalos_log.py --port COM5 --flights-only         # only the flights
     python tools/daidalos_log.py --decode dump.txt --out flight.csv # from a saved dump
     python tools/daidalos_log.py --port COM5 --erase                # after downloading!
 
@@ -106,6 +107,8 @@ def main() -> int:
     ap.add_argument("--decode", help="decode a saved raw dump instead of reading the board")
     ap.add_argument("--from", dest="start", type=int, default=0, help="first record")
     ap.add_argument("--info", action="store_true")
+    ap.add_argument("--flights-only", action="store_true",
+                    help="only the flights (LOG FLIGHTS), each with 3 s of ground data around it")
     ap.add_argument("--erase", action="store_true", help="erase the log (parameters are kept)")
     args = ap.parse_args()
 
@@ -140,26 +143,43 @@ def main() -> int:
         if args.info or not info.startswith("OK"):
             return 0 if info.startswith("OK") else 1
         n_total = int(info.split()[4])
-        ln = cmd(f"LOG DUMP {args.start}", "OK LOG")
-        if not ln.startswith("OK LOG BEGIN"):
-            print(ln)
-            return 1
-        n = int(ln.split()[3])
-        t0, last = time.time(), time.time()
-        while True:
-            ln = ser.readline().decode(errors="replace").strip()
-            if ln.startswith("LOGR"):
-                lines.append(ln)
-                last = time.time()
-                if len(lines) % 500 == 0:
-                    rate = len(lines) / max(time.time() - t0, 1e-3)
-                    print(f"\r  {len(lines)}/{n} records, {rate:.0f}/s", end="", flush=True)
-            elif ln.startswith("OK LOG DUMP") or ln.startswith("ERR"):
-                break
-            elif time.time() - last > 10:
-                print("\n  timeout")
-                break
-        print(f"\r  {len(lines)}/{n} records (log holds {n_total})")
+        jobs = [(args.start, 0)]
+        if args.flights_only:
+            ser.write(b"LOG FLIGHTS\n")
+            jobs, t0 = [], time.time()
+            while time.time() - t0 < 60:
+                ln = ser.readline().decode(errors="replace").strip()
+                if ln.startswith("LOGF"):
+                    p = ln.split()
+                    st, cnt = int(p[2]), int(p[3])
+                    a = max(0, st - 30)                      # 3 s of 10 Hz ground data
+                    jobs.append((a, st - a + cnt + 30))
+                    print(f"  flight {int(p[1]) + 1}: {cnt} records, max {p[6]} m")
+                elif ln.startswith("OK LOG FLIGHTS") or ln.startswith("ERR"):
+                    break
+        for start, count in jobs:
+            ln = cmd(f"LOG DUMP {start}" + (f" {count}" if count else ""), "OK LOG")
+            if not ln.startswith("OK LOG BEGIN"):
+                print(ln)
+                return 1
+            n = int(ln.split()[3])
+            t0, last, got = time.time(), time.time(), 0
+            while True:
+                ln = ser.readline().decode(errors="replace").strip()
+                if ln.startswith("LOGR"):
+                    lines.append(ln)
+                    got += 1
+                    last = time.time()
+                    if got % 500 == 0:
+                        rate = got / max(time.time() - t0, 1e-3)
+                        print(f"\r  {got}/{n} records, {rate:.0f}/s", end="", flush=True)
+                elif ln.startswith("OK LOG DUMP") or ln.startswith("ERR"):
+                    break
+                elif time.time() - last > 10:
+                    print("\n  timeout")
+                    break
+            print(f"\r  {got}/{n} records")
+        print(f"  {len(lines)} records downloaded (log holds {n_total})")
     if args.raw:
         with open(args.raw, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")

@@ -8,13 +8,13 @@ Odkazy: [`USER_MANUAL.md`](USER_MANUAL.md), [`CALIBRATION_MANUAL.md`](CALIBRATIO
 | | úkol | proč | kde |
 |---|---|---|---|
 | ☐ | **Pozorovatel větru z LandSim_Light** (on-board wind observer) | LandSim (2. audit) odhaduje vítr ve volném pádu z gyra — bez něj počítají křidélka a dopředná kompenzace s rychlostí vůči zemi místo vůči vzduchu; v LandSim to odstranilo vzácné rozkmitání (1 let z 90 do 40–50° ještě před zážehem). V našem testu s větrem 1,8 m/s raketa přistane, ale silnější vítr testovaný není. | port `tvc_sim.py` (`WIND_OBS_*`, blok „on-board wind observer“) do `common/guidance.cpp`; přidat do `guid_test` případ s větrem 4–6 m/s |
-| ☐ | **Zpoždění antény UWB** v kódu | firmware používá výchozí hodnotu knihovny arduino-dw1000; konstantní chyba vzdálenosti > 15 cm se dnes jen „schová“ do nejistoty | `Uwb_Anchor.ino` / `Uwb_Tag.ino`: konstanta `ANTENNA_DELAY` + `DW1000.setAntennaDelay()`; postup měření v `CALIBRATION_MANUAL.md` kap. 5.3 |
+| ✅ | **Zpoždění antény UWB** v kódu — konstanty `ANCHOR_ANTENNA_DELAY[]` / `TAG_ANTENNA_DELAY` (0 = výchozí); zbývá **změřit** (C) | firmware používá výchozí hodnotu knihovny arduino-dw1000; konstantní chyba vzdálenosti > 15 cm se dnes jen „schová“ do nejistoty | `Uwb_Anchor.ino` / `Uwb_Tag.ino`: konstanta `ANTENNA_DELAY` + `DW1000.setAntennaDelay()`; postup měření v `CALIBRATION_MANUAL.md` kap. 5.3 |
 | ☐ | Steering zero-effort velocity (booster) | v LandSim jen s boosterem D9 — Daidalos ho nemá; **nepotřeba**, pokud se booster nepřidá | — |
 | ☐ | Roztažení aerobrzdy do telemetrie / záznamu | firmware ho počítá (`brake_frac`), ale neposílá — po letu by šlo ověřit, jestli brzda opravdu byla venku | `ariadna_nav_status_t` + `LogRecord` |
 | ☐ | Tabulka motoru a geometrie křidélek jako parametry | dnes zakompilované v `guidance_tables.h`; změna motoru = přegenerovat a nahrát firmware | `make tables VEHICLE=…` funguje; parametry by to zjednodušily |
 | ☐ | `DG_CLAMP_MIN` (min. tah klapky) z LandSim | pevně 0,10 v `guidance.h`, generátor ho nepřepisuje | `tools/gen_guidance_tables.py` |
 | ☐ | Import CSV z pozemní vizualizace do záložky Letový záznam | dnes umí jen formát záznamu z flash | `Diagnostics/diag_log.py` |
-| ☐ | `tools/daidalos_log.py --flights-only` | GUI už stahuje jen lety, příkazová řádka zatím celé | `LOG FLIGHTS` + `LOG DUMP od počet` |
+| ✅ | `tools/daidalos_log.py --flights-only` | GUI už stahuje jen lety, příkazová řádka zatím celé | `LOG FLIGHTS` + `LOG DUMP od počet` |
 | ☐ | Celý odhadovač polohy do hlavičky a do `make check` | dnes testovaný po částech (filtr, UWB, trim), třída `Estimator` je v `.ino` | `Position_MCU.ino` → `common/` |
 
 ## B. Ověřit na hardwaru (kód je hotový)

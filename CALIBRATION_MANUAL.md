@@ -298,13 +298,17 @@ Tabulka má 8 míst. Kotva na 3m tyči u rampy výrazně zlepší výšku z UWB 
 ### 5.3 Zpoždění antény (jednou pro každou kotvu a tag)
 
 Každý DWM1000 má vlastní zpoždění antény, které se projeví jako konstantní přičtená
-vzdálenost. Firmware zatím používá výchozí hodnotu knihovny arduino-dw1000.
+vzdálenost.
 
 1. Tag a jednu kotvu postavte na stativy přesně 5,00 m od sebe (anténa–anténa), volný prostor.
 2. V záložce *Poloha a senzory* odečtěte vzdálenost k té kotvě (průměr ze 100 měření).
 3. Chyba `e = změřeno − 5,00 m`. Do ±0,15 m nic nedělejte (filtr má podlahu nejistoty
-   pro tuto chybu). Pokud je větší, nastavte v `Uwb_Anchor.ino` po inicializaci
-   `DW1000.setAntennaDelay(výchozí + e / 0,00469)` (1 jednotka ≈ 4,69 mm) a změřte znovu.
+   pro tuto chybu).
+4. Jinak se chyba rozdělí mezi oba konce: k zpoždění kotvy i tagu přičtěte
+   `e / 0,00469 / 2` jednotek (výchozí hodnota knihovny je 16384):
+   * kotva: `ANCHOR_ANTENNA_DELAY[číslo − 1]` v `Uwb_Anchor.ino`,
+   * tag: `TAG_ANTENNA_DELAY` v `Uwb_Tag.ino` (0 = výchozí).
+5. Nahrát firmware, změřit znovu; pak stejně pro ostatní kotvy (už jen kotvu, tag je hotový).
 
 ---
 

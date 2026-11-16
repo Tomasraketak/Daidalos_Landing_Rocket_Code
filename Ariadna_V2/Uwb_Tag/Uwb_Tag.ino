@@ -309,6 +309,10 @@ void setup()
         // anchor that logs who it ranged with logs something meaningful.
         DW1000Ranging.startAsTag((char *)TAG_EUI,
                                  DW1000.MODE_LONGDATA_RANGE_ACCURACY, false);
+        // Antenna delay of the tag's DW1000 (0 = library default 16384);
+        // CALIBRATION_MANUAL.md chapter 5.3.
+        static const uint16_t TAG_ANTENNA_DELAY = 0;
+        if (TAG_ANTENNA_DELAY) DW1000.setAntennaDelay(TAG_ANTENNA_DELAY);
     }
     critical_section_enter_blocking(&s_cs);
     s_flags = s_radio_up ? ARIADNA_UWB_LF_RADIO_UP : 0;
