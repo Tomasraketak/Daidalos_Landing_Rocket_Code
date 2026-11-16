@@ -52,6 +52,7 @@ import actuator_gui as ag                            # noqa: E402
 from actuator_gui import button, chip, label, set_chip, Card   # noqa: E402
 from daidalos_widgets import (RocketView, TiltBubble, StripChart, PadMap,   # noqa: E402
                               attitude_summary)
+from diag_log import LogTab                            # noqa: E402
 from diag_ignition import IgnitionTab                # noqa: E402
 
 APP_NAME = "Daidalos · Diagnostika"
@@ -259,6 +260,9 @@ class FlightSimBoard(ag.SimBoard):
             elif sub == "LOAD":
                 self.q.put(f"OK PARAM LOAD eeprom {self.crc()}")
             return
+        if c == "LOG":
+            self._log_cmd(p)
+            return
         if c in ("PADREF", "CAL", "FLIGHTARM"):
             self.q.put(f"OK {line.upper()}")
             return
@@ -267,6 +271,70 @@ class FlightSimBoard(ag.SimBoard):
                 self.q.put(f"ERR {c} needs TEST mode (send TEST 1)")
             return
         super()._cmd(line)
+
+    # ---- a synthetic flight log: pad at 10 Hz, one flight at 200 Hz, recovery
+    def _sim_log(self) -> list[bytes]:
+        if getattr(self, "_log", None) is not None:
+            return self._log
+        import struct
+        from diag_log import dlog
+        recs, t = [], 0
+        def rec(t_ms, st, ph, h, vz, fl, thr=0.0, k=1.0, drag=0, ts=0, fg=100, tvc=0.0):
+            return struct.pack(dlog.FMT, t_ms, 0.0, 0.0, h, 0.1, -0.05, vz, 0.0, 0.0,
+                               1.0 if st >= 5 else -1.0, 0.0, 0.0, 0.0, 500000000, 140000000,
+                               tvc, -tvc / 2, k, thr, k, 7900, 900, 0x1F, st, ph, 0x07, 7, 0, 0,
+                               fg, drag, ts, fl)
+        for i in range(600):                       # 60 s on the pad, 10 Hz
+            recs.append(rec(t, 2 if i > 300 else 1, 0, 0.0, 0.0, 0)); t += 100
+        h, vz = 0.0, 0.0
+        for i in range(200 * 26):                  # 26 s of flight, 200 Hz
+            tt = i / 200.0
+            if tt < 1.2:   a, st, ph = 60.0, 3, 1
+            elif vz > 0:   a, st, ph = -9.81 - 0.004 * vz * vz, 3, 1
+            elif h > 55:   a, st, ph = -9.81 + 0.0085 * vz * vz, 5, 2
+            elif h > 0.05: a, st, ph = 18.0 + 0.002 * vz * vz, 6, 4
+            else:          a, st, ph = 0.0, 7, 5
+            vz += a * 0.005; h = max(h + vz * 0.005, 0.0)
+            if h <= 0.0 and ph >= 4: vz = 0.0
+            burn = ph == 4
+            recs.append(rec(t, st, ph, h, vz, 1, thr=95.0 if burn else 0.0, k=0.7 if burn else 1.0,
+                            drag=103 if ph == 2 else 0, ts=97 if burn else 0, fg=112,
+                            tvc=1.5 * math.sin(tt * 9) if burn else 0.0))
+            t += 5
+        for i in range(300):                       # recovery, 10 Hz
+            recs.append(rec(t, 8, 5, 0.0, 0.0, 0)); t += 100
+        self._log = recs
+        return recs
+
+    def _log_cmd(self, p) -> None:
+        sub = p[1].upper() if len(p) > 1 else "INFO"
+        log = self._sim_log()
+        if sub == "INFO":
+            self.q.put(f"OK LOG INFO {len(log) * 96} {len(log)} 96")
+        elif sub == "FLIGHTS":
+            self.q.put(f"OK LOG SCAN {len(log)}")
+            import struct
+            from diag_log import dlog
+            fl = [i for i, r in enumerate(log) if r[-1] & 1]
+            if fl:
+                t0 = struct.unpack_from("<I", log[fl[0]])[0]; t1 = struct.unpack_from("<I", log[fl[-1]])[0]
+                hm = max(struct.unpack(dlog.FMT, log[i])[3] for i in fl)
+                self.list_queue.append(f"LOGF 0 {fl[0]} {len(fl)} {t0} {t1} {hm:.1f}")
+            self.list_queue.append(f"OK LOG FLIGHTS {1 if fl else 0}")
+        elif sub == "DUMP":
+            a = int(p[2]) if len(p) > 2 else 0
+            n = int(p[3]) if len(p) > 3 else len(log)
+            part = log[a:a + n]
+            self.q.put(f"OK LOG BEGIN {len(part)} 96")
+            self.list_queue += [f"LOGR {a + i} {r.hex()}" for i, r in enumerate(part)]
+            self.list_queue.append(f"OK LOG DUMP {a + len(part)}")
+        elif sub == "STOP":
+            self.list_queue = [l for l in self.list_queue if not l.startswith("LOGR")]
+            self.q.put("OK LOG STOP")
+        elif sub == "ERASE":
+            self._log = []
+            self.q.put("OK LOG ERASING 0")
+            self.list_queue.append("OK LOG ERASE")
 
     def readline(self, timeout: float = 0.05):
         now = time.monotonic()
@@ -452,6 +520,8 @@ class DiagWindow(ag.MainWindow):
         self.tabs.addTab(self._build_params(), "Parametry a časování")
         self.ign_tab = IgnitionTab(self)
         self.tabs.addTab(self._scroll(self.ign_tab), "Zážeh a LandSim")
+        self.log_tab = LogTab(self)
+        self.tabs.addTab(self._scroll(self.log_tab), "Letový záznam")
         outer.addWidget(self.tabs, 1)
         self.tabs.setStyleSheet(
             f"QTabBar::tab {{ padding: 8px 18px; color: {ag.C['muted']}; border: none; }}"
@@ -875,6 +945,12 @@ class DiagWindow(ag.MainWindow):
             return
         if line.startswith("PRM "):
             self._prm(line)
+            return
+        if line.startswith(("LOGR ", "LOGF ", "OK LOG", "ERR LOG")):
+            if hasattr(self, "log_tab"):
+                self.log_tab.on_line(line)
+            if not line.startswith("LOGR "):
+                self.log(line)
             return
         if line.startswith("I DAIDALOS"):
             self.flight_fw = True

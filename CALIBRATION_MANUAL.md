@@ -599,7 +599,9 @@ hmotnost), nejméně 2 g. Breakwire je primární, tohle je záloha.
 
 ### 10.1 Stažení letového záznamu
 
-Master zapisuje 50× za s od ARMED do LANDED na flash (96 B/záznam). Stažení (diagnostiku
+Master zapisuje na flash 200× za s za letu a 10× za s na zemi (96 B/záznam). Nejjednodušší
+je záložka diagnostiky **Letový záznam** (*Najít lety* → *Stáhnout vybrané lety* — souhrn
+kalibračních čísel se ukáže nad grafy, *Exportovat CSV*). Z příkazové řádky (diagnostiku
 zavřete, raketa v IDLE nebo RECOVERY):
 
 ```bash
@@ -613,7 +615,7 @@ můžete záznam smazat (parametry zůstanou):
 python tools/daidalos_log.py --port COM5 --erase
 ```
 
-Konzolové příkazy, které program používá: `LOG INFO`, `LOG DUMP [od]`, `LOG STOP`,
+Konzolové příkazy, které program používá: `LOG INFO`, `LOG FLIGHTS`, `LOG DUMP [od [počet]]`, `LOG STOP`,
 `LOG ERASE`.
 
 ### 10.2 Cd → `g.cd_body`

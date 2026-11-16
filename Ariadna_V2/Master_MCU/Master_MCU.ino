@@ -237,7 +237,14 @@ static const float SERVO_US_MAX    = 2100.0f;
 static const uint32_t FLASH_SIZE     = 16UL * 1024UL * 1024UL;  // W25Q128
 static const uint32_t FLASH_SECTOR   = 4096;
 static const uint32_t FLASH_PAGE     = 256;
-static const uint32_t LOG_HZ         = 50;
+// 200 Hz in flight (ASCENT..LANDED: every control tick), 10 Hz on the
+// ground (BOOT, IDLE, ARMED, TEST, RECOVERY ...). 96 B x 200 Hz = 19.2 kB/s:
+// the 16 MB chip holds ~14 min of flight. Ground logging stops when less
+// than LOG_FLIGHT_RESERVE is left, so a long day on the pad can never eat
+// the room the flight needs.
+static const uint32_t LOG_HZ_FLIGHT  = 200;
+static const uint32_t LOG_HZ_GROUND  = 10;
+static const uint32_t LOG_FLIGHT_RESERVE = 2UL * 1024UL * 1024UL;   // ~100 s at 200 Hz
 // Sectors 0 and 1 hold the parameter table (two copies, see section 13);
 // the flight log starts after them. The log never wraps, so it can never
 // overwrite them.
@@ -284,6 +291,7 @@ static void params_load(void);
 static void params_request_poll(void);
 static void flash_param_service(void);
 static void log_dump_service(void);
+static bool log_service_busy(void);
 static void send_master_state(void);
 static void params_stream(void);
 static bool params_synced(void);
@@ -679,7 +687,7 @@ struct LogRecord {
     uint8_t  fin_gain_pct;     // estimated fin effectiveness * 100
     uint8_t  drag_pct;         // measured / modelled free-fall drag * 100
     uint8_t  tscale_pct;       // measured / table thrust * 100
-    uint8_t  reserved[1];
+    uint8_t  flags;            // bit 0: flight-rate record (ASCENT..LANDED)
 };
 #pragma pack(pop)
 ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
@@ -690,7 +698,8 @@ ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
 // during which nothing can be programmed. At 50 Hz x 88 B that is 1.8 kB
 // of arrivals, so 8 kB is roughly a 4x margin — and it also covers a LoRa
 // transmission landing in the same window.
-static const uint32_t LOG_RING_SZ = 8192;
+// 32 kB: 1.7 s of 200 Hz records, against a 400 ms worst-case sector erase.
+static const uint32_t LOG_RING_SZ = 32768;
 static uint8_t  s_log_ring[LOG_RING_SZ];
 static volatile uint32_t s_log_head = 0;    // written by core 0
 static volatile uint32_t s_log_tail = 0;    // written by core 1
@@ -1353,7 +1362,7 @@ static bool self_test(void)
 //    PARAM SAVE | LOAD | DEFAULTS
 //    PADREF                      capture the pad reference now
 //    CAL GYRO                    gyro calibration (vehicle still)
-//    LOG INFO | DUMP [from] | STOP | ERASE
+//    LOG INFO | FLIGHTS | DUMP [from [count]] | STOP | ERASE
 //                                flight log: LOGR <n> <96 bytes hex> lines,
 //                                then OK LOG DUMP <n>; not while logging
 //    FLIGHTARM 1 | 0             arm request when mst.auto_arm = 0 / disarm
@@ -1516,9 +1525,59 @@ static volatile uint32_t s_dump_len  = 0;     // bytes in s_dump_buf
 static volatile uint8_t  s_dump_req  = 0;     // 1 = core 1: fill the buffer
 static volatile uint8_t  s_erase_req = 0;     // 1 = core 1: erase the log
 static volatile uint32_t s_erase_at  = 0;
+// LOG FLIGHTS: core 1 scans the whole log for runs of flight-rate records
+struct LogSeg { uint32_t start, count, t0, t1; float h_max; };
+static const uint8_t     LOG_SEG_MAX = 32;
+static LogSeg            s_seg[LOG_SEG_MAX];
+static volatile uint8_t  s_seg_n    = 0;
+static volatile uint8_t  s_scan_req = 0;      // 1 = core 1: scan, 2 = done
+static volatile uint32_t s_scan_rec = 0;      // progress
+
+static bool log_service_busy(void) { return s_dump_req || s_erase_req || s_scan_req; }
+
+static void flash_log_scan(void)
+{
+    // A flight is a run of records with flags bit 0, broken by a clock that
+    // jumps back (reboot) or a gap > 2 s. Read 8 records at a time; a full
+    // 16 MB chip is ~5 s of SPI on a core that is idle on the ground.
+    const uint32_t end = s_log_addr;
+    uint8_t buf[8 * LOG_REC_SZ];
+    uint8_t n = 0;
+    bool in = false;
+    uint32_t last_t = 0;
+    for (uint32_t a = LOG_BASE; a + LOG_REC_SZ <= end; a += sizeof(buf)) {
+        uint32_t len = end - a < sizeof(buf) ? end - a : sizeof(buf);
+        while (flash_busy()) tight_loop_contents();
+        flash_read(a, buf, len);
+        for (uint32_t o = 0; o + LOG_REC_SZ <= len; o += LOG_REC_SZ) {
+            const LogRecord *r = (const LogRecord *)(buf + o);
+            const uint32_t idx = (a + o - LOG_BASE) / LOG_REC_SZ;
+            const bool fl = (r->flags & 1) && r->t_ms != 0xFFFFFFFFu;
+            const bool brk = in && (r->t_ms < last_t || r->t_ms - last_t > 2000);
+            if (in && (!fl || brk)) in = false;
+            if (fl && !in && n < LOG_SEG_MAX) {
+                s_seg[n] = { idx, 0, r->t_ms, r->t_ms, -1e9f };
+                n++;
+                in = true;
+            }
+            if (fl && in) {
+                LogSeg &g = s_seg[n - 1];
+                g.count++;
+                g.t1 = r->t_ms;
+                if (r->h > g.h_max) g.h_max = r->h;
+            }
+            last_t = r->t_ms;
+            s_scan_rec = idx;
+        }
+    }
+    s_seg_n = n;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_scan_req = 2;
+}
 
 static void flash_log_service(void)
 {
+    if (s_scan_req == 1) flash_log_scan();
     if (s_dump_req == 1) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint32_t n = s_dump_end - s_dump_addr;
@@ -1655,6 +1714,20 @@ static void log_dump_service(void)
 {
     static uint32_t rec = 0, off = 0;
     if (s_erase_req == 2) { s_erase_req = 0; usb_printf("OK LOG ERASE\n"); }
+    static uint8_t seg_print = 255;
+    if (s_scan_req == 2) { s_scan_req = 0; seg_print = 0; }
+    if (seg_print != 255) {
+        if (seg_print < s_seg_n) {
+            const LogSeg &g = s_seg[seg_print];
+            usb_printf("LOGF %u %lu %lu %lu %lu %.1f\n", seg_print, (unsigned long)g.start,
+                       (unsigned long)g.count, (unsigned long)g.t0, (unsigned long)g.t1, (double)g.h_max);
+            seg_print++;
+        } else {
+            usb_printf("OK LOG FLIGHTS %u\n", s_seg_n);
+            seg_print = 255;
+        }
+        return;
+    }
     if (s_dump_req == 3) {                                              // start
         rec = (s_dump_addr - LOG_BASE) / LOG_REC_SZ;
         off = 0;
@@ -1666,7 +1739,7 @@ static void log_dump_service(void)
     // one record per call while the ring has room: a 96-byte record is a
     // 205-character line, and the telemetry lines must still get through
     while (off + LOG_REC_SZ <= s_dump_len &&
-           (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ / 2) {
+           (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ - 512) {
         char line[2 * LOG_REC_SZ + 24];
         int k = snprintf(line, sizeof(line), "LOGR %lu ", (unsigned long)rec);
         static const char HEX[] = "0123456789abcdef";
@@ -1678,8 +1751,9 @@ static void log_dump_service(void)
         usb_puts_n(line, (uint16_t)k);
         off += LOG_REC_SZ;
         rec++;
-        return;                                      // one line per tick
+        if (!Serial || Serial.availableForWrite() < 64) return;
     }
+    if (off + LOG_REC_SZ <= s_dump_len) return;          // ring full: next tick
     if (off + LOG_REC_SZ > s_dump_len) {
         s_dump_addr = s_dump_addr + s_dump_len;
         off = 0;
@@ -1981,6 +2055,7 @@ static void console_line(char *line)
         return;
     }
     if (!strcmp(cmd, "LOG")) {
+        // on the ground the 10 Hz log pauses itself while the log is read
         const bool logging = s_state >= ARIADNA_STATE_ARMED && s_state <= ARIADNA_STATE_LANDED;
         const uint32_t used = s_log_addr > LOG_BASE ? s_log_addr - LOG_BASE : 0;
         if (!s_flash_ok) { usb_printf("ERR LOG no flash\n"); return; }
@@ -1993,13 +2068,23 @@ static void console_line(char *line)
         if (!strcmp(a1, "DUMP")) {
             if (s_dump_req || s_erase_req) { usb_printf("ERR LOG busy\n"); return; }
             uint32_t from = a2 ? (uint32_t)strtoul(a2, nullptr, 10) : 0;
+            uint32_t cnt  = a3 ? (uint32_t)strtoul(a3, nullptr, 10) : 0xFFFFFFFFu;
             s_dump_end  = LOG_BASE + (used / LOG_REC_SZ) * LOG_REC_SZ;
             s_dump_addr = LOG_BASE + from * LOG_REC_SZ;
+            if (cnt != 0xFFFFFFFFu && s_dump_addr + cnt * LOG_REC_SZ < s_dump_end)
+                s_dump_end = s_dump_addr + cnt * LOG_REC_SZ;
             if (s_dump_addr >= s_dump_end) { usb_printf("OK LOG DUMP 0\n"); return; }
             usb_printf("OK LOG BEGIN %lu %u\n", (unsigned long)((s_dump_end - s_dump_addr) / LOG_REC_SZ),
                        (unsigned)LOG_REC_SZ);
             __atomic_thread_fence(__ATOMIC_RELEASE);
             s_dump_req = 3;
+            return;
+        }
+        if (!strcmp(a1, "FLIGHTS")) {
+            if (log_service_busy()) { usb_printf("ERR LOG busy\n"); return; }
+            usb_printf("OK LOG SCAN %lu\n", (unsigned long)(used / LOG_REC_SZ));
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_scan_req = 1;
             return;
         }
         if (!strcmp(a1, "STOP")) { s_dump_req = 0; usb_printf("OK LOG STOP\n"); return; }
@@ -2014,7 +2099,7 @@ static void console_line(char *line)
             usb_printf("OK LOG ERASING %lu KB\n", (unsigned long)(used / 1024));
             return;
         }
-        usb_printf("ERR LOG INFO|DUMP [from]|STOP|ERASE\n");
+        usb_printf("ERR LOG INFO|FLIGHTS|DUMP [from [count]]|STOP|ERASE\n");
         return;
     }
     if (!strcmp(cmd, "CAL")) {
@@ -2402,12 +2487,13 @@ void loop()
         tlm_publish(&t);
     }
 
-    // Logging runs from ARMED onward. Before that there is nothing worth
-    // keeping, and a chip that fills up on the pad has no room for the
-    // flight.
-    if (millis() >= next_log_ms &&
-        s_state >= ARIADNA_STATE_ARMED && s_state <= ARIADNA_STATE_LANDED) {
-        next_log_ms = millis() + 1000 / LOG_HZ;
+    // Flight: every tick. Ground: 10 Hz, while there is more than the
+    // flight reserve left. Not while the log is being read or erased.
+    const bool in_flight = s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_LANDED;
+    const bool ground_ok = s_log_addr + LOG_FLIGHT_RESERVE < FLASH_SIZE && !log_service_busy();
+    if (s_flash_ok && millis() >= next_log_ms && (in_flight || ground_ok)) {
+        next_log_ms = millis() + 1000 / (in_flight ? LOG_HZ_FLIGHT : LOG_HZ_GROUND);
+        if (in_flight) next_log_ms = millis();          // every 200 Hz tick
         s_flags |= ARIADNA_MST_LOGGING;
 
         LogRecord r;
@@ -2444,6 +2530,7 @@ void loop()
             float ts = s_have_nav_status ? s_nav_status.t_scale * 100.0f : 0.0f;
             r.tscale_pct = (uint8_t)(ts > 255.0f ? 255.0f : (ts < 0.0f ? 0.0f : ts));
         }
+        r.flags      = in_flight ? 1 : 0;
         r.vbat_mv    = (uint16_t)(s_vbat * 1000.0f);
         r.current_ma = (uint16_t)(s_current * 1000.0f);
         r.nav_flags  = s_nav.flags;
@@ -2478,7 +2565,7 @@ void loop()
  */
 static void flash_erase_ahead(void)
 {
-    const uint32_t LOOKAHEAD = 4 * FLASH_SECTOR;
+    const uint32_t LOOKAHEAD = 16 * FLASH_SECTOR;    // 64 kB: 3 s at 200 Hz
 
     if (s_log_erased_to >= s_log_addr + LOOKAHEAD) return;
     if (s_log_erased_to >= FLASH_SIZE)             return;

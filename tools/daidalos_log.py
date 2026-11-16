@@ -32,7 +32,7 @@ FIELDS = ["t_ms", "px", "py", "h", "vx", "vy", "vz", "ux", "uy", "uz",
           "roll", "pitch", "yaw", "lat", "lon", "tvc_x", "tvc_y", "clamp",
           "thrust_est", "k_plan", "vbat_mv", "current_ma", "nav_flags",
           "state", "nav_phase", "pyro", "health", "events", "t_event_ds",
-          "fin_gain_pct", "drag_pct", "tscale_pct", "reserved"]
+          "fin_gain_pct", "drag_pct", "tscale_pct", "flags"]
 assert struct.calcsize(FMT) == 96, struct.calcsize(FMT)
 STATES = ["BOOT", "IDLE", "ARMED", "ASCENT", "APOGEE", "DESCENT", "GUIDANCE",
           "LANDED", "RECOVERY", "ABORT", "TEST", "ERROR"]
@@ -47,7 +47,7 @@ def decode_line(line: str):
     if len(raw) != 96 or raw == b"\xff" * 96:
         return None
     d = dict(zip(FIELDS, struct.unpack(FMT, raw)))
-    d.pop("reserved")
+    d["flight_rate"] = d.pop("flags") & 1
     d["lat"] /= 1e7
     d["lon"] /= 1e7
     d["fin_gain"] = d.pop("fin_gain_pct") / 100.0

@@ -13,6 +13,8 @@ přeprogramování.
 > 📏 **Kalibrace** — jak získat každou kalibrační hodnotu (serva, senzory, lidar, UWB,
 > hmotnost, setrvačnost, Cd, aerobrzda, motor, data z letu): [`CALIBRATION_MANUAL.md`](CALIBRATION_MANUAL.md).
 
+> ✅ **Co zbývá** (software, testy na hardwaru, kalibrace): [`TODO.md`](TODO.md).
+
 > ⚠️ **Software je nelétaný.** Je ověřený v simulaci a na stole proti simulaci, ne v letu.
 > Kapitola 12 (předletové testy) není doporučení, je to podmínka.
 
@@ -512,9 +514,16 @@ nezničí obě. Při startu se načte platná kopie s vyšším pořadovým čí
 druhé jádro Mastera (vlastní flash), konzole dostane `OK PARAM SAVE …` / `OK PARAM LOAD
 flash …`. Smazání letového záznamu (`LOG ERASE`) parametry nesmaže.
 
-**Letový záznam** se stahuje nástrojem `tools/daidalos_log.py` (CSV + souhrn kalibračních
+**Letový záznam.** Master zapisuje na flash **200× za s za letu** (ASCENT…LANDED) a
+**10× za s na zemi** (záznam ze země se zastaví, když na čipu zbývají poslední 2 MB, aby
+let měl vždy místo; 16 MB ≈ 14 min letu). Záložka **Letový záznam** v diagnostice:
+*Zjistit obsah* → *Najít lety* (Master projde flash sám a vrátí seznam letů) → zaškrtnout →
+*Stáhnout vybrané lety* (jen let + 3 s okolí) nebo *Stáhnout vše*; pak filtr (jen let /
+let s okolím / vše, číslo letu, časové okno), grafy (výška, rychlost, náklon, TVC a klapka,
+tah, kalibrační poměry, napájení, stav) a *Exportovat CSV*. Uložené CSV jde znovu otevřít.
+Totéž z příkazové řádky: nástroj `tools/daidalos_log.py` (CSV + souhrn kalibračních
 čísel, viz [`CALIBRATION_MANUAL.md`](CALIBRATION_MANUAL.md) kap. 10). Příkazy konzole:
-`LOG INFO`, `LOG DUMP [od]` (řádky `LOGR <n> <96 bajtů hex>`), `LOG STOP`, `LOG ERASE` — jen
+`LOG INFO`, `LOG FLIGHTS` (řádky `LOGF`), `LOG DUMP [od [počet]]` (řádky `LOGR <n> <96 bajtů hex>`), `LOG STOP`, `LOG ERASE` — jen
 když raketa nezapisuje (ne ARMED…LANDED).
 
 ### Zážeh a LandSim — postup po změně rakety
