@@ -53,13 +53,16 @@ static const float DG_MOTOR_CUM[17] = {
 #define DG_FIN_STALL_DEG  22.0f
 
 // ---- fitted gains (tvc_gains.json) ----
-#define DG_WN_TVC         5.927824105301522f
-#define DG_ZETA_TVC       0.7198310073143257f
-#define DG_WN_FIN         6.538962719442912f
-#define DG_ZETA_FIN       1.5853135013659096f
-#define DG_ROLL_GAIN      1.8571556902258854f
-#define DG_SCHED_TVC      0.3320197372107575f
-#define DG_SCHED_FIN      0.02280235000827696f
+#define DG_WN_TVC         8.230423385206832f
+#define DG_ZETA_TVC       1.039857442407118f
+#define DG_WN_FIN         2.0f
+#define DG_ZETA_FIN       0.9941139158605563f
+#define DG_ROLL_GAIN      0.7485332009639065f
+#define DG_SCHED_TVC      0.6f
+#define DG_SCHED_FIN      -0.6f
+
+// ---- clamp planner: thrust forecast (scatter decays back to the table) ----
+#define DG_THRUST_TAU     0.7f   // s, 0 = deviation lasts to burnout
 
 // ---- default ignition band: [h_min, h_max] against |vz| at ignition ----
 // h_max = 0 marks a fall speed with no feasible band; h_min is then the

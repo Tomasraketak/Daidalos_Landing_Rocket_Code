@@ -82,6 +82,9 @@ void dg_params_default(dg_params_t *p)
     p->thrust_scale  = 1.0f;
     p->ign_delay_pad = DG_IGN_DELAY_PAD;
     p->drag_adapt    = 1.0f;
+    p->plan_ts_tau   = DG_THRUST_TAU;
+    p->fin_dcd_zero  = DG_FIN_CD_ZERO;
+    p->fin_dcd_brake = DG_FIN_CD_BRAKE;
     p->diameter      = DG_DIAMETER;
     p->tbl_vz0       = DG_IGN_VZ0;
     p->tbl_dvz       = DG_IGN_DVZ;
@@ -94,10 +97,19 @@ void dg_params_default(dg_params_t *p)
 // Derived from the parameters once, not per tick.
 static float g_area = DG_AREA;
 
-static inline float cd_free_nominal(void)
+// The free-fall Cd the vehicle is flying NOW. The airbrake is "control first,
+// brake with what is left": when the attitude loop needs travel the splay is
+// squeezed and the drag drops towards the fins-neutral value. The fins' extra
+// drag is mostly induced, i.e. ~ angle^2, so it is blended on frac^2. Without
+// this a squeezed brake reads as a smaller Cd, and the drag scale learned from
+// it is then applied to the full-brake fall it was never measured on.
+static inline float cd_free_at(float frac)
 {
     if (P.fin_enable < 0.5f) return P.cd_body;
-    return P.cd_body + (P.fin_brake > 0.5f ? DG_FIN_CD_BRAKE : DG_FIN_CD_ZERO);
+    if (P.fin_brake < 0.5f)  return P.cd_body + P.fin_dcd_zero;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    return P.cd_body + P.fin_dcd_zero + (P.fin_dcd_brake - P.fin_dcd_zero) * frac * frac;
 }
 
 // ---------------------------------------------------------------------
@@ -134,6 +146,7 @@ typedef struct {
     volatile float t_ign_abs;    // DESCENT: predicted time of the ignition command
     volatile float band_lo, band_hi;
     float drag_scale;            // measured / modelled free-fall drag
+    float brake_frac;            // splay the mixer really gave / requested, filtered
     // fin adaptation
     float kappa;
     float trim[3];               // rad: axis 1, axis 2, roll
@@ -171,6 +184,7 @@ void dg_init(void)
     S.t_nom_burn = -1.0f;
     S.kappa     = clampf(P.fin_gain0, 0.4f, 2.0f);
     S.drag_scale = 1.0f;
+    S.brake_frac = 1.0f;
     S.t_ign_abs = -1.0f;
     g_area = 0.785398163f * P.diameter * P.diameter;
 }
@@ -180,7 +194,7 @@ void dg_init(void)
 // what was measured in the free fall was the airbrake.
 static inline float cd_burn_now(void)
 {
-    return (P.cd_body + (P.fin_enable > 0.5f ? DG_FIN_CD_ZERO : 0.0f)) *
+    return (P.cd_body + (P.fin_enable > 0.5f ? P.fin_dcd_zero : 0.0f)) *
            clampf(S.drag_scale, 0.6f, 1.6f);
 }
 
@@ -242,6 +256,22 @@ static inline float mass_at(float t_burn)
 //      h_cmd = min(h_min + pad, h_max)
 //  Igniting high is recoverable by throttling down, igniting low is not.
 // =====================================================================
+// h_min of one table entry. A table exported by landsim_export.py writes
+// h_min = 0 where no altitude lands at all; read literally that would mean
+// "fall to the ground before lighting". There the best effort is to light
+// as if the band went on: the last positive h_min, extrapolated along the
+// slope of the last two (the band climbs ~linearly with the fall speed).
+static float hmin_at(int i)
+{
+    if (P.tbl_hmin[i] > 0.0f) return P.tbl_hmin[i];
+    int j = i;
+    while (j > 0 && P.tbl_hmin[j] <= 0.0f) j--;
+    if (P.tbl_hmin[j] <= 0.0f) return 0.0f;        // empty table
+    float slope = (j > 0 && P.tbl_hmin[j - 1] > 0.0f) ? P.tbl_hmin[j] - P.tbl_hmin[j - 1] : 0.0f;
+    if (slope < 0.0f) slope = 0.0f;
+    return P.tbl_hmin[j] + slope * (float)(i - j);
+}
+
 float dg_ign_band(float vz_abs, float *h_max)
 {
     float f = (vz_abs - P.tbl_vz0) / (P.tbl_dvz > 0.1f ? P.tbl_dvz : 0.1f);
@@ -249,7 +279,8 @@ float dg_ign_band(float vz_abs, float *h_max)
     int i = (int)f;
     if (i > DG_IGN_N - 2) i = DG_IGN_N - 2;
     float t = f - (float)i;
-    float lo = P.tbl_hmin[i] + t * (P.tbl_hmin[i + 1] - P.tbl_hmin[i]);
+    float a = hmin_at(i), b = hmin_at(i + 1);
+    float lo = a + t * (b - a);
     if (h_max) {
         // a neighbour with no band makes the whole interval "no band": the
         // upper edge is not something to interpolate towards zero
@@ -263,7 +294,9 @@ float dg_ign_compute(float h0, float vz0, float vh0, float drag_scale,
                      float *t_to, float *vz_at, float *band_lo, float *band_hi)
 {
     const float dt = 0.005f;
-    const float kd = 0.5f * DG_RHO * g_area * cd_free_nominal() *
+    // The rest of the fall is flown at the airbrake splay the vehicle has now
+    // (1 = fully out, as LandSim plans it) and at the measured drag scale.
+    const float kd = 0.5f * DG_RHO * g_area * cd_free_at(S.brake_frac) *
                      clampf(drag_scale, 0.4f, 2.5f) / P.mass_gross;
     float h = h0, vx = fabsf(vh0), vz = vz0, t = 0.0f;
     float h_lo = -1.0f, v_lo = 0.0f, t_lo = 0.0f, h_hi = -1.0f;
@@ -376,7 +409,7 @@ float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
     // credit the drag: the air is already decelerating the vehicle
     float v = sqrtf(vx * vx + vy * vy + vz * vz);
     if (v > 0.01f) {
-        float df = 0.5f * DG_RHO * g_area * P.cd_body * clampf(S.drag_scale, 0.6f, 1.6f) * v * v;
+        float df = 0.5f * DG_RHO * g_area * cd_burn_now() * v * v;
         float s  = df / (v * mass);
         ax += s * vx;
         ay += s * vy;
@@ -449,13 +482,21 @@ static inline float k_from_plan(float k_level, bool hold_over, float h, float vz
 // after burnout included: a plan that over-brakes, stops in mid-air with a
 // spent grain and falls back must be seen as the failure it is.
 static float project_core(float h0, float vz0, float t0, float k_level, float t_scale,
-                          int n_hold, float *t_td);
+                          int n_hold, float *t_td, float ts_inf, float ts_tau);
 
 float dg_project_vz(float h0, float vz0, float t0, float k_level, float t_scale,
-                    float *t_td)
+                    float *t_td, float ts_inf, float ts_tau)
 {
     return project_core(h0, vz0, t0, k_level, t_scale,
-                        (int)(P.plan_hold / DG_PLAN_DT + 0.5f), t_td);
+                        (int)(P.plan_hold / DG_PLAN_DT + 0.5f), t_td, ts_inf, ts_tau);
+}
+
+// The thrust scale `dt_s` seconds ahead: today's deviation decays back to
+// the table (LandSim_Light's forecast). tau = 0 holds it.
+static inline float ts_forecast(float t_scale, float ts_inf, float ts_tau, float dt_s)
+{
+    if (ts_tau <= 0.0f) return t_scale;
+    return ts_inf + (t_scale - ts_inf) * expf(-dt_s / ts_tau);
 }
 
 /**
@@ -476,8 +517,8 @@ static float touchdown_time(float h0, float vz0, float t0, float k_level, float 
     // 7 m), then flies the last metre on the terminal law - which is half
     // a second the countdown must not leave out.
     const float LIDAR_H = 7.0f;
-    // Like the vehicle: PLAN on the margined thrust, FLY on the estimate.
-    const float plan_scale = t_scale * (1.0f - P.plan_margin);
+    // Like the vehicle: PLAN on the margined thrust, FLY on the estimate -
+    // both with the estimate decaying back towards the table.
     const float dt = 0.02f, replan = 0.3f;
     const float kd = 0.5f * DG_RHO * g_area * cd_burn_now();
     float h = h0, vz = vz0, t = t0, since = 0.0f, k = k_level;
@@ -489,10 +530,13 @@ static float touchdown_time(float h0, float vz0, float t0, float k_level, float 
         const float hp = (h > LIDAR_H) ? h - pad : h;
         if (since >= replan) {
             float r;
-            k = dg_solve_plan(hp, vz, t, plan_scale, &r, nullptr);
+            // the plan made THEN sees the deviation already partly decayed
+            const float ts_now = ts_forecast(t_scale, 1.0f, P.plan_ts_tau, t - t0);
+            k = dg_solve_plan(hp, vz, t, ts_now * (1.0f - P.plan_margin), &r, nullptr,
+                              1.0f - P.plan_margin, P.plan_ts_tau);
             since = 0.0f;
         }
-        float tn   = dg_thrust_ref(t) * t_scale;
+        float tn   = dg_thrust_ref(t) * ts_forecast(t_scale, 1.0f, P.plan_ts_tau, t - t0);
         float mass = mass_at(t);
         float kk   = dg_terminal_active(hp, vz, tn, mass) ? dg_terminal_throttle(hp, vz, mass, tn) : k;
         if (gate && dg_thrust_ref(t) >= DG_THRUST_GATE * DG_PEAK_THRUST * P.thrust_scale) gate = false;
@@ -509,7 +553,7 @@ static float touchdown_time(float h0, float vz0, float t0, float k_level, float 
 }
 
 static float project_core(float h0, float vz0, float t0, float k_level, float t_scale,
-                          int n_hold, float *t_td)
+                          int n_hold, float *t_td, float ts_inf, float ts_tau)
 {
     float h = h0, vz = vz0, t = t0;
     const float kd = 0.5f * DG_RHO * g_area * cd_burn_now();
@@ -520,7 +564,7 @@ static float project_core(float h0, float vz0, float t0, float k_level, float t_
     // (15 * 0.02 is or is not > 0.3) and one step of difference is 0.6 m/s.
     int n = 0;
     while (h > 0.0f && n < DG_PLAN_NMAX) {
-        float tn   = dg_thrust_ref(t) * t_scale;
+        float tn   = dg_thrust_ref(t) * ts_forecast(t_scale, ts_inf, ts_tau, t - t0);
         float mass = mass_at(t);
         float k    = k_from_plan(k_level, n >= n_hold, h, vz, mass, tn);
         float a    = (tn * k - kd * vz * fabsf(vz)) / mass - DG_G;
@@ -539,7 +583,7 @@ static float project_core(float h0, float vz0, float t0, float k_level, float t_
 // it. So: scan, bracket the FIRST crossing from below, bisect only that;
 // if nothing reaches the target, ternary-search the peak.
 float dg_solve_plan(float h, float vz, float t, float t_scale,
-                    float *resid, float *t_td)
+                    float *resid, float *t_td, float ts_inf, float ts_tau)
 {
     const int   n_scan = 10;
     const float kmin = DG_CLAMP_MIN, kmax = DG_CLAMP_MAX;
@@ -550,7 +594,7 @@ float dg_solve_plan(float h, float vz, float t, float t_scale,
 
     for (int i = 0; i < n_scan; i++) {
         float k = kmin + (kmax - kmin) * (float)i / (float)(n_scan - 1);
-        float f = dg_project_vz(h, vz, t, k, t_scale, &tt) - target;
+        float f = dg_project_vz(h, vz, t, k, t_scale, &tt, ts_inf, ts_tau) - target;
         if (f > best_f) { best_f = f; best_k = k; best_t = tt; }
         if (f >= 0.0f) {
             if (i == 0) {
@@ -573,8 +617,8 @@ float dg_solve_plan(float h, float vz, float t, float t_scale,
             float m1 = a + (c - a) / 3.0f;
             float m2 = c - (c - a) / 3.0f;
             float t1, t2;
-            float f1 = dg_project_vz(h, vz, t, m1, t_scale, &t1) - target;
-            float f2 = dg_project_vz(h, vz, t, m2, t_scale, &t2) - target;
+            float f1 = dg_project_vz(h, vz, t, m1, t_scale, &t1, ts_inf, ts_tau) - target;
+            float f2 = dg_project_vz(h, vz, t, m2, t_scale, &t2, ts_inf, ts_tau) - target;
             if (f1 > best_f) { best_f = f1; best_k = m1; best_t = t1; }
             if (f2 > best_f) { best_f = f2; best_k = m2; best_t = t2; }
             if (f1 < f2) a = m1; else c = m2;
@@ -586,7 +630,7 @@ float dg_solve_plan(float h, float vz, float t, float t_scale,
 
     for (int i = 0; i < 10; i++) {
         float mid = 0.5f * (lo + hi);
-        float f = dg_project_vz(h, vz, t, mid, t_scale, &tt) - target;
+        float f = dg_project_vz(h, vz, t, mid, t_scale, &tt, ts_inf, ts_tau) - target;
         if (f >= 0.0f) { hi = mid; best_t = tt; }
         else             lo = mid;
     }
@@ -832,6 +876,7 @@ void dg_step_control(const dg_nav_t *nav, dg_out_t *out)
     out->fin_trim[2] = S.trim[2] * RAD;
     out->t_burn     = (S.phase == DG_PHASE_BURN) ? now - S.t_burn0 : -1.0f;
     out->drag_scale = S.drag_scale;
+    out->brake_frac = S.brake_frac;
     out->h_band_lo  = S.band_lo;
     out->h_band_hi  = S.band_hi;
 
@@ -878,7 +923,8 @@ void dg_step_control(const dg_nav_t *nav, dg_out_t *out)
             const float vn  = sqrtf(vv2);
             if (P.drag_adapt > 0.5f && vn > 15.0f && nav->a_axial > 0.0f &&
                 -dot3(v, b) / vn > 0.95f) {
-                const float k_nom = 0.5f * DG_RHO * g_area * cd_free_nominal() / P.mass_gross;
+                // the model at the splay the brake REALLY has right now
+                const float k_nom = 0.5f * DG_RHO * g_area * cd_free_at(S.brake_frac) / P.mass_gross;
                 const float raw = clampf(nav->a_axial / (vv2 * k_nom), 0.4f, 2.5f);
                 S.drag_scale += (raw - S.drag_scale) * DG_CTRL_DT / 1.0f;
             }
@@ -1145,6 +1191,16 @@ void dg_step_control(const dg_nav_t *nav, dg_out_t *out)
         dg_fin_mix(b, u1, u2, v, rf, tau_roll, brake,
                    adapt ? S.kappa : clampf(P.fin_gain0, 0.4f, 2.0f),
                    adapt ? S.trim : trim0, control, out->fin_deg);
+        // How much of the requested airbrake the mixer could give. The
+        // alternating sum of the four commands cancels the steering, the roll
+        // and the crossflow terms (each is antisymmetric across a pair) and
+        // leaves 4 x the splay. Filtered over ~0.5 s: it feeds the drag model.
+        if (brake > 0.5f) {
+            float splay = 0.25f * (out->fin_deg[0] - out->fin_deg[1] +
+                                   out->fin_deg[2] - out->fin_deg[3]);
+            float f = clampf(splay / brake, 0.0f, 1.0f);
+            S.brake_frac += (f - S.brake_frac) * clampf(DG_CTRL_DT / 0.5f, 0.0f, 1.0f);
+        }
         out->fins_live = !(phase == DG_PHASE_ASCENT && P.fin_ascent_mode < 0.5f);
 
         // learn from what the previous commands did
@@ -1210,8 +1266,13 @@ void dg_step_planner(const dg_nav_t *nav)
         float tb = (phase == DG_PHASE_BURN) ? now - S.t_burn0 : 0.0f;
         if (tb < 0.0f) tb = 0.0f;
         float resid = 0.0f, t_td = 0.0f;
+        // Plan on the margined estimate, forecast to decay back to the
+        // (margined) table over plan_ts_tau: the thrust scatter is a wander
+        // with a ~0.7 s correlation, not a property of this motor. Holding a
+        // strong first half second to burnout throws thrust away and then
+        // arrives fast when the scatter swings back (LandSim 2nd audit).
         float k = dg_solve_plan(h_est, nav->vz, tb, S.t_scale * (1.0f - P.plan_margin),
-                                &resid, &t_td);
+                                &resid, &t_td, 1.0f - P.plan_margin, P.plan_ts_tau);
         S.k_level    = k;
         S.plan_resid = resid;
         (void)t_td;

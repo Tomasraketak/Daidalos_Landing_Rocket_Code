@@ -10,6 +10,9 @@ Kde je potřeba jít do hloubky, odkazuje manuál přímo na soubor a funkci. Č
 výchozí hodnoty; skoro všechna se dají změnit v diagnostickém GUI (kapitola 9) bez
 přeprogramování.
 
+> 📏 **Kalibrace** — jak získat každou kalibrační hodnotu (serva, senzory, lidar, UWB,
+> hmotnost, setrvačnost, Cd, aerobrzda, motor, data z letu): [`CALIBRATION_MANUAL.md`](CALIBRATION_MANUAL.md).
+
 > ⚠️ **Software je nelétaný.** Je ověřený v simulaci a na stole proti simulaci, ne v letu.
 > Kapitola 12 (předletové testy) není doporučení, je to podmínka.
 
@@ -246,7 +249,13 @@ h_cmd = min(h_min(|vz|) + pad, h_max(|vz|))       pad = |vz| · g.ign_delay_pad_
 Zapálit **výš** se dá opravit přiškrcením, zapálit **níž** nejde opravit vůbec — proto se
 rezerva počítá na nejhorší zpoždění roznětu. Typicky ~50 m pro apogeum 150 m.
 
-**c) Odpor se měří za letu.** Během pádu (|v| > 15 m/s, osa rakety do 18° od směru
+**c) Odpor se měří za letu — i s aerobrzdou křidélek.** Při pádu jsou křidélka roztažená
+jako aerobrzda (+,−,+,−, `fin.max_deg`), což zhruba zdvojnásobí odpor. Odpor křidélek je ve
+dvou parametrech jako přírůstek k Cd trupu: `g.fin_dcd_zero` (neutrál, hoření) a
+`g.fin_dcd_brake` (brzda, pád); oba počítá LandSim. Brzda dostává jen výchylku, kterou
+nepotřebuje řízení — firmware proto sleduje, kolik brzdy křidélka skutečně mají (střídavý
+součet čtyř výchylek, filtr 0,5 s), a model odporu i pád do pásma počítá s tímto roztažením
+(Cd ∝ druhé mocnině).  Během pádu (|v| > 15 m/s, osa rakety do 18° od směru
 proudění) se z osového zrychlení spočítá `K = a / v²` a porovná s modelem
 (`g.cd_body`, průměr `g.diameter_m`, brzda křidélek). Poměr (`drag_scale`, „Odpor měřený
 / model“ v diagnostice) se filtruje s časovou konstantou 1 s a omezí na 0,4–2,5. Tím se
@@ -311,6 +320,10 @@ tahem. Zbytek tahu „zahodí“ (palivo hoří stejně, klapka jen odkloní pro
 * **Odhad tahu z akcelerometru:** `T = a_osové · m − odpor`. Poměr ke katalogové
   křivce (`Tah / tabulka` v diagnostice) jde do plánovače — motor slabší o 10 % se pozná
   za 0,2 s. Plánovač navíc počítá jen s 97 % odhadu (`g.plan_margin`).
+* **Předpověď tahu** (LandSim, druhý audit): odchylka tahu od tabulky se nebere jako
+  vlastnost motoru, ale jako výkyv, který odezní — plánovač počítá s tím, že se odhad vrací
+  k tabulce s časovou konstantou `g.plan_ts_tau_s` (0,7 s). Dřív silná první půlsekunda
+  vedla k zahození tahu a pak k tvrdému dosednutí, když se výkyv otočil.
 * **Koncový zákon** pod 3 m (když je motor ještě silný): sleduje profil
   `vz_ref = −√(16·h)` omezený 0,8–2,5 m/s.
 
@@ -322,7 +335,7 @@ zbytku letu stejným plánovačem, jakým se řídí — včetně přeplánován
 výškové rezervy). Z nich sekvencer časuje aerokryt a nohy; oba jdou i do telemetrie.
 
 Přesnost v testu (celá obálka, poruchy tahu, odporu, zpoždění roznětu): aerokryt
-0,6 ± 0,08 s před zážehem; nohy **1,5–2,2 s** před skutečným dosednutím (cíl 1,7 s, odchylka
+0,6 ± 0,08 s před zážehem; nohy **1,6–2,1 s** před skutečným dosednutím (cíl 1,7 s, odchylka
 téměř vždy na bezpečnou stranu — dřív). Noha s lidarem má tedy vždy ≥ 1 s na vyklopení a
 500 ms hradlo lidaru.
 
@@ -497,7 +510,12 @@ Každá kopie nese značku `DAI2`, pořadové číslo, verzi rozložení a CRC. 
 nezničí obě. Při startu se načte platná kopie s vyšším pořadovým číslem; když žádná není
 (nový čip, jiné rozložení parametrů), použijí se výchozí hodnoty. Zápis i čtení dělá
 druhé jádro Mastera (vlastní flash), konzole dostane `OK PARAM SAVE …` / `OK PARAM LOAD
-flash …`. Smazání letového záznamu (`ERASE`) parametry nesmaže.
+flash …`. Smazání letového záznamu (`LOG ERASE`) parametry nesmaže.
+
+**Letový záznam** se stahuje nástrojem `tools/daidalos_log.py` (CSV + souhrn kalibračních
+čísel, viz [`CALIBRATION_MANUAL.md`](CALIBRATION_MANUAL.md) kap. 10). Příkazy konzole:
+`LOG INFO`, `LOG DUMP [od]` (řádky `LOGR <n> <96 bajtů hex>`), `LOG STOP`, `LOG ERASE` — jen
+když raketa nezapisuje (ne ARMED…LANDED).
 
 ### Zážeh a LandSim — postup po změně rakety
 
@@ -588,14 +606,15 @@ python Ground_Visualizer\ground_visualizer.py
 | skupina | čte ji | obsah |
 |---|---|---|
 | `seq.*` | Navigation | **časování událostí**: předstih aerokrytu, okno záložního roznětu, předstih a délka nohou, délka pulzu roznětu, povolení, výškové meze |
-| `g.*` | Navigation | hmotnost, palivo, **Cd trupu, průměr, škála tahu, rezerva na zpoždění roznětu, adaptace odporu**, zisky smyček (fitované v simulaci), kužel náklonu, rezerva výšky, posun/přepis výšky zážehu, plánovač, detekce zážehu |
+| `g.*` | Navigation | hmotnost, palivo, **Cd trupu, průměr, škála tahu, rezerva na zpoždění roznětu, adaptace odporu, odpor křidélek (neutrál / aerobrzda), předpověď tahu**, zisky smyček (fitované v simulaci), kužel náklonu, rezerva výšky, posun/přepis výšky zážehu, plánovač, detekce zážehu |
 | `tbl.*` | Navigation | pásmo zážehu z LandSim (`tbl.vz0`, `tbl.dvz`, `tbl.hmin_00…31`, `tbl.hmax_00…31`); v záložce Parametry skryté, upravuje se v záložce *Zážeh a LandSim* |
 | `fin.*` | Navigation | křidélka: povolení, mez, brzda, režim při stoupání, drift, adaptace |
 | `srv.*` | Master | kalibrace serv: střed, µs/°, **znaménka**, klapka, aerokryt |
 | `mst.*` | Master | práh detekce startu, automatické zastrčení |
 | `pos.*` | Position | **zpoždění GPS**, lidar (povolení, offset, dosah, **zpoždění po vyklopení nohou**, **montážní odchylka X/Y**), orientace jen z gyra, UWB |
 
-Tabulka se ukládá na flash čip W25Q128 (kap. 9); rozložení verze 2 (164 hodnot). Po
+Tabulka se ukládá na flash čip W25Q128 (kap. 9); rozložení verze 3 (164 hodnot; verze 3
+vynutila nové zisky přefitované v LandSim po druhém auditu). Po
 nahrání firmwaru s jiným rozložením se načtou výchozí hodnoty — uložené profily
 (export z konzole) jde znovu importovat.
 
@@ -709,7 +728,7 @@ náhradní hlavičky neověří vše.
 |---|---|---|
 | navedení = simulace | `make guid`, čísla přímo z `tvc_sim.py` | směr navedení do 1e-7, plánovač shodně, motor, koncový zákon, výška zážehu do 0,8 m od `find_ignition` |
 | odpor za letu | `make guid`: model s odporem ×0,7 a ×1,4 | odhad 0,71 / 1,36, obě přistanou |
-| odpočty | `make guid`, každý let obálky | aerokryt 0,6 ± 0,08 s; nohy 1,45–2,3 s před dosednutím |
+| odpočty | `make guid`, každý let obálky | aerokryt 0,6 ± 0,08 s; nohy 1,62–2,11 s před dosednutím |
 | hradlo lidaru | kód Position MCU (`legs_ms`, `LIDAR_CEILING_M`) | ⚠️ jen kontrola kódu, ne test na počítači |
 | uložení parametrů | kód Mastera (A/B sektory, zpětné čtení) | ⚠️ ověřit na desce: SAVE → restart → LOAD |
 | navedení v letu | 6-DOF model v `guid_test.cpp`: 140–180 m, drift, zpoždění roznětu 0–300 ms, tah ±8 %, rotace ±90 °/s, vítr, chybná osa tahu, ±1 m chyba výškoměru, slabá/silná/nesouosá křidélka, bez křidélek, mrtvý akcelerometr | všechny přistanou pod 4 m/s, vh < 0,5 m/s, náklon < 3° |

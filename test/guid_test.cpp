@@ -73,7 +73,7 @@ static void test_golden()
 
     worst = 0;
     for (const auto &c : GOLD_PROJ) {
-        float v = dg_project_vz(c.h, c.vz, c.tb, c.k, c.ts, nullptr);
+        float v = dg_project_vz(c.h, c.vz, c.tb, c.k, c.ts, nullptr, c.ts_inf, c.ts_tau);
         double e = std::fabs(v - c.vz_td);
         if (e > worst) worst = e;
         // Past the plan hold the simulation decides "t - t0 > 0.30" on an
@@ -89,7 +89,7 @@ static void test_golden()
     worst = 0;
     for (const auto &c : GOLD_PLAN) {
         float resid, ttd;
-        float k = dg_solve_plan(c.h, c.vz, c.tb, c.ts, &resid, &ttd);
+        float k = dg_solve_plan(c.h, c.vz, c.tb, c.ts, &resid, &ttd, c.ts_inf, c.ts_tau);
         // Where the target is reachable the level must match; where it is
         // not, the peak is flat and what must match is the achieved speed.
         if (c.resid >= 0.0f) {
@@ -138,6 +138,30 @@ static void test_golden()
         float h3 = dg_ign_compute(150.0f, 0.0f, 0.0f, 1.4f, nullptr, nullptr, nullptr, nullptr);
         // (often capped by the band's upper edge, so it may barely move - but never up)
         CHECK(h3 <= h1 + 0.05f, "more drag must not raise the ignition altitude: %g vs %g", (double)h3, (double)h1);
+    }
+
+    // landsim_export.py writes h_min = 0 where there is no band at all. The
+    // vehicle must still light (best effort), never fall to the ground first.
+    {
+        dg_params_t prm;
+        dg_params_default(&prm);
+        int n0 = 0;
+        for (int i = 0; i < DG_IGN_N; i++)
+            if (prm.tbl_hmax[i] <= 0.0f) { prm.tbl_hmin[i] = 0.0f; n0++; }
+        dg_set_params(&prm);
+        float worst = 0.0f;
+        for (int i = 0; i < DG_IGN_N; i++) {
+            if (DG_IGN_HMAX[i] > 0.0f) continue;
+            float hm;
+            float lo = dg_ign_band(DG_IGN_VZ0 + DG_IGN_DVZ * i, &hm);
+            CHECK(lo > 20.0f && hm <= 0.0f, "no-band entry %d: h_min %g (must extrapolate)", i, (double)lo);
+            float e = std::fabs(lo - DG_IGN_HMIN[i]);
+            if (e > worst) worst = e;
+        }
+        CHECK(n0 > 0 && worst < 6.0f, "extrapolated best effort %g m from the generator's", (double)worst);
+        std::printf("  no-band entries as exported (h_min = 0): %d, extrapolated within %.1f m\n", n0, (double)worst);
+        dg_params_default(&prm);
+        dg_set_params(&prm);
     }
 }
 

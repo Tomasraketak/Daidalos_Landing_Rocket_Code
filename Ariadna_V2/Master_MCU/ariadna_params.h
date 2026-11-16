@@ -42,7 +42,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   2     // stored with the flash image
+#define ARIADNA_PARAM_LAYOUT   3     // stored with the flash image (3: gains re-fitted on LandSim 2nd audit)
 
 // X(id, NAME, key, default, min, max, unit, owner)
 //   owner: 'N' Navigation MCU, 'M' Master, 'P' Position MCU
@@ -63,16 +63,16 @@
     X(10, G_MASS_GROSS,     "g.mass_gross_kg",    2.85f, 1.0f, 10.0f, "kg",   'N') \
     X(11, G_MASS_PROP,      "g.mass_prop_kg",     0.277f, 0.05f, 2.0f, "kg",  'N') \
     /* ---- guidance: nozzle attitude loop ---- */ \
-    X(12, G_WN_TVC,         "g.wn_tvc",           5.927824f, 1.0f, 20.0f, "rad/s", 'N') \
-    X(13, G_ZETA_TVC,       "g.zeta_tvc",         0.719831f, 0.3f, 3.0f, "-",  'N') \
-    X(14, G_SCHED_TVC,      "g.sched_tvc",        0.33202f, -1.0f, 1.0f, "-",  'N') \
+    X(12, G_WN_TVC,         "g.wn_tvc",           8.230423f, 1.0f, 20.0f, "rad/s", 'N') \
+    X(13, G_ZETA_TVC,       "g.zeta_tvc",         1.039857f, 0.3f, 3.0f, "-",  'N') \
+    X(14, G_SCHED_TVC,      "g.sched_tvc",        0.6f, -1.0f, 1.0f, "-",  'N') \
     X(15, G_ATT_KI,         "g.att_ki",           2.0f,  0.0f,  4.0f, "1/s",  'N') \
     X(16, G_ATT_I_LIM,      "g.att_i_lim",        0.05f, 0.0f,  0.2f, "rad*s", 'N') \
     /* ---- guidance: fin attitude loop ---- */ \
-    X(17, G_WN_FIN,         "g.wn_fin",           6.538963f, 1.0f, 20.0f, "rad/s", 'N') \
-    X(18, G_ZETA_FIN,       "g.zeta_fin",         1.585314f, 0.3f, 3.0f, "-",  'N') \
-    X(19, G_SCHED_FIN,      "g.sched_fin",        0.022802f, -1.0f, 1.0f, "-", 'N') \
-    X(20, G_ROLL_GAIN,      "g.roll_gain",        1.857156f, 0.0f, 10.0f, "rad/s", 'N') \
+    X(17, G_WN_FIN,         "g.wn_fin",           2.0f, 1.0f, 20.0f, "rad/s", 'N') \
+    X(18, G_ZETA_FIN,       "g.zeta_fin",         0.994114f, 0.3f, 3.0f, "-",  'N') \
+    X(19, G_SCHED_FIN,      "g.sched_fin",        -0.6f, -1.0f, 1.0f, "-", 'N') \
+    X(20, G_ROLL_GAIN,      "g.roll_gain",        0.748533f, 0.0f, 10.0f, "rad/s", 'N') \
     X(21, G_ROLL_MAX,       "g.roll_max_deg",     2.0f,  0.0f,  6.0f, "deg",  'N') \
     /* ---- guidance: where to point, when to light ---- */ \
     X(22, G_TILT_MIN,       "g.tilt_min_deg",     1.5f,  0.0f, 10.0f, "deg",  'N') \
@@ -106,6 +106,7 @@
     X(46, G_IGN_DELAY_PAD,  "g.ign_delay_pad_s",  0.40f, 0.0f,  1.5f, "s",    'N') \
     X(47, G_DRAG_ADAPT,     "g.drag_adapt",       1.0f,  0.0f,  1.0f, "0/1",  'N') \
     X(48, G_DIAMETER,       "g.diameter_m",       0.105f, 0.03f, 0.3f, "m",   'N') \
+    X(49, G_PLAN_TS_TAU,    "g.plan_ts_tau_s",    0.70f, 0.0f,  5.0f, "s",    'N') \
     /* ---- servo calibration (Master) ---- */ \
     X(50, SRV_TVC_TRIM_X,   "srv.tvc_x_trim_us", 1500.0f, 900.0f, 2100.0f, "us", 'M') \
     X(51, SRV_TVC_TRIM_Y,   "srv.tvc_y_trim_us", 1500.0f, 900.0f, 2100.0f, "us", 'M') \
@@ -138,6 +139,9 @@
     X(86, POS_LIDAR_DELAY,  "pos.lidar_delay_ms", 500.0f, 0.0f, 3000.0f, "ms", 'P') \
     X(87, POS_LIDAR_TILT_X, "pos.lidar_tilt_x_deg", 0.0f, -20.0f, 20.0f, "deg", 'P') \
     X(88, POS_LIDAR_TILT_Y, "pos.lidar_tilt_y_deg", 0.0f, -20.0f, 20.0f, "deg", 'P') \
+    /* ---- guidance: fin drag (LandSim band.json fin_cd_* minus g.cd_body) ---- */ \
+    X(89, G_FIN_DCD_ZERO,   "g.fin_dcd_zero",     0.14306195f, 0.0f, 1.5f, "-",   'N') \
+    X(90, G_FIN_DCD_BRAKE,  "g.fin_dcd_brake",    0.44720534f, 0.0f, 3.0f, "-",   'N') \
     ARIADNA_PARAM_LIST_TBL(X)
 
 // ---- ids --------------------------------------------------------------

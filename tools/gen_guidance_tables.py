@@ -74,6 +74,9 @@ def main():
     ap.add_argument("--dvz", type=float, default=2.0, help="|vz| step of the band table")
     ap.add_argument("--vehicle", help="JSON from the diagnostic GUI: parameter key -> value")
     ap.add_argument("--table-json", help="write only the band table to this JSON file")
+    ap.add_argument("--landsim-vehicle",
+                    help="vehicle.json in LandSim's own format (landsim_export.py): regenerate "
+                         "EVERYTHING - motor table, fin geometry, inertia, band - for it")
     args = ap.parse_args()
 
     sim_dir = os.path.abspath(args.sim)
@@ -87,6 +90,17 @@ def main():
     if gains:
         cfg = cfg.with_gains(gains)
     from dataclasses import replace
+    if args.landsim_vehicle:
+        import landsim_export as ex
+        with open(args.landsim_vehicle, encoding="utf-8") as fh:
+            lveh = json.load(fh)
+        # Daidalos flies no D9; LandSim's default rocket carries one
+        lveh.setdefault("n_boosters", 0)
+        lveh.setdefault("use_booster_rule", False)
+        cfg = ex.config_from_vehicle(lveh)
+        if gains and not any(k in lveh for k in ("wn", "zeta", "wn_fin", "zeta_fin", "roll_gain")):
+            cfg = cfg.with_gains(gains)
+        print("LandSim vehicle:", ex.resolved_vehicle(cfg), file=sys.stderr)
     if args.delay_pad is not None:
         cfg = replace(cfg, delay_pad=args.delay_pad)
     if args.vehicle:
@@ -245,6 +259,9 @@ def main():
     out.append(f"#define DG_SCHED_TVC      {f(cfg.sched_tvc)}")
     out.append(f"#define DG_SCHED_FIN      {f(cfg.sched_fin)}")
     out.append("")
+    out.append("// ---- clamp planner: thrust forecast (scatter decays back to the table) ----")
+    out.append(f"#define DG_THRUST_TAU     {f(getattr(cfg, 'plan_thrust_tau', 0.0))}   // s, 0 = deviation lasts to burnout")
+    out.append("")
     out.append("// ---- default ignition band: [h_min, h_max] against |vz| at ignition ----")
     out.append("// h_max = 0 marks a fall speed with no feasible band; h_min is then the")
     out.append("// least-bad altitude. The flight copy is the tbl.* parameters.")
@@ -300,7 +317,7 @@ def main():
         for (vx, vy) in ((0.0, 0.0), (6.0, 0.0), (-3.0, 4.0), (0.4, -0.3)):
             for vz in (-40.0, -15.0, -3.0, -0.8):
                 for mass in (2.85, 2.6):
-                    ux, uy, uz, tgo = s.guidance_dir(h, vx, vy, vz, mass, cfg.cd, 0.0, 0.0,
+                    ux, uy, uz, tgo = s.guidance_dir(h, vx, vy, vz, mass, cfg.cd_burn, 0.0, 0.0,
                                                      cfg.area, cfg.tilt_min, cfg.tilt_slope,
                                                      cfg.tilt_cap, 1.0, 0.0)
                     cases.append((h, vx, vy, vz, mass, ux, uy, uz, tgo))
@@ -313,17 +330,21 @@ def main():
     # projection and plan
     dry = cfg.gross_mass - m.propellant_mass
     kmin, kmax = cfg.k_min, cfg.k_max
+    TAU = getattr(cfg, "plan_thrust_tau", 0.0) or 0.7
     proj = []
     for (h, vz, tb) in ((55.0, -31.0, 0.0), (40.0, -30.0, 0.5), (25.0, -22.0, 1.0),
                         (12.0, -12.0, 1.6), (5.0, -6.0, 2.0), (2.0, -2.5, 2.2),
                         (60.0, -28.0, 0.0), (30.0, -30.0, 0.2)):
         for k in (0.1, 0.4, 0.7, 1.0):
-            for ts_ in (1.0, 0.9):
+            # (t_scale, forecast target, forecast tau): held, and decaying
+            for ts_, ti, tau in ((1.0, -1.0, 0.0), (0.9, -1.0, 0.0),
+                                 (0.9, 0.97, TAU), (1.12, 0.97, TAU)):
                 v = s.project_vz(h, vz, tb, dry, k, mt, mf, mc, m.propellant_mass,
                                  m.total_impulse, cfg.cd_burn, cfg.area, kmin, kmax,
-                                 bt, bf, bb, b.propellant_mass, 1.0e6, 0.02, ts_)
-                proj.append((h, vz, tb, k, ts_, v))
-    g.append("struct GoldProj { float h, vz, tb, k, ts, vz_td; };")
+                                 bt, bf, bb, b.propellant_mass, 1.0e6, 0.02, ts_,
+                                 *((ti, tau) if tau > 0.0 else ()))
+                proj.append((h, vz, tb, k, ts_, ti, tau, v))
+    g.append("struct GoldProj { float h, vz, tb, k, ts, ts_inf, ts_tau, vz_td; };")
     g.append(f"static const GoldProj GOLD_PROJ[{len(proj)}] = {{")
     for c in proj:
         g.append("    { " + ", ".join(f(v) for v in c) + " },")
@@ -333,13 +354,15 @@ def main():
     for (h, vz, tb) in ((55.0, -31.0, 0.0), (50.0, -28.0, 0.0), (40.0, -30.0, 0.5),
                         (25.0, -22.0, 1.0), (12.0, -12.0, 1.6), (5.0, -6.0, 2.0),
                         (70.0, -25.0, 0.0), (20.0, -30.0, 0.3), (8.0, -3.0, 1.2)):
-        for ts_ in (1.0, 0.9, 1.1):
+        for ts_, ti, tau in ((1.0, -1.0, 0.0), (0.9, -1.0, 0.0), (1.1, -1.0, 0.0),
+                             (0.9, 0.97, TAU), (1.1, 0.97, TAU)):
             k, r = s.solve_plan(h, vz, tb, dry, mt, mf, mc, m.propellant_mass,
                                 m.total_impulse, cfg.cd_burn, cfg.area, kmin, kmax,
                                 bt, bf, bb, b.propellant_mass, 1.0e6, 0.02,
-                                cfg.plan_target, ts_)
-            plan.append((h, vz, tb, ts_, k, r))
-    g.append("struct GoldPlan { float h, vz, tb, ts, k, resid; };")
+                                cfg.plan_target, ts_,
+                                *((ti, tau) if tau > 0.0 else ()))
+            plan.append((h, vz, tb, ts_, ti, tau, k, r))
+    g.append("struct GoldPlan { float h, vz, tb, ts, ts_inf, ts_tau, k, resid; };")
     g.append(f"static const GoldPlan GOLD_PLAN[{len(plan)}] = {{")
     for c in plan:
         g.append("    { " + ", ".join(f(v) for v in c) + " },")

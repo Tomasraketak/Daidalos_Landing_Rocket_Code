@@ -219,6 +219,9 @@ static void test_params()
         { ARIADNA_P_G_CD_BODY, d.cd_body, "cd_body" }, { ARIADNA_P_G_THRUST_SCALE, d.thrust_scale, "thrust_scale" },
         { ARIADNA_P_G_IGN_DELAY_PAD, d.ign_delay_pad, "ign_delay_pad" },
         { ARIADNA_P_G_DRAG_ADAPT, d.drag_adapt, "drag_adapt" }, { ARIADNA_P_G_DIAMETER, d.diameter, "diameter" },
+        { ARIADNA_P_G_PLAN_TS_TAU, d.plan_ts_tau, "plan_ts_tau" },
+        { ARIADNA_P_G_FIN_DCD_ZERO, d.fin_dcd_zero, "fin_dcd_zero" },
+        { ARIADNA_P_G_FIN_DCD_BRAKE, d.fin_dcd_brake, "fin_dcd_brake" },
         { ARIADNA_P_TBL_VZ0, d.tbl_vz0, "tbl_vz0" }, { ARIADNA_P_TBL_DVZ, d.tbl_dvz, "tbl_dvz" },
     };
     for (int i = 0; i < DG_IGN_N; i++) {

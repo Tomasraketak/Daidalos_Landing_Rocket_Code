@@ -53,7 +53,7 @@
 
 #include "guidance_tables.h"
 
-#define DG_VERSION        210          // 2.10 — in-flight ignition search, drag estimate
+#define DG_VERSION        220          // 2.20 - thrust forecast, airbrake-aware drag, fin dCd params
 
 // ---------------------------------------------------------------------
 //  Fixed constants (the simulation's)
@@ -137,6 +137,9 @@ typedef struct {
     float thrust_scale;      // multiplies the tabulated motor curve
     float ign_delay_pad;     // s of igniter delay the ignition altitude pads for
     float drag_adapt;        // 1 = scale the drag by what is measured in the free fall
+    float plan_ts_tau;       // s, how long the planner expects a thrust deviation to last
+    float fin_dcd_zero;      // fins' drag, neutral, as an addition to the body Cd
+    float fin_dcd_brake;     // ... splayed as the free-fall airbrake
     float diameter;          // m
     // the ignition band table, from LandSim_Light (tbl.* parameters)
     float tbl_vz0, tbl_dvz;
@@ -196,6 +199,7 @@ typedef struct {
     float fin_trim[3];  // deg, estimated trim offsets: axis 1, axis 2, roll
     float t_burn;       // s since thrust onset, < 0 before
     float drag_scale;   // measured / modelled drag in the free fall (1 = as modelled)
+    float brake_frac;   // airbrake the mixer really splayed / requested (0..1)
     float h_band_lo, h_band_hi;   // m, where THIS fall enters / leaves the ignition band
 } dg_out_t;
 
@@ -242,11 +246,16 @@ void  dg_gimbal_basis(float bx, float by, float bz,
 bool  dg_terminal_active(float h, float vz, float thrust_avail, float mass);
 float dg_terminal_throttle(float h, float vz, float mass, float thrust_avail);
 // Projected touchdown speed under clamp level k; *t_td = time to the ground.
+// Thrust forecast (LandSim_Light project_vz): with ts_tau > 0 the scale
+// decays from t_scale towards ts_inf with that time constant - today's
+// thrust deviation is a wander, not a property of the motor. ts_tau = 0
+// holds t_scale to burnout.
 float dg_project_vz(float h, float vz, float t_burn, float k, float t_scale,
-                    float *t_td);
+                    float *t_td, float ts_inf = -1.0f, float ts_tau = 0.0f);
 // The clamp level that reaches the plan target; *resid < 0 if none does.
 float dg_solve_plan(float h, float vz, float t_burn, float t_scale,
-                    float *resid, float *t_td);
+                    float *resid, float *t_td, float ts_inf = -1.0f,
+                    float ts_tau = 0.0f);
 
 /**
  * The fin mixer on its own, for the host test and the bench.

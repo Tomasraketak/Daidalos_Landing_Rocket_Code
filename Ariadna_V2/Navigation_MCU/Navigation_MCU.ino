@@ -241,6 +241,9 @@ static void params_apply(void)
     g.thrust_scale   = v[ARIADNA_P_G_THRUST_SCALE];
     g.ign_delay_pad  = v[ARIADNA_P_G_IGN_DELAY_PAD];
     g.drag_adapt     = v[ARIADNA_P_G_DRAG_ADAPT];
+    g.plan_ts_tau    = v[ARIADNA_P_G_PLAN_TS_TAU];
+    g.fin_dcd_zero   = v[ARIADNA_P_G_FIN_DCD_ZERO];
+    g.fin_dcd_brake  = v[ARIADNA_P_G_FIN_DCD_BRAKE];
     g.diameter       = v[ARIADNA_P_G_DIAMETER];
     // the ignition band table, as the diagnostic GUI computed it with LandSim
     g.tbl_vz0        = v[ARIADNA_P_TBL_VZ0];

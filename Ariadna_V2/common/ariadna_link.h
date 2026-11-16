@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   310   // 3.10: in-flight ignition search, lidar on the leg, flash params
+#define ARIADNA_FW_VERSION   320   // 3.20: LandSim 2nd audit (gains, thrust forecast), airbrake-aware drag, fin dCd params
 
 // ---------------------------------------------------------------------
 //  Framing constants

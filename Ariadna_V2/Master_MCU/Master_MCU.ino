@@ -283,6 +283,7 @@ struct LogRecord;
 static void params_load(void);
 static void params_request_poll(void);
 static void flash_param_service(void);
+static void log_dump_service(void);
 static void send_master_state(void);
 static void params_stream(void);
 static bool params_synced(void);
@@ -676,7 +677,9 @@ struct LogRecord {
     uint8_t  events;           // ARIADNA_EV_* from the sequencer
     int8_t   t_event_ds;       // countdown, 0.1 s, saturating
     uint8_t  fin_gain_pct;     // estimated fin effectiveness * 100
-    uint8_t  reserved[3];
+    uint8_t  drag_pct;         // measured / modelled free-fall drag * 100
+    uint8_t  tscale_pct;       // measured / table thrust * 100
+    uint8_t  reserved[1];
 };
 #pragma pack(pop)
 ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
@@ -1350,6 +1353,9 @@ static bool self_test(void)
 //    PARAM SAVE | LOAD | DEFAULTS
 //    PADREF                      capture the pad reference now
 //    CAL GYRO                    gyro calibration (vehicle still)
+//    LOG INFO | DUMP [from] | STOP | ERASE
+//                                flight log: LOGR <n> <96 bytes hex> lines,
+//                                then OK LOG DUMP <n>; not while logging
 //    FLIGHTARM 1 | 0             arm request when mst.auto_arm = 0 / disarm
 //    HB                          heartbeat (any line counts)
 //   TEST mode only - the Actuator Console's own commands, unchanged:
@@ -1497,9 +1503,52 @@ static bool params_load_request(void)
     return true;
 }
 
+// ---- flight log readout and erase (LOG DUMP / LOG ERASE) ----------------
+// Same pattern as the parameter store: core 0 asks, core 1 (which owns the
+// flash) does it between log pages, core 0 prints what came back as fast as
+// USB takes it. Only while the vehicle is NOT logging (not ARMED..LANDED).
+static const uint32_t LOG_REC_SZ   = 96;                  // sizeof(LogRecord)
+static const uint32_t DUMP_CHUNK   = 8 * LOG_REC_SZ;
+static uint8_t           s_dump_buf[DUMP_CHUNK];
+static volatile uint32_t s_dump_addr = 0;     // next flash address to read
+static volatile uint32_t s_dump_end  = 0;     // stop here
+static volatile uint32_t s_dump_len  = 0;     // bytes in s_dump_buf
+static volatile uint8_t  s_dump_req  = 0;     // 1 = core 1: fill the buffer
+static volatile uint8_t  s_erase_req = 0;     // 1 = core 1: erase the log
+static volatile uint32_t s_erase_at  = 0;
+
+static void flash_log_service(void)
+{
+    if (s_dump_req == 1) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        uint32_t n = s_dump_end - s_dump_addr;
+        if (n > DUMP_CHUNK) n = DUMP_CHUNK;
+        if (!flash_busy()) {
+            flash_read(s_dump_addr, s_dump_buf, n);
+            s_dump_len = n;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_dump_req = 2;                        // core 0: print it
+        }
+    }
+    if (s_erase_req == 1 && !flash_busy()) {
+        // sector by sector, one per call: never blocks this core for long
+        if (s_erase_at < s_log_addr && s_erase_at < FLASH_SIZE) {
+            flash_sector_erase(s_erase_at);
+            s_erase_at += FLASH_SECTOR;
+        } else {
+            s_log_addr      = LOG_BASE;
+            s_log_erased_to = LOG_BASE;
+            s_log_head = s_log_tail = 0;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_erase_req = 2;
+        }
+    }
+}
+
 /** Core 1, between log pages. */
 static void flash_param_service(void)
 {
+    flash_log_service();
     const uint8_t req = s_flash_req;
     if (!req) return;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -1601,6 +1650,49 @@ static void usb_printf(const char *fmt, ...)
     usb_puts_n(buf, (uint16_t)n);
 }
 
+/** Core 0: print the chunk core 1 read, then ask for the next. */
+static void log_dump_service(void)
+{
+    static uint32_t rec = 0, off = 0;
+    if (s_erase_req == 2) { s_erase_req = 0; usb_printf("OK LOG ERASE\n"); }
+    if (s_dump_req == 3) {                                              // start
+        rec = (s_dump_addr - LOG_BASE) / LOG_REC_SZ;
+        off = 0;
+        s_dump_req = 1;
+        return;
+    }
+    if (s_dump_req != 2) return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    // one record per call while the ring has room: a 96-byte record is a
+    // 205-character line, and the telemetry lines must still get through
+    while (off + LOG_REC_SZ <= s_dump_len &&
+           (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ / 2) {
+        char line[2 * LOG_REC_SZ + 24];
+        int k = snprintf(line, sizeof(line), "LOGR %lu ", (unsigned long)rec);
+        static const char HEX[] = "0123456789abcdef";
+        for (uint32_t i = 0; i < LOG_REC_SZ; i++) {
+            line[k++] = HEX[s_dump_buf[off + i] >> 4];
+            line[k++] = HEX[s_dump_buf[off + i] & 15];
+        }
+        line[k++] = '\n';
+        usb_puts_n(line, (uint16_t)k);
+        off += LOG_REC_SZ;
+        rec++;
+        return;                                      // one line per tick
+    }
+    if (off + LOG_REC_SZ > s_dump_len) {
+        s_dump_addr = s_dump_addr + s_dump_len;
+        off = 0;
+        if (s_dump_addr + LOG_REC_SZ > s_dump_end) {
+            usb_printf("OK LOG DUMP %lu\n", (unsigned long)rec);
+            s_dump_req = 0;
+        } else {
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_dump_req = 1;
+        }
+    }
+}
+
 static void console_line(char *line);
 static uint8_t s_list_idx = 255;        // PARAM LIST in progress: next entry to print
 
@@ -1643,6 +1735,7 @@ static void usb_service(void)
             s_list_idx = 255;
         }
     }
+    log_dump_service();
 
     uint8_t budget = 64;                              // bytes per tick, bounded
     while (budget-- && Serial.available()) {
@@ -1885,6 +1978,43 @@ static void console_line(char *line)
         if (!on_ground_state()) { usb_printf("ERR PADREF not on the ground\n"); return; }
         broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
         usb_printf("OK PADREF\n");
+        return;
+    }
+    if (!strcmp(cmd, "LOG")) {
+        const bool logging = s_state >= ARIADNA_STATE_ARMED && s_state <= ARIADNA_STATE_LANDED;
+        const uint32_t used = s_log_addr > LOG_BASE ? s_log_addr - LOG_BASE : 0;
+        if (!s_flash_ok) { usb_printf("ERR LOG no flash\n"); return; }
+        if (!a1 || !strcmp(a1, "INFO")) {
+            usb_printf("OK LOG INFO %lu %lu %u\n", (unsigned long)used,
+                       (unsigned long)(used / LOG_REC_SZ), (unsigned)LOG_REC_SZ);
+            return;
+        }
+        if (logging) { usb_printf("ERR LOG busy - the vehicle is logging\n"); return; }
+        if (!strcmp(a1, "DUMP")) {
+            if (s_dump_req || s_erase_req) { usb_printf("ERR LOG busy\n"); return; }
+            uint32_t from = a2 ? (uint32_t)strtoul(a2, nullptr, 10) : 0;
+            s_dump_end  = LOG_BASE + (used / LOG_REC_SZ) * LOG_REC_SZ;
+            s_dump_addr = LOG_BASE + from * LOG_REC_SZ;
+            if (s_dump_addr >= s_dump_end) { usb_printf("OK LOG DUMP 0\n"); return; }
+            usb_printf("OK LOG BEGIN %lu %u\n", (unsigned long)((s_dump_end - s_dump_addr) / LOG_REC_SZ),
+                       (unsigned)LOG_REC_SZ);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_dump_req = 3;
+            return;
+        }
+        if (!strcmp(a1, "STOP")) { s_dump_req = 0; usb_printf("OK LOG STOP\n"); return; }
+        if (!strcmp(a1, "ERASE")) {
+            if (!(s_state == ARIADNA_STATE_IDLE || s_state == ARIADNA_STATE_TEST)) {
+                usb_printf("ERR LOG ERASE only in IDLE or TEST\n"); return;
+            }
+            if (s_dump_req || s_erase_req) { usb_printf("ERR LOG busy\n"); return; }
+            s_erase_at = LOG_BASE;            // the parameter sectors 0-1 are kept
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            s_erase_req = 1;
+            usb_printf("OK LOG ERASING %lu KB\n", (unsigned long)(used / 1024));
+            return;
+        }
+        usb_printf("ERR LOG INFO|DUMP [from]|STOP|ERASE\n");
         return;
     }
     if (!strcmp(cmd, "CAL")) {
@@ -2309,6 +2439,10 @@ void loop()
             r.t_event_ds = (int8_t)(te < 0.0f ? -1 : (te > 12.7f ? 127 : (int)(te * 10.0f)));
             float fg = s_have_nav_status ? s_nav_status.fin_gain * 100.0f : 0.0f;
             r.fin_gain_pct = (uint8_t)(fg > 255.0f ? 255.0f : (fg < 0.0f ? 0.0f : fg));
+            float dg = s_have_nav_status ? s_nav_status.drag_scale * 100.0f : 0.0f;
+            r.drag_pct = (uint8_t)(dg > 255.0f ? 255.0f : (dg < 0.0f ? 0.0f : dg));
+            float ts = s_have_nav_status ? s_nav_status.t_scale * 100.0f : 0.0f;
+            r.tscale_pct = (uint8_t)(ts > 255.0f ? 255.0f : (ts < 0.0f ? 0.0f : ts));
         }
         r.vbat_mv    = (uint16_t)(s_vbat * 1000.0f);
         r.current_ma = (uint16_t)(s_current * 1000.0f);

@@ -4,7 +4,7 @@ Three microcontrollers, one ground station, one laptop. This directory is the
 structural foundation: it compiles, it is tested where it can be tested, and it is
 written to be finished rather than admired.
 
-> **Firmware 3.10 (November 2026).** The vehicle now flies the algorithm of
+> **Firmware 3.20 (November 2026).** The vehicle now flies the algorithm of
 > [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) — `common/guidance.cpp`,
 > with fin control, on-line fin adaptation, a flight-event sequencer (aerocover, main and
 > backup igniter, leg release), a parameter table editable from a USB diagnostic console,
@@ -21,6 +21,7 @@ written to be finished rather than admired.
 > | parameter table on the Master's W25Q128 flash (A/B sectors 0–1; the RP2350 has no EEPROM), streamed to the boards on the ground | `common/ariadna_params.h` |
 > | **3.10:** ignition height found in flight from the LandSim feasibility band and a fall propagated with the *measured* drag, recomputed 10×/s; band table computed from the diagnostic console via LandSim_Light | `common/guidance.cpp` `dg_ign_compute()`, `Diagnostics/diag_ignition.py` |
 > | **3.10:** lidar on the folding leg — fused only `pos.lidar_delay_ms` after the leg event, never when maxed out, beam tilt from attitude and a two-axis mount offset | `Position_MCU.ino` §lidar |
+> | **3.20:** gains re-fitted on LandSim_Light's second audit; clamp planner forecasts the thrust deviation decaying back to the table (`g.plan_ts_tau_s`); free-fall drag model follows the airbrake splay the mixer really gave; fin drag (`g.fin_dcd_zero/brake`) and the band come from `landsim_export.py`; flight log readout `LOG DUMP` + `tools/daidalos_log.py` | `common/guidance.cpp`, `Master_MCU.ino`, [`../CALIBRATION_MANUAL.md`](../CALIBRATION_MANUAL.md) |
 > | USB diagnostic console (non-blocking), TEST mode with the Actuator Console built in | `Master_MCU.ino` §13, `Diagnostics/daidalos_diag.py` |
 > | TF-Luna lidar, INSLIB attitude, GPS latency compensation (50 ms) | `Position_MCU.ino` §3, §7b |
 > | telemetry v4: quaternion, countdown, events; 3-D rocket view | `Ground_Visualizer/`, `Diagnostics/daidalos_widgets.py` |

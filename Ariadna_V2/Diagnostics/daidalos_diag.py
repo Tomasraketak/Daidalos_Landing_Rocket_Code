@@ -154,6 +154,9 @@ PARAM_HELP = {
     "g.thrust_scale": "Násobek katalogové tahové křivky přistávacího motoru (statický zážeh).",
     "g.ign_delay_pad_s": "Na jak dlouhé zpoždění roznětu se výška zážehu jistí (nejhorší případ + ~0,1 s).",
     "g.drag_adapt": "1 = odpor se ve volném pádu měří akcelerometrem a výpočet zážehu ho používá.",
+    "g.plan_ts_tau_s": "Plánovač klapky čeká, že odchylka tahu od tabulky odezní s touto časovou konstantou (LandSim: 0,7 s). 0 = odchylka trvá do vyhoření.",
+    "g.fin_dcd_zero": "Odpor křidélek v neutrálu jako přírůstek k Cd trupu (LandSim band.json fin_cd_zero − cd_body). Platí při hoření.",
+    "g.fin_dcd_brake": "Odpor křidélek roztažených jako aerobrzda (+,−,+,−) při pádu, přírůstek k Cd trupu (fin_cd_brake − cd_body). Raketa ho škáluje podle skutečného roztažení brzdy.",
     "g.diameter_m": "Průměr trupu (referenční plocha odporu).",
     "tbl.vz0": "Tabulka zážehu: první rychlost pádu. Počítá se v LandSim (záložka Zážeh a LandSim).",
     "tbl.dvz": "Tabulka zážehu: krok rychlosti pádu.",
@@ -223,7 +226,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 300 FLIGHT guidance 200 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 320 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -284,7 +287,7 @@ class FlightSimBoard(ag.SimBoard):
         qw, qx, qy = math.cos(tilt / 2), math.sin(tilt / 2) * math.cos(az), math.sin(tilt / 2) * math.sin(az)
         nz = 1 - 2 * (qx * qx + qy * qy)
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 300, "gv": 200, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 320, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -299,14 +302,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 300, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 320, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 200, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 300, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 320, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,

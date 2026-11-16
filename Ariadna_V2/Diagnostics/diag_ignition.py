@@ -47,8 +47,49 @@ VEHICLE_KEYS = [
     ("g.ign_delay_pad_s", "Rezerva na zpoždění roznětu", "s"),
     ("g.plan_target_mps", "Cílová rychlost dosednutí", "m/s"),
     ("fin.brake", "Křidélka jako brzda (0/1)", ""),
+    ("g.fin_dcd_zero", "ΔCd křidélek, neutrál (z LandSim)", "-"),
+    ("g.fin_dcd_brake", "ΔCd křidélek, aerobrzda (z LandSim)", "-"),
 ]
 N_TBL = 32
+
+# vehicle.json for landsim_export.py: our parameter key -> LandSim's key
+LANDSIM_KEYS = {
+    "g.mass_gross_kg": "mass_gross_kg", "g.mass_prop_kg": "mass_prop_kg",
+    "g.cd_body": "cd_body", "g.thrust_scale": "thrust_scale",
+    "g.diameter_m": "diameter_m", "g.ign_delay_pad_s": "delay_pad_s",
+    "g.plan_target_mps": "plan_target",
+}
+# geometry LandSim needs but the rocket does not (0 = LandSim's default)
+EXTRA_KEYS = [
+    ("fin_area_m2", "Plocha jednoho křidélka", "m²", 4),
+    ("fin_arm_m", "Rameno křidélek (těžiště → křidélko)", "m", 3),
+    ("fin_stall_deg", "Úhel odtržení křidélka", "°", 1),
+    ("inertia_t", "Moment setrvačnosti příčný (plná)", "kg·m²", 4),
+    ("inertia_r", "Moment setrvačnosti podélný (plná)", "kg·m²", 5),
+    ("ign_delay_max_s", "Max. zpoždění roznětu", "s", 3),
+]
+# band.json "gains" -> parameter keys
+GAIN_KEYS = {"wn_tvc": "g.wn_tvc", "zeta_tvc": "g.zeta_tvc", "wn_fin": "g.wn_fin",
+             "zeta_fin": "g.zeta_fin", "roll_gain": "g.roll_gain", "sched_tvc": "g.sched_tvc",
+             "sched_fin": "g.sched_fin", "att_ki": "g.att_ki"}
+
+
+def fill_no_band(hmin: list, hmax: list) -> list:
+    """landsim_export writes h_min = 0 where no altitude lands. Replace it with
+    the best effort the Navigation MCU would use anyway (hmin_at() in
+    guidance.cpp): the last positive h_min extrapolated along its slope."""
+    out = list(hmin)
+    for i, v in enumerate(out):
+        if v > 0:
+            continue
+        j = i
+        while j > 0 and out[j] <= 0:
+            j -= 1
+        if out[j] <= 0:
+            continue
+        slope = max(out[j] - out[j - 1], 0.0) if j > 0 and out[j - 1] > 0 else 0.0
+        out[i] = out[j] + slope * (i - j)
+    return out
 
 
 def header_const(name: str, default: float) -> float:
@@ -75,11 +116,18 @@ def band_at(tbl: dict, vz_abs: float):
     return lo, hi
 
 
+def cd_free_of(veh: dict) -> float:
+    """Free-fall Cd with the airbrake fully out, as the rocket models it."""
+    z = veh.get("g.fin_dcd_zero") or FIN_CD_ZERO
+    b = veh.get("g.fin_dcd_brake") or FIN_CD_BRAKE
+    return veh["g.cd_body"] + (b if veh.get("fin.brake", 1) > 0.5 else z)
+
+
 def ign_compute(tbl: dict, veh: dict, h0: float, vz0: float = 0.0, vh0: float = 0.0,
                 drag_scale: float = 1.0):
     """The Navigation MCU's dg_ign_compute(), line for line. Returns
     (h_cmd, band_lo, band_hi, vz at h_cmd, time to h_cmd)."""
-    cd_free = veh["g.cd_body"] + (FIN_CD_BRAKE if veh.get("fin.brake", 1) > 0.5 else FIN_CD_ZERO)
+    cd_free = cd_free_of(veh)
     area = math.pi * (veh["g.diameter_m"] / 2) ** 2
     kd = 0.5 * 1.225 * area * cd_free * min(max(drag_scale, 0.4), 2.5) / veh["g.mass_gross_kg"]
     dt, g = 0.005, 9.80665
@@ -214,6 +262,10 @@ class IgnitionTab(QtWidgets.QWidget):
         super().__init__()
         self.win = win
         self.computed: dict | None = None
+        self.gains: dict | None = None
+        self.fin_dcd: tuple | None = None
+        self.last_vehicle: dict | None = None
+        self.mode = "export"
         self.settings = QtCore.QSettings("VoltinoLabs", "DaidalosDiag")
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(20, 16, 20, 20)
@@ -257,18 +309,50 @@ class IgnitionTab(QtWidgets.QWidget):
         b.clicked.connect(self.browse)
         r.addWidget(b)
         sc.lay.addLayout(r)
+        ef = QtWidgets.QFormLayout()
+        self.extra: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        for key, name, unit, dec in EXTRA_KEYS:
+            sp = QtWidgets.QDoubleSpinBox()
+            sp.setDecimals(dec)
+            sp.setRange(0, 100)
+            sp.setSingleStep(10 ** -dec)
+            sp.setSpecialValueText("výchozí LandSim")
+            sp.setSuffix(f" {unit}")
+            try:
+                sp.setValue(float(self.settings.value(f"landsim/{key}", 0.0)))
+            except (TypeError, ValueError):
+                pass
+            self.extra[key] = sp
+            ef.addRow(name, sp)
+        sc.lay.addLayout(ef)
+        r = QtWidgets.QHBoxLayout()
+        r.addWidget(label("Tahová křivka (CSV t,N)", "muted"))
+        self.curve_path = QtWidgets.QLineEdit(self.settings.value("landsim/curve", ""))
+        self.curve_path.setPlaceholderText("prázdné = křivka v LandSim")
+        r.addWidget(self.curve_path, 1)
+        b = button("…")
+        b.clicked.connect(self.browse_curve)
+        r.addWidget(b)
+        sc.lay.addLayout(r)
+        self.fit_gains = QtWidgets.QCheckBox("Přefitovat zisky regulátorů (--gains, řádově minuty)")
+        sc.lay.addWidget(self.fit_gains)
         r = QtWidgets.QHBoxLayout()
         self.run_btn = button("Spočítat v LandSim_Light", "primary",
-                              "Spustí tools/gen_guidance_tables.py s tímto vozidlem (~30–90 s)")
+                              "Spustí landsim_export.py s tímto vozidlem (~15–60 s, se zisky déle)")
         self.run_btn.clicked.connect(self.run_sim)
         r.addWidget(self.run_btn)
         self.send_btn = button("Odeslat vozidlo + tabulku do rakety", "primary",
-                               "PARAM SET pro g.* a tbl.*; pak Uložit do flash na záložce Parametry")
+                               "PARAM SET pro g.*, ΔCd křidélek, tbl.* (a zisky, pokud byly "
+                               "přefitovány); pak Uložit do flash")
         self.send_btn.clicked.connect(self.send)
         self.send_btn.setEnabled(False)
         r.addWidget(self.send_btn)
         b = button("Uložit do flash", tip="PARAM SAVE")
         b.clicked.connect(lambda: self.win._cmd("PARAM SAVE"))
+        r.addWidget(b)
+        b = button("Uložit vehicle.json…", tip="Popis vozidla pro LandSim (landsim_export.py, "
+                   "make tables VEHICLE=...) - pro přegenerování celé tabulky v firmwaru")
+        b.clicked.connect(self.save_vehicle)
         r.addWidget(b)
         r.addStretch(1)
         sc.lay.addLayout(r)
@@ -358,6 +442,61 @@ class IgnitionTab(QtWidgets.QWidget):
                 sp.blockSignals(False)
         self.preview()
 
+    def browse_curve(self) -> None:
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Tahová křivka", "", "CSV (*.csv *.txt)")
+        if f:
+            self.curve_path.setText(f)
+
+    def landsim_vehicle(self) -> dict:
+        """vehicle.json in landsim_export.py's words. Daidalos flies NO D9
+        booster: LandSim's default rocket carries one, so say so explicitly."""
+        veh = self.vehicle()
+        out = {"comment": "written by the Daidalos diagnostic console",
+               "n_boosters": 0, "use_booster_rule": False,
+               "fin_enable": 1, "fin_brake": 1 if veh.get("fin.brake", 1) > 0.5 else 0}
+        for k, lk in LANDSIM_KEYS.items():
+            out[lk] = float(veh[k])
+        it = {}
+        for key, sp in self.extra.items():
+            self.settings.setValue(f"landsim/{key}", sp.value())
+            if sp.value() <= 0:
+                continue
+            if key == "inertia_t":
+                it["transverse"] = sp.value()
+            elif key == "inertia_r":
+                it["roll"] = sp.value()
+            else:
+                out[key] = sp.value()
+        if it:
+            out["inertia"] = it
+        cp = self.curve_path.text().strip()
+        self.settings.setValue("landsim/curve", cp)
+        if cp:
+            rows = []
+            with open(cp, encoding="utf-8") as fh:
+                for ln in fh:
+                    parts = re.split(r"[,;\s]+", ln.strip())
+                    try:
+                        rows.append([float(parts[0]), float(parts[1])])
+                    except (ValueError, IndexError):
+                        continue                    # header / comment line
+            if len(rows) < 3:
+                raise ValueError(f"{cp}: méně než 3 řádky t,N")
+            out["motor_curve"] = rows
+        return out
+
+    def save_vehicle(self) -> None:
+        try:
+            veh = self.landsim_vehicle()
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "LandSim", str(exc))
+            return
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "vehicle.json", "vehicle.json", "JSON (*.json)")
+        if f:
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(veh, fh, indent=1)
+            self.sim_log.appendPlainText(f"# uloženo {f}")
+
     def browse(self) -> None:
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Složka LandSim_Light", self.sim_path.text())
         if d:
@@ -366,6 +505,31 @@ class IgnitionTab(QtWidgets.QWidget):
     # -------------------------------------------------------------- simulation
     def run_sim(self) -> None:
         sim = self.sim_path.text().strip()
+        exporter = os.path.join(sim, "landsim_export.py")
+        if os.path.isfile(exporter):
+            self.settings.setValue("landsim_path", sim)
+            try:
+                veh = self.landsim_vehicle()
+            except (OSError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(self, "LandSim", str(exc))
+                return
+            self.last_vehicle = veh
+            vpath = os.path.join(self.tmp, "vehicle.json")
+            self.out_path = os.path.join(self.tmp, "band.json")
+            with open(vpath, "w", encoding="utf-8") as fh:
+                json.dump(veh, fh, indent=1)
+            if os.path.exists(self.out_path):
+                os.remove(self.out_path)
+            args = [exporter, "--vehicle", vpath, "--out", self.out_path, "--n", str(N_TBL)]
+            if self.fit_gains.isChecked():
+                args.append("--gains")
+            self.mode = "export"
+            self.sim_log.clear()
+            self.sim_log.appendPlainText("> landsim_export.py " + " ".join(args[1:]))
+            self.run_btn.setEnabled(False)
+            self.proc.setWorkingDirectory(sim)
+            self.proc.start(sys.executable, args)
+            return
         if not os.path.isfile(os.path.join(sim, "tvc_sim.py")):
             QtWidgets.QMessageBox.warning(self, "LandSim", f"V {sim} není tvc_sim.py.\n\n"
                                           "git clone https://github.com/Tomasraketak/LandSim_Light\n"
@@ -379,7 +543,9 @@ class IgnitionTab(QtWidgets.QWidget):
         if os.path.exists(self.out_path):
             os.remove(self.out_path)
         self.sim_log.clear()
-        self.sim_log.appendPlainText(f"> {os.path.basename(GEN)} --sim {sim}")
+        self.sim_log.appendPlainText(f"> {os.path.basename(GEN)} --sim {sim}   "
+                                     "(starý LandSim bez landsim_export.py)")
+        self.mode = "bridge"
         self.run_btn.setEnabled(False)
         self.proc.start(sys.executable, [GEN, "--sim", sim, "--vehicle", vpath,
                                          "--table-json", self.out_path])
@@ -398,10 +564,40 @@ class IgnitionTab(QtWidgets.QWidget):
             return
         with open(self.out_path, encoding="utf-8") as fh:
             d = json.load(fh)
-        self.computed = {"vz0": d["tbl.vz0"], "dvz": d["tbl.dvz"], "hmin": d["h_min"], "hmax": d["h_max"]}
-        n_no = sum(1 for v in d["h_max"] if v <= 0)
+        self.gains = None
+        self.fin_dcd = None
+        if getattr(self, "mode", "bridge") == "export":
+            if d.get("schema") != 1 or int(d.get("n", 0)) != N_TBL:
+                self.sim_log.appendPlainText(f"# CHYBA: band.json schema {d.get('schema')} / n "
+                                             f"{d.get('n')} (čekám schema 1, n {N_TBL})")
+                return
+            cd = float(d["vehicle"]["cd_body"])
+            self.fin_dcd = (float(d["fin_cd_zero"]) - cd, float(d["fin_cd_brake"]) - cd)
+            self.computed = {"vz0": d["vz0"], "dvz": d["dvz"],
+                             "hmin": fill_no_band(d["hmin"], d["hmax"]), "hmax": d["hmax"]}
+            if "gains" in d:
+                self.gains = {GAIN_KEYS[k]: float(v) for k, v in d["gains"].items() if k in GAIN_KEYS}
+            git = str(d.get("landsim_git", "?"))[:10] + (" (upravený)" if d.get("landsim_dirty") else "")
+            self.sim_log.appendPlainText(f"# LandSim {git}; ΔCd křidélek neutrál {self.fin_dcd[0]:.3f}, "
+                                         f"aerobrzda {self.fin_dcd[1]:.3f}; rezerva zpoždění "
+                                         f"{d['delay_pad_s']:.2f} s")
+            for k, sp in (("g.fin_dcd_zero", self.fin_dcd[0]), ("g.fin_dcd_brake", self.fin_dcd[1]),
+                          ("g.ign_delay_pad_s", float(d["delay_pad_s"]))):
+                self.fields[k].blockSignals(True)
+                self.fields[k].setValue(sp)
+                self.fields[k].blockSignals(False)
+            if self.gains:
+                self.sim_log.appendPlainText("# zisky: " + ", ".join(f"{k} {v:.3f}" for k, v in self.gains.items()))
+            if "motor_curve" in (self.last_vehicle or {}):
+                self.sim_log.appendPlainText(
+                    "# POZOR: vlastní tahová křivka platí pro pásmo, ale tabulka motoru v raketě je "
+                    "zakompilovaná - přegenerujte guidance_tables.h (make tables VEHICLE=...) a nahrajte "
+                    "firmware Navigation MCU.")
+        else:
+            self.computed = {"vz0": d["tbl.vz0"], "dvz": d["tbl.dvz"], "hmin": d["h_min"], "hmax": d["h_max"]}
+        n_no = sum(1 for v in self.computed["hmax"] if v <= 0)
         self.sim_log.appendPlainText(f"# hotovo: pásmo pro {N_TBL - n_no} z {N_TBL} rychlostí pádu"
-                                     + (f", nad {d['tbl.vz0'] + d['tbl.dvz'] * (N_TBL - n_no):.0f} m/s "
+                                     + (f", nad {self.computed['vz0'] + self.computed['dvz'] * (N_TBL - n_no):.0f} m/s "
                                         "přistání nejde uzavřít" if n_no else ""))
         self.send_btn.setEnabled(True)
         self.preview()
@@ -413,6 +609,8 @@ class IgnitionTab(QtWidgets.QWidget):
         cmds += [f"PARAM SET tbl.vz0 {self.computed['vz0']:.6g}", f"PARAM SET tbl.dvz {self.computed['dvz']:.6g}"]
         cmds += [f"PARAM SET tbl.hmin_{i:02d} {v:.6g}" for i, v in enumerate(self.computed["hmin"])]
         cmds += [f"PARAM SET tbl.hmax_{i:02d} {v:.6g}" for i, v in enumerate(self.computed["hmax"])]
+        if getattr(self, "gains", None):
+            cmds += [f"PARAM SET {k} {v:.6g}" for k, v in self.gains.items()]
         # paced: the Master answers each one, and its console reads 64 bytes a tick
         self._queue = cmds
         self._tick = QtCore.QTimer(self, interval=30, timeout=self._send_next)
@@ -446,7 +644,7 @@ class IgnitionTab(QtWidgets.QWidget):
                                                  self.dscale.value())
         # the fall itself, for the plot
         fall = []
-        cd_free = veh["g.cd_body"] + (FIN_CD_BRAKE if veh.get("fin.brake", 1) > 0.5 else FIN_CD_ZERO)
+        cd_free = cd_free_of(veh)
         kd = 0.5 * 1.225 * math.pi * (veh["g.diameter_m"] / 2) ** 2 * cd_free * self.dscale.value() / veh["g.mass_gross_kg"]
         h, vz = self.apo.value(), 0.0
         while h > 0:

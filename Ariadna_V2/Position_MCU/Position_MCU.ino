@@ -261,6 +261,23 @@ static const uint32_t BARO_HZ = 50;
 // =====================================================================
 TriSense          sensor;
 AdvancedTriFusion fusion(&sensor.imu, &sensor.mag);
+
+// ---- per-board sensor calibration (CALIBRATION_MANUAL.md, chapter 3) ----
+// Measured once per TriSense board with the library's own tools and pasted
+// here; identity values = uncalibrated. All in the SENSOR's own axes.
+//   accelerometer: examples/IMUcalibration, key 'a' (6-point sphere fit)
+//                  accel_out = (raw - ACC_OFFSET) * ACC_SCALE   [g]
+//   magnetometer:  examples/MotionCal + PJRC MotionCal         [uT]
+// The gyro needs no constant: it is calibrated at every boot (vehicle still).
+static const float ACC_OFFSET[3]       = { 0.0f, 0.0f, 0.0f };
+static const float ACC_SCALE[3]        = { 1.0f, 1.0f, 1.0f };
+static float       MAG_HARD_IRON[3]    = { 0.0f, 0.0f, 0.0f };
+static float       MAG_SOFT_IRON[3][3] = { { 1.0f, 0.0f, 0.0f },
+                                           { 0.0f, 1.0f, 0.0f },
+                                           { 0.0f, 0.0f, 1.0f } };
+// Magnetic declination of the launch site [deg, east +]. INSLIB replaces it
+// with the World Magnetic Model at the first GPS fix.
+static const float MAG_DECLINATION_DEG = 5.6f;
 #if ARIADNA_USE_INSLIB
 TriSenseINS       ins(sensor);
 #endif
@@ -2256,11 +2273,17 @@ static void attitude_begin(void)
     cfg.gnssLatencyMs = 50;            // refined per fix from pos.gps_latency_ms
     cfg.autoZupt      = true;          // switched off at launch, see the loop
     ins.setMounting(TriSenseINSMount::ComponentsUp);
-    ins.setDeclination(5.6f);          // until the first fix sets the WMM position
+    sensor.imu.setAccelOffset(ACC_OFFSET[0], ACC_OFFSET[1], ACC_OFFSET[2]);
+    sensor.imu.setAccelScale(ACC_SCALE[0], ACC_SCALE[1], ACC_SCALE[2]);
+    ins.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
+    ins.setDeclination(MAG_DECLINATION_DEG);   // until the first fix sets the WMM position
     ins.begin(cfg);                    // calibrates the gyro: keep the vehicle still
     // INSLIB set the barometer up for itself (50 Hz, OSR x8, no IIR), which
     // is also what the estimator in section 7 samples at.
 #else
+    sensor.imu.setAccelOffset(ACC_OFFSET[0], ACC_OFFSET[1], ACC_OFFSET[2]);
+    sensor.imu.setAccelScale(ACC_SCALE[0], ACC_SCALE[1], ACC_SCALE[2]);
+    fusion.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
     sensor.autoCalibrateGyro(1000);
     fusion.initOrientation(200);
 #endif
@@ -2603,7 +2626,7 @@ static bool sensors_begin(void)
 
     // Magnetic declination for the pad. Update for your launch site — this
     // is the value for central Bohemia in 2026.
-    fusion.setDeclination(5.6f);
+    fusion.setDeclination(MAG_DECLINATION_DEG);
 
     // A rocket under thrust is not in a 1 g field, so accelerometer-based
     // levelling must be OFF whenever the vehicle is accelerating. The

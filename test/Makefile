@@ -62,8 +62,9 @@ SIM ?= ../../LandSim_Light
 # Library checkouts, for the Position MCU syntax check (optional).
 TRISENSE ?= ../../Voltino_TriSense_Library
 INSLIB   ?= ../../TriSenseINSLIB
+# make tables SIM=../../LandSim_Light [VEHICLE=vehicle.json]  (VEHICLE in LandSim's format)
 tables:
-	python3 ../tools/gen_guidance_tables.py --sim $(SIM)
+	python3 ../tools/gen_guidance_tables.py --sim $(SIM) $(if $(VEHICLE),--landsim-vehicle $(abspath $(VEHICLE)))
 
 # ---------------------------------------------------------------------
 # Ariadna V2 link codec. Shared by three MCUs, a ground station and a
