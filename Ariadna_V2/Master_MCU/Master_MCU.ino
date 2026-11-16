@@ -13,7 +13,7 @@
 //    * runs the LoRa downlink to the ground station
 //    * owns arming, the RBF interlock, and the buzzer and RGB annunciators
 //
-//    * holds the PARAMETER TABLE (EEPROM) and streams it to the other two
+//    * holds the PARAMETER TABLE (W25Q128, sectors 0-1) and streams it to the other two
 //      boards while the vehicle is on the ground
 //    * talks to the diagnostic GUI over USB — only while a host has the
 //      port open, and never by waiting for it (section 13)
@@ -77,7 +77,6 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
-#include <EEPROM.h>
 
 // The shared annunciator engine. ARIADNA_RGB_PIN must be set BEFORE the
 // include: the header instantiates the pixel object at that pin, and the
@@ -213,7 +212,7 @@ enum {
 // test 3 in the README exists to catch exactly this.
 //
 // ALL OF THESE ARE PARAMETERS NOW (ariadna_params.h, group "srv."), set
-// from the diagnostic GUI and kept in EEPROM, because every one is a
+// from the diagnostic GUI and kept in the W25Q128 flash, because every one is a
 // property of how a horn was pressed onto a spline. The names below are
 // kept so the servo code reads as it always did.
 static ariadna_params_t s_params;
@@ -239,6 +238,12 @@ static const uint32_t FLASH_SIZE     = 16UL * 1024UL * 1024UL;  // W25Q128
 static const uint32_t FLASH_SECTOR   = 4096;
 static const uint32_t FLASH_PAGE     = 256;
 static const uint32_t LOG_HZ         = 50;
+// Sectors 0 and 1 hold the parameter table (two copies, see section 13);
+// the flight log starts after them. The log never wraps, so it can never
+// overwrite them.
+static const uint32_t PARAM_SECTOR_A = 0;
+static const uint32_t PARAM_SECTOR_B = 1;
+static const uint32_t LOG_BASE       = 2 * 4096;
 
 // ---- link supervision -------------------------------------------------
 static const uint32_t LINK_TIMEOUT_MS = 300;
@@ -276,6 +281,9 @@ struct LogRecord;
 // `make syntax` compiles this file as plain C++ where it does not - and a
 // build that only works inside one IDE cannot be checked on a workstation.
 static void params_load(void);
+static void params_request_poll(void);
+static void flash_param_service(void);
+static void send_master_state(void);
 static void params_stream(void);
 static bool params_synced(void);
 static void usb_service(void);
@@ -332,7 +340,7 @@ static bool     s_cover_open  = false;
 
 // parameter sync
 static uint16_t s_param_crc   = 0;
-static bool     s_params_from_eeprom = false;
+static bool     s_params_from_flash = false;
 
 // TEST mode: the diagnostic GUI drives the actuators directly
 static bool     s_test        = false;
@@ -621,13 +629,13 @@ static bool flash_begin(void)
 static uint32_t flash_find_append(void)
 {
     uint8_t buf[16];
-    uint32_t lo = 0;                       // known written (or the start)
+    uint32_t lo = LOG_BASE / FLASH_SECTOR; // known written (or the start)
     uint32_t hi = FLASH_SIZE / FLASH_SECTOR;
 
-    flash_read(0, buf, sizeof(buf));
+    flash_read(LOG_BASE, buf, sizeof(buf));
     bool first_erased = true;
     for (uint8_t i = 0; i < sizeof(buf); i++) if (buf[i] != 0xFF) first_erased = false;
-    if (first_erased) return 0;            // empty chip
+    if (first_erased) return LOG_BASE;     // empty log
 
     while (hi - lo > 1) {
         uint32_t mid = (lo + hi) / 2;
@@ -1354,48 +1362,179 @@ static bool self_test(void)
 //    P {..}  Position status   G {..}  guidance / Navigation status
 // =====================================================================
 
-// ---- parameter store ---------------------------------------------------
+// ---- parameter store: the W25Q128, not EEPROM -----------------------------
+//
+// The RP2350 has NO EEPROM. arduino-pico's EEPROM.h emulates one in the last
+// sector of the PROGRAM flash, and every commit() erases and reprograms that
+// sector with execute-in-place switched off - BOTH cores stop for tens of
+// milliseconds. Core 1 runs the LoRa link and the flight log, so that is not
+// acceptable here even on the ground.
+//
+// The table lives on the external W25Q128 instead, in sectors 0 and 1, two
+// copies with a sequence number: a save always writes the OLDER copy, so a
+// power cut in the middle of a save leaves the newer one intact, and a boot
+// takes the newest copy that passes its CRC. The flight log starts at
+// LOG_BASE, after them.
+//
+// The flash bus belongs to core 1 (the log). Core 0 never touches it after
+// setup(): a save or load is a REQUEST that core 1 executes between two log
+// pages, and the USB console reports the result when it is done.
 struct ParamImage {
     uint32_t magic;
+    uint32_t seq;
     uint16_t layout;
     uint16_t crc;
     float    v[ARIADNA_PARAM_ID_MAX];
 };
-static const uint32_t PARAM_MAGIC = 0x44414931;      // "DAI1"
+static const uint32_t PARAM_MAGIC = 0x44414932;      // "DAI2"
 
+static ParamImage        s_pimg;                     // staging, handed between cores
+static volatile uint8_t  s_flash_req = 0;            // 1 save, 2 load (core 0 -> core 1)
+static volatile uint8_t  s_flash_res = 0;            // 0 pending, 1 ok, 2 failed
+static uint32_t          s_param_seq = 0;            // seq of the copy in use
+
+static void flash_wait_idle(uint32_t timeout_ms)
+{
+    const uint32_t t0 = millis();
+    while (flash_busy() && millis() - t0 < timeout_ms) tight_loop_contents();
+}
+
+static bool pimg_valid(const ParamImage *im)
+{
+    if (im->magic != PARAM_MAGIC || im->layout != ARIADNA_PARAM_LAYOUT) return false;
+    ariadna_params_t t;
+    memcpy(t.v, im->v, sizeof(t.v));
+    return ariadna_params_crc(&t) == im->crc;
+}
+
+/** Read both copies into `out`, newest valid wins. Flash-bus owner only. */
+static bool flash_params_read(ParamImage *out)
+{
+    ParamImage a, b;
+    flash_read(PARAM_SECTOR_A * FLASH_SECTOR, (uint8_t *)&a, sizeof(a));
+    flash_read(PARAM_SECTOR_B * FLASH_SECTOR, (uint8_t *)&b, sizeof(b));
+    const bool va = pimg_valid(&a), vb = pimg_valid(&b);
+    if (!va && !vb) return false;
+    *out = (va && (!vb || a.seq >= b.seq)) ? a : b;
+    return true;
+}
+
+/** Write `im` over the OLDER copy. Flash-bus owner only; blocks ~50 ms. */
+static bool flash_params_write(ParamImage *im)
+{
+    ParamImage a, b;
+    flash_read(PARAM_SECTOR_A * FLASH_SECTOR, (uint8_t *)&a, sizeof(a));
+    flash_read(PARAM_SECTOR_B * FLASH_SECTOR, (uint8_t *)&b, sizeof(b));
+    const bool va = pimg_valid(&a), vb = pimg_valid(&b);
+    uint32_t newest = 0, sector = PARAM_SECTOR_A;
+    if (va) newest = a.seq;
+    if (vb && b.seq > newest) newest = b.seq;
+    // overwrite the copy that is NOT the newest valid one
+    if (va && (!vb || a.seq >= b.seq)) sector = PARAM_SECTOR_B;
+    im->seq = newest + 1;
+    const uint32_t base = sector * FLASH_SECTOR;
+
+    flash_wait_idle(500);
+    flash_sector_erase(base);
+    flash_wait_idle(500);
+    const uint8_t *p = (const uint8_t *)im;
+    for (uint32_t off = 0; off < sizeof(*im); off += FLASH_PAGE) {
+        uint32_t n = sizeof(*im) - off;
+        if (n > FLASH_PAGE) n = FLASH_PAGE;
+        flash_page_program(base + off, p + off, n);
+        flash_wait_idle(10);
+    }
+    ParamImage chk;                                   // read back: it really took
+    flash_read(base, (uint8_t *)&chk, sizeof(chk));
+    return memcmp(&chk, im, sizeof(chk)) == 0;
+}
+
+static void params_apply_image(const ParamImage *im)
+{
+    ariadna_params_default(&s_params);
+    // Through ariadna_param_set(), so a stored value outside today's range
+    // is clamped rather than trusted, and an id the image does not know
+    // keeps its default.
+    for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++) {
+        uint8_t id = ARIADNA_PARAM_INFO[i].id;
+        (void)ariadna_param_set(&s_params, id, im->v[id]);
+    }
+    s_param_seq = im->seq;
+}
+
+/** setup() only, before core 1 owns the flash bus. */
 static void params_load(void)
 {
     ariadna_params_default(&s_params);
-    s_params_from_eeprom = false;
-    EEPROM.begin(1024);
-    ParamImage img;
-    EEPROM.get(0, img);
-    if (img.magic == PARAM_MAGIC && img.layout == ARIADNA_PARAM_LAYOUT) {
-        ariadna_params_t t;
-        memcpy(t.v, img.v, sizeof(t.v));
-        if (ariadna_params_crc(&t) == img.crc) {
-            // Through ariadna_param_set(), so a stored value outside today's
-            // range is clamped rather than trusted.
-            for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++) {
-                uint8_t id = ARIADNA_PARAM_INFO[i].id;
-                (void)ariadna_param_set(&s_params, id, t.v[id]);
-            }
-            s_params_from_eeprom = true;
-        }
+    s_params_from_flash = false;
+    if (s_flash_ok && flash_params_read(&s_pimg)) {
+        params_apply_image(&s_pimg);
+        s_params_from_flash = true;
     }
     s_param_crc = ariadna_params_crc(&s_params);
 }
 
-/** Blocks for a flash write (and pauses core 1). Ground only. */
-static bool params_save(void)
+/** Core 0: ask core 1 to save the current table. */
+static bool params_save_request(void)
 {
-    ParamImage img;
-    img.magic  = PARAM_MAGIC;
-    img.layout = ARIADNA_PARAM_LAYOUT;
-    memcpy(img.v, s_params.v, sizeof(img.v));
-    img.crc    = ariadna_params_crc(&s_params);
-    EEPROM.put(0, img);
-    return EEPROM.commit();
+    if (!s_flash_ok || s_flash_req) return false;
+    s_pimg.magic  = PARAM_MAGIC;
+    s_pimg.layout = ARIADNA_PARAM_LAYOUT;
+    memcpy(s_pimg.v, s_params.v, sizeof(s_pimg.v));
+    s_pimg.crc    = ariadna_params_crc(&s_params);
+    s_flash_res   = 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_flash_req   = 1;
+    return true;
+}
+
+static bool params_load_request(void)
+{
+    if (!s_flash_ok || s_flash_req) return false;
+    s_flash_res = 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_flash_req = 2;
+    return true;
+}
+
+/** Core 1, between log pages. */
+static void flash_param_service(void)
+{
+    const uint8_t req = s_flash_req;
+    if (!req) return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    bool ok = (req == 1) ? flash_params_write(&s_pimg) : flash_params_read(&s_pimg);
+    s_flash_res = ok ? 1 : 2;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_flash_req = 0;
+}
+
+/** Core 0, every tick: finish a request core 1 has completed. */
+static void params_request_poll(void)
+{
+    static uint8_t pending = 0;               // what core 0 is waiting for
+    if (s_flash_req) { if (!pending) pending = s_flash_req; return; }
+    if (!pending) return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (pending == 1) {
+        if (s_flash_res == 1) {
+            s_param_seq = s_pimg.seq;
+            s_params_from_flash = true;
+            usb_printf("OK PARAM SAVE %u (flash copy %lu)\n", s_param_crc, (unsigned long)s_param_seq);
+        } else {
+            usb_printf("ERR PARAM SAVE flash write failed\n");
+        }
+    } else {
+        if (s_flash_res == 1) {
+            params_apply_image(&s_pimg);
+            s_param_crc = ariadna_params_crc(&s_params);
+            s_params_from_flash = true;
+            usb_printf("OK PARAM LOAD flash %u\n", s_param_crc);
+        } else {
+            usb_printf("ERR PARAM LOAD no valid copy in flash\n");
+        }
+    }
+    pending = 0;
 }
 
 static inline bool on_ground_state(void)
@@ -1687,12 +1826,12 @@ static void console_param(char *a1, char *a2, char *a3)
         return;
     }
     if (!strcmp(a1, "SAVE")) {
-        usb_printf(params_save() ? "OK PARAM SAVE %u\n" : "ERR PARAM SAVE failed %u\n", s_param_crc);
+        // Done by core 1, which owns the flash; reported when it is.
+        if (!params_save_request()) usb_printf("ERR PARAM SAVE flash missing or busy\n");
         return;
     }
     if (!strcmp(a1, "LOAD")) {
-        params_load();
-        usb_printf("OK PARAM LOAD %s %u\n", s_params_from_eeprom ? "eeprom" : "defaults", s_param_crc);
+        if (!params_load_request()) usb_printf("ERR PARAM LOAD flash missing or busy\n");
         return;
     }
     if (!strcmp(a1, "DEFAULTS")) {
@@ -1922,7 +2061,7 @@ static void diag_emit(void)
             (s_have_nav && link_alive(s_nav_us)) ? 1 : 0,
             (unsigned long)s_rx_nav.rx_ok, (unsigned long)(s_rx_nav.rx_crc + s_rx_nav.rx_len),
             (s_have_act && link_alive(s_act_us)) ? 1 : 0,
-            s_param_crc, params_synced() ? 1 : 0, s_params_from_eeprom ? 1 : 0,
+            s_param_crc, params_synced() ? 1 : 0, s_params_from_flash ? 1 : 0,
             s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped);
         break;
     case 2:         // N: the navigation state
@@ -1985,6 +2124,22 @@ static void diag_emit(void)
 // =====================================================================
 //  11. CORE 0 — routing, servos, state machine
 // =====================================================================
+static void send_master_state(void)
+{
+    ariadna_master_state_t ms;
+    memset(&ms, 0, sizeof(ms));
+    ms.t_ms        = millis();
+    ms.t_launch_ms = s_t_launch_ms;
+    ms.vbat_mv     = (uint16_t)(s_vbat * 1000.0f);
+    ms.current_ma  = (uint16_t)(s_current * 1000.0f);
+    ms.state       = s_state;
+    ms.flags       = s_flags;
+    ms.nav_events  = s_act.events;
+    if (s_flash_ok) ms.flags |= ARIADNA_MST_LOGGING;
+    send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
+    send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
+}
+
 void setup()
 {
     // Navigation held in reset until this board is ready, so it cannot
@@ -2003,7 +2158,10 @@ void setup()
 
     Serial.begin(ARIADNA_CONSOLE_BAUD);
 
-    // Parameters before anything that reads one (servo trims, below).
+    // The flash first, then the parameters (they live on it), then
+    // everything that reads one (servo trims, below). Core 1 is still
+    // waiting in setup1(), so the bus is ours.
+    s_flash_ok = flash_begin();
     params_load();
 
     // 0xFF: the SK6812 is powered from the board's own rail, so there is
@@ -2023,8 +2181,6 @@ void setup()
     pca_write_run(0, s_servo_counts, PCA_N_USED);
     digitalWrite(PIN_PCA_OE, LOW);       // outputs on, at the parked pulse
 
-    // ---- flash ----
-    s_flash_ok = flash_begin();
 
     // ---- inter-processor links ----
     POS_PORT.setTX(PIN_POS_TX); POS_PORT.setRX(PIN_POS_RX);
@@ -2056,7 +2212,7 @@ void setup()
     MASTER_PRINT("\nAriadna V2 Master MCU — POST %s\n", s_post_pass ? "PASS" : "FAIL");
     MASTER_PRINT("# fw %d, servo bus %s, flash %s, parameters from %s\n",
                  ARIADNA_FW_VERSION, s_servo_ok ? "ok" : "FAIL", s_flash_ok ? "ok" : "FAIL",
-                 s_params_from_eeprom ? "EEPROM" : "DEFAULTS");
+                 s_params_from_flash ? "FLASH" : "DEFAULTS");
 
     // Release the Navigation MCU now that both UARTs are up.
     digitalWrite(PIN_RST_NAV, HIGH);
@@ -2087,27 +2243,24 @@ void loop()
     state_machine();
     params_stream();
     usb_service();        // diagnostic GUI: a no-op unless a host has the port open
+    params_request_poll();
     if (s_test) test_service();
     annunciate();
     ariadna_rgb_service(&s_rgb);
     ariadna_buzzer_service(&s_buzz);
 
     // ---- state broadcast, 10 Hz -----------------------------------------
-    if (millis() >= next_bcast_ms) {
-        next_bcast_ms = millis() + 1000 / ARIADNA_MASTER_HZ;
-
-        ariadna_master_state_t ms;
-        memset(&ms, 0, sizeof(ms));
-        ms.t_ms        = millis();
-        ms.t_launch_ms = s_t_launch_ms;
-        ms.vbat_mv     = (uint16_t)(s_vbat * 1000.0f);
-        ms.current_ma  = (uint16_t)(s_current * 1000.0f);
-        ms.state       = s_state;
-        ms.flags       = s_flags;
-        if (s_flash_ok) ms.flags |= ARIADNA_MST_LOGGING;
-
-        send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
-        send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
+    // 10 Hz, and AT ONCE when the Navigation MCU reports a new flight event:
+    // the Position MCU times its lidar from the moment the legs open, and a
+    // 100 ms wait for the next slot would be 100 ms of a usable lidar lost.
+    {
+        static uint8_t last_events = 0;
+        const bool event_new = (s_act.events != last_events);
+        if (millis() >= next_bcast_ms || event_new) {
+            next_bcast_ms = millis() + 1000 / ARIADNA_MASTER_HZ;
+            last_events = s_act.events;
+            send_master_state();
+        }
     }
 
     // ---- telemetry snapshot and log -------------------------------------
@@ -2273,6 +2426,7 @@ void loop1()
 
     // Flash first: the log is the only record that survives a lost link.
     if (s_flash_ok) {
+        flash_param_service();
         flash_erase_ahead();
         flash_drain();
     }

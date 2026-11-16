@@ -33,9 +33,10 @@ static const float DG_MOTOR_CUM[17] = {
 
 // ---- airframe ----
 #define DG_AREA           0.008659014751456867f   // m^2
-#define DG_CD_BODY        0.35f   // bare body, guidance drag credit
-#define DG_CD_BURN        0.4930619470876475f   // body + fins at 0 deg (planner)
-#define DG_CD_FREE        0.7972053358755042f   // body + airbrake (free fall)
+#define DG_CD_BODY        0.35f   // bare body (default of g.cd_body)
+#define DG_FIN_CD_ZERO    0.14306194708764752f   // fins at 0 deg, as body dCd
+#define DG_FIN_CD_BRAKE   0.44720533587550426f   // fins splayed as airbrake, as body dCd
+#define DG_DIAMETER       0.105f   // m (default of g.diameter_m)
 #define DG_IT_PER_KG      0.16333333333333333f   // transverse MMOI / mass
 #define DG_IA_PER_KG      0.0013781249999999998f   // roll MMOI / mass
 #define DG_L_GIMBAL       0.7f   // CG -> nozzle pivot, m
@@ -60,28 +61,28 @@ static const float DG_MOTOR_CUM[17] = {
 #define DG_SCHED_TVC      0.3320197372107575f
 #define DG_SCHED_FIN      0.02280235000827696f
 
-// ---- ignition altitude: h_cmd(apogee altitude, horizontal speed at apogee) ----
-#define DG_IGN_NH 12
-#define DG_IGN_NV 5
-#define DG_IGN_H0 80.0f
-#define DG_IGN_DH 10.0f
-static const float DG_IGN_VX[5] = {
-    0.0f, 2.5f, 5.0f, 7.5f, 10.0f,
+// ---- default ignition band: [h_min, h_max] against |vz| at ignition ----
+// h_max = 0 marks a fall speed with no feasible band; h_min is then the
+// least-bad altitude. The flight copy is the tbl.* parameters.
+#define DG_IGN_N   32
+#define DG_IGN_VZ0 4.0f
+#define DG_IGN_DVZ 2.0f
+static const float DG_IGN_HMIN[32] = {
+    2.22265625f, 3.126953125f, 4.142578125f, 5.185546875f, 6.359375f, 7.623046875f,
+    9.2578125f, 10.78515625f, 12.625f, 14.509765625f, 16.18359375f, 18.166015625f,
+    20.6875f, 22.748046875f, 25.451171875f, 28.03125f, 29.875f, 33.09765625f,
+    35.892578125f, 38.830078125f, 41.73046875f, 44.751953125f, 47.623046875f, 50.884765625f,
+    53.962890625f, 58.296875f, 61.37101181295551f, 65.31030307743995f, 68.7403834312955f, 72.26966827508187f,
+    76.19072818577749f, 80.51929230567876f,
 };
-#define DG_IGN_DELAY_PAD  0.4f   // s, what the table pads for
-static const float DG_IGN_TABLE[12][5] = {
-    { 37.97243729812547f, 38.426947032063765f, 38.38731518370594f, 38.39495537805507f, 38.1453950501304f },   // apogee 80 m
-    { 41.34178641307522f, 41.493420013058845f, 41.26560328581824f, 41.143338855449684f, 41.243580497177945f },   // apogee 90 m
-    { 44.52427878050847f, 44.470333569276534f, 44.470908353813726f, 44.43046652983748f, 44.447425081940274f },   // apogee 100 m
-    { 47.39825558558894f, 47.356859991415f, 47.41205637844101f, 47.16839278615385f, 47.27855372475637f },   // apogee 110 m
-    { 50.307603494622455f, 50.18452328209818f, 49.90525457362408f, 49.753383867919595f, 50.255853077782376f },   // apogee 120 m
-    { 53.082634426821826f, 52.83029220705758f, 52.79197366430984f, 52.56142053954592f, 52.562656400412635f },   // apogee 130 m
-    { 54.93716032608696f, 54.13468070652175f, 54.98301630434783f, 54.79959239130436f, 54.89130434782609f },   // apogee 140 m
-    { 55.41015625f, 55.779551630434774f, 55.41015625f, 55.656419836956516f, 55.53328804347825f },   // apogee 150 m
-    { 56.85971467391305f, 56.70176630434783f, 57.017663043478265f, 56.41219429347826f, 56.83338994565217f },   // apogee 160 m
-    { 57.34714673913044f, 57.6273777173913f, 57.37516983695652f, 57.26307744565217f, 56.534476902173914f },   // apogee 170 m
-    { 56.26953125000001f, 56.32897418478261f, 57.39894701086957f, 57.042289402173914f, 57.28006114130435f },   // apogee 180 m
-    { 57.942425271739125f, 59.544836956521735f, 58.50798233695652f, 58.28804347826087f, 58.16236413043478f },   // apogee 190 m
+static const float DG_IGN_HMAX[32] = {
+    17.12109375f, 19.998046875f, 22.939453125f, 25.650390625f, 28.53125f, 31.005859375f,
+    33.51953125f, 35.712890625f, 38.28515625f, 40.431640625f, 42.421875f, 44.78125f,
+    46.6875f, 48.5703125f, 50.05078125f, 50.99609375f, 53.390625f, 54.509765625f,
+    55.595703125f, 56.705078125f, 57.556640625f, 57.771484375f, 52.998046875f, 52.748046875f,
+    60.435546875f, 59.59375f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f,
 };
+#define DG_IGN_DELAY_PAD  0.4f   // s, default igniter pad
 
 #endif // DAIDALOS_GUIDANCE_TABLES_H

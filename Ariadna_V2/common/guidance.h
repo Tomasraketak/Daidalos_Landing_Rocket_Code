@@ -53,7 +53,7 @@
 
 #include "guidance_tables.h"
 
-#define DG_VERSION        200          // 2.00 — LandSim_Light port
+#define DG_VERSION        210          // 2.10 — in-flight ignition search, drag estimate
 
 // ---------------------------------------------------------------------
 //  Fixed constants (the simulation's)
@@ -132,6 +132,16 @@ typedef struct {
     float fin_ascent_mode;   // 0 parked, 1 roll damper, 2 roll + hold vertical
     float fin_adapt;         // 0 = fixed model, 1 = adapt effectiveness and trim
     float fin_gain0;         // initial effectiveness (1 = the CFD model)
+    // the vehicle as the ignition search and the planner see it
+    float cd_body;           // bare-body drag coefficient (fins are added from the CFD)
+    float thrust_scale;      // multiplies the tabulated motor curve
+    float ign_delay_pad;     // s of igniter delay the ignition altitude pads for
+    float drag_adapt;        // 1 = scale the drag by what is measured in the free fall
+    float diameter;          // m
+    // the ignition band table, from LandSim_Light (tbl.* parameters)
+    float tbl_vz0, tbl_dvz;
+    float tbl_hmin[DG_IGN_N];
+    float tbl_hmax[DG_IGN_N];  // 0 = no feasible band at that fall speed
 } dg_params_t;
 
 void dg_params_default(dg_params_t *p);
@@ -185,6 +195,8 @@ typedef struct {
     float fin_gain;     // estimated fin effectiveness, 1 = the model
     float fin_trim[3];  // deg, estimated trim offsets: axis 1, axis 2, roll
     float t_burn;       // s since thrust onset, < 0 before
+    float drag_scale;   // measured / modelled drag in the free fall (1 = as modelled)
+    float h_band_lo, h_band_hi;   // m, where THIS fall enters / leaves the ignition band
 } dg_out_t;
 
 // ---------------------------------------------------------------------
@@ -199,6 +211,8 @@ void dg_set_params(const dg_params_t *p);
 const dg_params_t *dg_get_params(void);
 
 // Flight phase transitions the caller reports (it owns the mission state).
+// dg_begin_descent() takes the apogee state; the ignition altitude is then
+// recomputed ten times a second by dg_step_planner() from the real fall.
 void dg_begin_ascent(void);                           // launch detected
 void dg_begin_descent(float h_apogee, float vh_apogee);  // apogee passed
 
@@ -208,8 +222,17 @@ void dg_step_planner(const dg_nav_t *nav);
 // ---- introspection: the host test and the self test ---------------------
 float dg_thrust_ref(float t_burn);                 // tabulated thrust, N
 float dg_burned(float t_burn);                     // propellant burned, kg
-float dg_h_cmd_lookup(float h_apogee, float vh);   // table only, no bias
-float dg_h_ignite(void);                           // what this flight will use
+/**
+ * The ignition altitude for a fall starting from (h, vz, vh) with the drag
+ * scaled by `drag_scale`: LandSim_Light's find_ignition(), with the band
+ * [h_min, h_max] read from the tbl.* table and the fall propagated here.
+ * No bias, no override. Optional outputs: the time to reach it, the fall
+ * speed there, and the two band edges along this trajectory.
+ */
+float dg_ign_compute(float h, float vz, float vh, float drag_scale,
+                     float *t_to, float *vz_at, float *band_lo, float *band_hi);
+float dg_ign_band(float vz_abs, float *h_max);     // table lookup: h_min (and h_max)
+float dg_h_ignite(void);                           // what this flight will use now
 float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
                       float *ux, float *uy, float *uz);   // returns t_go
 void  dg_gimbal_basis(float bx, float by, float bz,

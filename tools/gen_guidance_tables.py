@@ -5,10 +5,30 @@
 
 writes
 
-    Ariadna_V2/common/guidance_tables.h   motor curve, vehicle numbers, fitted gains,
-                                          and the ignition-altitude table
-    test/guid_golden.h                    reference values the host test compares
-                                          guidance.cpp against
+    Ariadna_V2/common/guidance_tables.h    motor curve, vehicle numbers, fitted gains,
+                                           and the DEFAULT ignition band table
+    Ariadna_V2/common/ariadna_params_tbl.h the same band table as parameters (tbl.*),
+                                           so it can be replaced from the diagnostic GUI
+    test/guid_golden.h                     reference values the host test compares
+                                           guidance.cpp against
+
+THE IGNITION BAND TABLE. For every fall speed |vz| at the moment of ignition
+(4, 6, ... 66 m/s) the simulation finds the band of altitudes [h_min, h_max]
+from which its own receding-horizon clamp controller still lands softer than
+FEASIBLE_VZ (-2.3 m/s). The vehicle does the rest in flight: ten times a second
+during the descent it propagates its own fall from the CURRENT state with the
+drag it MEASURES, finds where that trajectory enters the band, and adds the
+igniter-delay pad. That is the simulation's find_ignition(), split into the part
+that needs a PC (the band) and the part that needs the real flight (the fall).
+
+THE BRIDGE TO THE DIAGNOSTIC GUI.
+
+    python3 tools/gen_guidance_tables.py --sim ../LandSim_Light \
+        --vehicle vehicle.json --table-json table.json
+
+reads the vehicle the GUI exported (g.mass_gross_kg, g.cd_body, ...), flies the
+simulation with it and writes only the band table, as JSON, for the GUI to
+upload. No header is touched in that mode.
 
 The script IMPORTS tvc_sim.py rather than re-implementing anything, so the
 firmware tables cannot drift from the simulation they came from. Re-run it
@@ -19,6 +39,7 @@ The landing vehicle has no D9 booster channel (PYRO1 igniter, PYRO2 backup
 igniter, PYRO3 leg release), so everything is generated with n_boosters = 0.
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -49,10 +70,10 @@ def main():
     ap.add_argument("--delay-pad", type=float, default=None,
                     help="igniter delay the ignition altitude pads for [s] "
                          "(default: the simulation's)")
-    ap.add_argument("--h-lo", type=float, default=80.0)
-    ap.add_argument("--h-hi", type=float, default=260.0)
-    ap.add_argument("--h-step", type=float, default=10.0)
-    ap.add_argument("--vx", default="0,2.5,5,7.5,10")
+    ap.add_argument("--vz0", type=float, default=4.0, help="first |vz| of the band table")
+    ap.add_argument("--dvz", type=float, default=2.0, help="|vz| step of the band table")
+    ap.add_argument("--vehicle", help="JSON from the diagnostic GUI: parameter key -> value")
+    ap.add_argument("--table-json", help="write only the band table to this JSON file")
     args = ap.parse_args()
 
     sim_dir = os.path.abspath(args.sim)
@@ -65,9 +86,27 @@ def main():
     gains = s.load_gains()
     if gains:
         cfg = cfg.with_gains(gains)
+    from dataclasses import replace
     if args.delay_pad is not None:
-        from dataclasses import replace
         cfg = replace(cfg, delay_pad=args.delay_pad)
+    if args.vehicle:
+        with open(args.vehicle, encoding="utf-8") as fh:
+            veh = json.load(fh)
+        m_ = {"g.mass_gross_kg": "gross_mass", "g.mass_prop_kg": "propellant",
+              "g.cd_body": "cd", "g.thrust_scale": "thrust_mult", "g.diameter_m": "diameter",
+              "g.plan_target_mps": "plan_target", "g.ign_delay_pad_s": "delay_pad"}
+        kw = {m_[k]: float(v) for k, v in veh.items() if k in m_}
+        if "fin.brake" in veh:
+            kw["fin_brake"] = "auto" if float(veh["fin.brake"]) > 0.5 else "off"
+        if "fin.enable" in veh and float(veh["fin.enable"]) < 0.5:
+            kw["fins"] = False
+        # inertia scales with the mass the GUI gives (the geometry does not change)
+        if "gross_mass" in kw:
+            r = kw["gross_mass"] / cfg.gross_mass
+            kw["mmoi_transverse"] = cfg.mmoi_transverse * r
+            kw["mmoi_roll"] = cfg.mmoi_roll * r
+        cfg = replace(cfg, **kw)
+        print("vehicle:", kw, file=sys.stderr)
 
     m, b = cfg.tables()
     mt, mf, mc = s.motor_arrays(m)
@@ -75,19 +114,81 @@ def main():
     fins = cfg.fin_set()
     _, cd_free = cfg.fin_args()
 
-    # ---------------- ignition table ----------------
-    hs = list(np.arange(args.h_lo, args.h_hi + 1e-6, args.h_step))
-    vxs = [float(v) for v in args.vx.split(",")]
+    # ---------------- ignition band table ----------------
+    dry = cfg.gross_mass - m.propellant_mass
+    feasible_vz = s.FEASIBLE_VZ
+
+    def touchdown(h, vz):
+        return s.project_rh(float(h), -float(vz), 0.0, dry, mt, mf, mc, m.propellant_mass,
+                            m.total_impulse, cfg.cd_burn, cfg.area, cfg.k_min, cfg.k_max,
+                            bt, bf, bb, b.propellant_mass, 1.0e6, cfg.plan_target)
+
+    def band(vz):
+        """[h_min, h_max] for this fall speed; (h_best, 0) when no altitude works."""
+        step = 2.0
+        hs = [3.0 + step * i for i in range(int(157 / step))]
+        lo = hi = None
+        best_h, best_v = hs[0], -1e9
+        for h in hs:
+            v = touchdown(h, vz)
+            if v > best_v:
+                best_v, best_h = v, h
+            if v >= feasible_vz:
+                if lo is None:
+                    lo = h
+                hi = h
+            elif lo is not None:
+                break                       # the band is one interval
+        if lo is None:
+            a_, c_ = max(1.0, best_h - step), best_h + step
+            for _ in range(14):
+                m1, m2 = a_ + (c_ - a_) / 3, c_ - (c_ - a_) / 3
+                if touchdown(m1, vz) < touchdown(m2, vz):
+                    a_ = m1
+                else:
+                    c_ = m2
+            return 0.5 * (a_ + c_), 0.0
+        a_, c_ = max(0.5, lo - step), lo           # refine the lower edge
+        for _ in range(10):
+            mid = 0.5 * (a_ + c_)
+            if touchdown(mid, vz) >= feasible_vz:
+                c_ = mid
+            else:
+                a_ = mid
+        h_min = c_
+        a_, c_ = hi, hi + step                      # and the upper one
+        for _ in range(10):
+            mid = 0.5 * (a_ + c_)
+            if touchdown(mid, vz) >= feasible_vz:
+                a_ = mid
+            else:
+                c_ = mid
+        return h_min, a_
+
+    n_vz = 32
+    vzs = [args.vz0 + args.dvz * i for i in range(n_vz)]
     t0 = time.time()
-    table = []
-    for h0 in hs:
-        row = []
-        for vx in vxs:
-            row.append(s.plan_ignition(cfg, float(h0), float(vx)))
-        table.append(row)
-        print(f"  apogee {h0:5.0f} m: " + " ".join(f"{v:6.2f}" for v in row),
-              file=sys.stderr)
-    print(f"ignition table: {time.time() - t0:.0f} s", file=sys.stderr)
+    h_min_t, h_max_t = [], []
+    for vz in vzs:
+        lo_, hi_ = band(vz)
+        h_min_t.append(lo_)
+        h_max_t.append(hi_)
+        print(f"  |vz| {vz:5.1f} m/s: band {lo_:6.2f} .. {hi_:6.2f} m"
+              + ("   (NO BAND: best effort)" if hi_ <= 0 else ""), file=sys.stderr)
+    print(f"band table: {time.time() - t0:.0f} s", file=sys.stderr)
+
+    if args.table_json:
+        with open(args.table_json, "w", encoding="utf-8") as fh:
+            json.dump({"tbl.vz0": args.vz0, "tbl.dvz": args.dvz,
+                       "h_min": h_min_t, "h_max": h_max_t,
+                       "fin_cd_zero": (cfg.cd_burn - cfg.cd),
+                       "fin_cd_brake": (cd_free - cfg.cd),
+                       "vehicle": {"gross_mass": cfg.gross_mass, "propellant": m.propellant_mass,
+                                   "cd": cfg.cd, "thrust_mult": cfg.thrust_mult,
+                                   "diameter": cfg.diameter, "delay_pad": cfg.delay_pad}},
+                      fh, indent=1)
+        print("wrote", args.table_json, file=sys.stderr)
+        return
 
     root = os.path.abspath(args.root)
     out = []
@@ -116,9 +217,10 @@ def main():
     out.append("")
     out.append("// ---- airframe ----")
     out.append(f"#define DG_AREA           {f(cfg.area)}   // m^2")
-    out.append(f"#define DG_CD_BODY        {f(cfg.cd)}   // bare body, guidance drag credit")
-    out.append(f"#define DG_CD_BURN        {f(cfg.cd_burn)}   // body + fins at 0 deg (planner)")
-    out.append(f"#define DG_CD_FREE        {f(cd_free)}   // body + airbrake (free fall)")
+    out.append(f"#define DG_CD_BODY        {f(cfg.cd)}   // bare body (default of g.cd_body)")
+    out.append(f"#define DG_FIN_CD_ZERO    {f(cfg.cd_burn - cfg.cd)}   // fins at 0 deg, as body dCd")
+    out.append(f"#define DG_FIN_CD_BRAKE   {f(cd_free - cfg.cd)}   // fins splayed as airbrake, as body dCd")
+    out.append(f"#define DG_DIAMETER       {f(cfg.diameter)}   // m (default of g.diameter_m)")
     out.append(f"#define DG_IT_PER_KG      {f(cfg.mmoi_transverse / cfg.gross_mass)}   // transverse MMOI / mass")
     out.append(f"#define DG_IA_PER_KG      {f(cfg.mmoi_roll / cfg.gross_mass)}   // roll MMOI / mass")
     out.append(f"#define DG_L_GIMBAL       {f(cfg.l_gimbal)}   // CG -> nozzle pivot, m")
@@ -143,22 +245,38 @@ def main():
     out.append(f"#define DG_SCHED_TVC      {f(cfg.sched_tvc)}")
     out.append(f"#define DG_SCHED_FIN      {f(cfg.sched_fin)}")
     out.append("")
-    out.append("// ---- ignition altitude: h_cmd(apogee altitude, horizontal speed at apogee) ----")
-    out.append(f"#define DG_IGN_NH {len(hs)}")
-    out.append(f"#define DG_IGN_NV {len(vxs)}")
-    out.append(f"#define DG_IGN_H0 {f(hs[0])}")
-    out.append(f"#define DG_IGN_DH {f(args.h_step)}")
-    out.append(arr("DG_IGN_VX", vxs))
-    out.append(f"#define DG_IGN_DELAY_PAD  {f(cfg.delay_pad)}   // s, what the table pads for")
-    out.append(f"static const float DG_IGN_TABLE[{len(hs)}][{len(vxs)}] = {{")
-    for h0, row in zip(hs, table):
-        out.append("    { " + ", ".join(f(v) for v in row) + f" }},   // apogee {h0:.0f} m")
-    out.append("};")
+    out.append("// ---- default ignition band: [h_min, h_max] against |vz| at ignition ----")
+    out.append("// h_max = 0 marks a fall speed with no feasible band; h_min is then the")
+    out.append("// least-bad altitude. The flight copy is the tbl.* parameters.")
+    out.append(f"#define DG_IGN_N   {n_vz}")
+    out.append(f"#define DG_IGN_VZ0 {f(args.vz0)}")
+    out.append(f"#define DG_IGN_DVZ {f(args.dvz)}")
+    out.append(arr("DG_IGN_HMIN", h_min_t))
+    out.append(arr("DG_IGN_HMAX", h_max_t))
+    out.append(f"#define DG_IGN_DELAY_PAD  {f(cfg.delay_pad)}   // s, default igniter pad")
     out.append("")
     out.append("#endif // DAIDALOS_GUIDANCE_TABLES_H")
     path = os.path.join(root, "Ariadna_V2", "common", "guidance_tables.h")
     with open(path, "w") as fh:
         fh.write("\n".join(out) + "\n")
+    print("wrote", path, file=sys.stderr)
+
+    # ---------------- the same table as parameters ----------------
+    pt = ["// GENERATED by tools/gen_guidance_tables.py - the ignition band table as",
+          "// parameters (ids 96..163). Included by ariadna_params.h. DO NOT EDIT.",
+          "#ifndef ARIADNA_PARAMS_TBL_H", "#define ARIADNA_PARAMS_TBL_H",
+          "#define ARIADNA_PARAM_LIST_TBL(X) \\",
+          f"    X( 96, TBL_VZ0, \"tbl.vz0\", {f(args.vz0)}, 0.0f, 30.0f, \"m/s\", 'N') \\",
+          f"    X( 97, TBL_DVZ, \"tbl.dvz\", {f(args.dvz)}, 0.5f, 10.0f, \"m/s\", 'N') \\"]
+    for i, v in enumerate(h_min_t):
+        pt.append(f"    X({100 + i:3d}, TBL_HMIN_{i:02d}, \"tbl.hmin_{i:02d}\", {f(v)}, 0.0f, 300.0f, \"m\", 'N') \\")
+    for i, v in enumerate(h_max_t):
+        pt.append(f"    X({132 + i:3d}, TBL_HMAX_{i:02d}, \"tbl.hmax_{i:02d}\", {f(v)}, 0.0f, 300.0f, \"m\", 'N') \\")
+    pt[-1] = pt[-1][:-2]
+    pt += ["#endif", ""]
+    path = os.path.join(root, "Ariadna_V2", "common", "ariadna_params_tbl.h")
+    with open(path, "w") as fh:
+        fh.write("\n".join(pt))
     print("wrote", path, file=sys.stderr)
 
     # ---------------- golden vectors ----------------
@@ -242,9 +360,10 @@ def main():
         g.append("    { " + ", ".join(f(v) for v in c) + " },")
     g.append("};")
 
-    # a few ignition-table spot checks, off the grid points
+    # ignition altitude from an apogee state, exactly as find_ignition() solves it;
+    # guidance.cpp must reproduce it from the band table and its own fall
     spots = []
-    for (h0, vx) in ((150.0, 0.0), (170.0, 5.0), (120.0, 2.5)):
+    for (h0, vx) in ((150.0, 0.0), (170.0, 5.0), (120.0, 2.5), (100.0, 0.0), (185.0, 1.0)):
         spots.append((h0, vx, s.plan_ignition(cfg, h0, vx)))
     g.append("struct GoldIgn { float h0, vx, h_cmd; };")
     g.append(f"static const GoldIgn GOLD_IGN[{len(spots)}] = {{")

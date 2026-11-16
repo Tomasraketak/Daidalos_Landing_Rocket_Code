@@ -68,7 +68,7 @@ static void test_layout(void)
 
     check(sizeof(ariadna_nav_state_t)     == 88, "nav_state is 88 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
-    check(sizeof(ariadna_nav_status_t)    == 80, "nav_status is 80 bytes");
+    check(sizeof(ariadna_nav_status_t)    == 92, "nav_status is 92 bytes");
     check(sizeof(ariadna_pos_status_t)    == 96, "pos_status is 96 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");

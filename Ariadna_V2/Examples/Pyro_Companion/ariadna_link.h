@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   300   // 3.00: LandSim_Light guidance, fins, sequencer
+#define ARIADNA_FW_VERSION   310   // 3.10: in-flight ignition search, lidar on the leg, flash params
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -334,7 +334,10 @@ typedef struct {
                           // axis 1; positive pushes the fin along b x r_i.
     uint8_t  flags;       // ARIADNA_ACT_* bits
     uint8_t  phase;       // dg_phase_t, mirrored for the Master's LED/buzzer
-    uint8_t  _pad[2];
+    uint8_t  events;      // ARIADNA_EV_* (ariadna_seq.h), at 200 Hz: the Master
+                          // forwards it to the Position MCU, whose lidar sits on
+                          // a landing leg and may only be believed after it opens
+    uint8_t  _pad;
 } ariadna_actuator_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_actuator_t) == 36, "actuator layout changed");
 
@@ -378,8 +381,11 @@ typedef struct {
     uint8_t  pyro_active;  // channels with current flowing right now
     uint8_t  params_seen;  // how many distinct parameters have arrived
     uint8_t  _pad;
+    float    drag_scale;   // measured / modelled free-fall drag, 1 = as modelled
+    float    band_lo;      // m, where this fall enters the ignition band
+    float    band_hi;      // m, where it leaves it (0 = no feasible band)
 } ariadna_nav_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 80, "nav_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 92, "nav_status layout changed");
 
 // --- ariadna_pos_status_t.sensor_ok ----------------------------------
 #define ARIADNA_SENS_IMU       (1u << 0)
@@ -389,6 +395,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 80, "nav_status layout cha
 #define ARIADNA_SENS_UWB       (1u << 4)
 #define ARIADNA_SENS_LIDAR     (1u << 5)   // TF Luna answering on I2C
 #define ARIADNA_SENS_INS       (1u << 6)   // INSLIB filter running
+#define ARIADNA_SENS_LIDAR_GATE (1u << 7)  // legs open long enough: the lidar may be fused
 
 /**
  * Position MCU housekeeping and telemetry, 20 Hz.
@@ -469,7 +476,8 @@ typedef struct {
     uint16_t current_ma;
     uint8_t  state;        // ariadna_state_t
     uint8_t  flags;        // ARIADNA_MST_* bits
-    uint8_t  _pad[2];
+    uint8_t  nav_events;   // ARIADNA_EV_* from the Navigation MCU (legs open -> lidar)
+    uint8_t  _pad;
 } ariadna_master_state_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_master_state_t) == 16, "master_state layout changed");
 

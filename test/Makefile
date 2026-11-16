@@ -138,10 +138,14 @@ SYNC_PAIRS = \
   $(GUIDANCE_SRC)/guidance_tables.h:$(NAV_DIR)/guidance_tables.h \
   $(GUIDANCE_SRC)/guidance_tables.h:$(V2)/Master_MCU/guidance_tables.h \
   $(V2)/common/ariadna_params.h:$(NAV_DIR)/ariadna_params.h \
+  $(V2)/common/ariadna_params_tbl.h:$(NAV_DIR)/ariadna_params_tbl.h \
+  $(V2)/common/ariadna_params_tbl.h:$(V2)/Master_MCU/ariadna_params_tbl.h \
+  $(V2)/common/ariadna_params_tbl.h:$(V2)/Position_MCU/ariadna_params_tbl.h \
   $(V2)/common/ariadna_params.h:$(V2)/Master_MCU/ariadna_params.h \
   $(V2)/common/ariadna_params.h:$(V2)/Position_MCU/ariadna_params.h \
   $(V2)/common/ariadna_seq.h:$(NAV_DIR)/ariadna_seq.h \
   $(V2)/common/ariadna_seq.h:$(V2)/Master_MCU/ariadna_seq.h \
+  $(V2)/common/ariadna_seq.h:$(V2)/Position_MCU/ariadna_seq.h \
   $(V2)/common/actcon_pyro.h:$(NAV_DIR)/actcon_pyro.h \
   $(V2)/common/actcon_pyro.h:$(V2)/Master_MCU/actcon_pyro.h \
   $(V2)/common/ariadna_link.h:$(V2)/Master_MCU/ariadna_link.h \

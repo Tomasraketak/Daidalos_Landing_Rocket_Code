@@ -325,9 +325,11 @@ static const GoldTerm GOLD_TERM[12] = {
     { 0.2f, -1.0f, 2.6f, 60.0f, 1.0f, 0.3224037636733552f },
 };
 struct GoldIgn { float h0, vx, h_cmd; };
-static const GoldIgn GOLD_IGN[3] = {
+static const GoldIgn GOLD_IGN[5] = {
     { 150.0f, 0.0f, 55.41015625f },
     { 170.0f, 5.0f, 57.37516983695652f },
     { 120.0f, 2.5f, 50.18452328209818f },
+    { 100.0f, 0.0f, 44.52427878050847f },
+    { 185.0f, 1.0f, 58.34578804347827f },
 };
 #endif

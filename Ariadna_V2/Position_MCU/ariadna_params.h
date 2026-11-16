@@ -7,8 +7,11 @@
 //  by the three flight boards and listed to the diagnostic GUI.
 //
 //  HOW IT MOVES
-//    * The MASTER owns the table. It loads it from its EEPROM at boot
-//      (defaults if the stored copy fails its CRC or its layout version).
+//    * The MASTER owns the table. It keeps it in sectors 0 and 1 of its
+//      W25Q128 flash (two copies, newest valid one wins) and loads it at boot
+//      - defaults if neither copy passes its CRC and layout version. The
+//      RP2350 has no EEPROM: arduino-pico's EEPROM.h emulates one in the
+//      program flash, and writing that stalls BOTH cores.
 //    * The diagnostic GUI edits it over USB: PARAM SET / SAVE / DEFAULTS.
 //      Edits are accepted only on the ground (IDLE or TEST).
 //    * The Master streams the whole table, one ARIADNA_PKT_PARAM at a
@@ -24,16 +27,22 @@
 //  defaults here are the guidance module's own, and that the ranges hold.
 //
 //  ADDING A PARAMETER: append a line with the next free id. Never reuse or
-//  renumber an id - the EEPROM image and the GUI's saved profiles are keyed
+//  renumber an id - the flash image and the GUI's saved profiles are keyed
 //  on them. Bump ARIADNA_PARAM_LAYOUT only if a default must be forced.
+//
+//  Ids 96..163 are the IGNITION BAND TABLE (tbl.*), generated from
+//  LandSim_Light into ariadna_params_tbl.h. The diagnostic GUI recomputes it
+//  for the vehicle you enter and uploads it like any other parameter.
 // =====================================================================
 #ifndef ARIADNA_PARAMS_H
 #define ARIADNA_PARAMS_H
 
+#include "ariadna_params_tbl.h"
+
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   1     // stored with the EEPROM image
+#define ARIADNA_PARAM_LAYOUT   2     // stored with the flash image
 
 // X(id, NAME, key, default, min, max, unit, owner)
 //   owner: 'N' Navigation MCU, 'M' Master, 'P' Position MCU
@@ -91,6 +100,12 @@
     X(41, G_FIN_ASCENT,     "fin.ascent_mode",    2.0f,  0.0f,  2.0f, "0/1/2", 'N') \
     X(42, G_FIN_ADAPT,      "fin.adapt",          1.0f,  0.0f,  1.0f, "0/1",  'N') \
     X(43, G_FIN_GAIN0,      "fin.gain0",          1.0f,  0.4f,  2.0f, "-",    'N') \
+    /* ---- guidance: the vehicle as the ignition search sees it ---- */ \
+    X(44, G_CD_BODY,        "g.cd_body",          0.35f, 0.1f,  1.5f, "-",    'N') \
+    X(45, G_THRUST_SCALE,   "g.thrust_scale",     1.0f,  0.5f,  2.0f, "-",    'N') \
+    X(46, G_IGN_DELAY_PAD,  "g.ign_delay_pad_s",  0.40f, 0.0f,  1.5f, "s",    'N') \
+    X(47, G_DRAG_ADAPT,     "g.drag_adapt",       1.0f,  0.0f,  1.0f, "0/1",  'N') \
+    X(48, G_DIAMETER,       "g.diameter_m",       0.105f, 0.03f, 0.3f, "m",   'N') \
     /* ---- servo calibration (Master) ---- */ \
     X(50, SRV_TVC_TRIM_X,   "srv.tvc_x_trim_us", 1500.0f, 900.0f, 2100.0f, "us", 'M') \
     X(51, SRV_TVC_TRIM_Y,   "srv.tvc_y_trim_us", 1500.0f, 900.0f, 2100.0f, "us", 'M') \
@@ -119,14 +134,18 @@
     X(82, POS_LIDAR_OFFSET, "pos.lidar_offset_m", 0.0f, -2.0f,   2.0f, "m",   'P') \
     X(83, POS_LIDAR_MAX,    "pos.lidar_max_m",    7.5f,  1.0f,  12.0f, "m",   'P') \
     X(84, POS_ATT_FREEZE,   "pos.att_gyro_only",  1.0f,  0.0f,   1.0f, "0/1", 'P') \
-    X(85, POS_UWB_EN,       "pos.uwb_enable",     1.0f,  0.0f,   1.0f, "0/1", 'P')
+    X(85, POS_UWB_EN,       "pos.uwb_enable",     1.0f,  0.0f,   1.0f, "0/1", 'P') \
+    X(86, POS_LIDAR_DELAY,  "pos.lidar_delay_ms", 500.0f, 0.0f, 3000.0f, "ms", 'P') \
+    X(87, POS_LIDAR_TILT_X, "pos.lidar_tilt_x_deg", 0.0f, -20.0f, 20.0f, "deg", 'P') \
+    X(88, POS_LIDAR_TILT_Y, "pos.lidar_tilt_y_deg", 0.0f, -20.0f, 20.0f, "deg", 'P') \
+    ARIADNA_PARAM_LIST_TBL(X)
 
 // ---- ids --------------------------------------------------------------
 enum {
 #define X(id, NAME, key, def, lo, hi, unit, owner) ARIADNA_P_##NAME = id,
     ARIADNA_PARAM_LIST(X)
 #undef X
-    ARIADNA_PARAM_ID_MAX = 86          // ids are 0 .. ARIADNA_PARAM_ID_MAX-1
+    ARIADNA_PARAM_ID_MAX = 164         // ids are 0 .. ARIADNA_PARAM_ID_MAX-1
 };
 
 typedef struct {

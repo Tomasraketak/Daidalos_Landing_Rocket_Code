@@ -96,6 +96,7 @@
 #include "ariadna_uwb.h"
 #include "ariadna_uwb_link.h"
 #include "ariadna_params.h"
+#include "ariadna_seq.h"          // ARIADNA_EV_LEGS: the lidar is on a leg
 // Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
 // library's include path only when it sees a real #include of it, so the
 // header's __has_include probe on its own always reads "absent" and the
@@ -823,6 +824,10 @@ private:
 };
 
 static LidarTFLuna s_lidar;
+// The TF-Luna's range is 0.2..8 m; a reading this close to the top is the
+// sensor saturating on "no ground in range", not a measurement.
+static const float LIDAR_CEILING_M = 7.8f;
+static bool        s_lidar_leg_out = false;   // for the status packet
 static UwbTag      s_uwb;
 
 // The solver's limits, filled in at setup(). Held at file scope so the
@@ -3282,24 +3287,54 @@ void loop()
 
     // ---- lidar ------------------------------------------------------------
     //
-    // Polled at 50 Hz on the way down and at 5 Hz otherwise (so the pad
-    // crew can see it is alive). FUSED only when all of these hold:
-    //   * the Master says the vehicle is descending - on the pad the nose,
-    //     and the lidar with it, points at the sky;
-    //   * the thrust axis is within 20 degrees of vertical, so the beam is
-    //     on the ground below and not on the horizon;
-    //   * the range is inside what the sensor is good for.
+    // The TF-Luna sits on a FOLD-OUT LANDING LEG. Until the leg is open it
+    // looks at the inside of the airframe or along it, and what it reads
+    // means nothing. So the lidar is FUSED only when all of these hold:
+    //
+    //   * the Navigation MCU has fired the leg release (ARIADNA_EV_LEGS,
+    //     forwarded by the Master the instant it happens) at least
+    //     pos.lidar_delay_ms ago (500 ms): the leg has swung out and settled;
+    //   * the reading is not at the sensor's maximum: a TF-Luna that sees
+    //     nothing reports its ceiling, which is "no ground", not "8 m";
+    //   * the range is inside pos.lidar_max_m and the return strong enough;
+    //   * the beam is within 25 deg of vertical, so it hits the ground below.
+    //
+    // Height = range * cos(beam angle) + pos.lidar_offset_m. The beam angle
+    // is the vehicle's attitude AND the mounting error of the leg, which the
+    // diagnostic GUI sets in two axes (pos.lidar_tilt_x_deg / _y_deg): the
+    // beam is body +Z (toward the nose, i.e. down in the descent) tilted by
+    // tilt_x about body X, then by tilt_y about body Y.
+    //
+    // It is polled at 5 Hz before that (so the pad crew can see it alive)
+    // and at 50 Hz once the leg is out.
     {
         static uint32_t next_lidar_ms = 0;
-        const bool descending = s_have_master &&
-                                (s_master.state == ARIADNA_STATE_DESCENT ||
-                                 s_master.state == ARIADNA_STATE_GUIDANCE);
+        static uint32_t legs_ms = 0;
+        if (s_have_master && (s_master.nav_events & ARIADNA_EV_LEGS) && legs_ms == 0)
+            legs_ms = now_ms ? now_ms : 1;
+        if (s_have_master && s_master.state <= ARIADNA_STATE_ARMED) legs_ms = 0;   // next flight
+        const bool leg_out = legs_ms != 0 &&
+                             (uint32_t)(now_ms - legs_ms) >= (uint32_t)PRM(POS_LIDAR_DELAY);
+
         if (PRM(POS_LIDAR_EN) > 0.5f && (int32_t)(now_ms - next_lidar_ms) >= 0) {
-            next_lidar_ms = now_ms + (descending ? 20 : 200);
-            if (s_lidar.poll(now_ms) && descending && u[2] > 0.94f &&
-                s_lidar.fix().range_m <= PRM(POS_LIDAR_MAX))
-                s_est.fuse_range(s_lidar.fix(), u[2], PRM(POS_LIDAR_OFFSET), now_ms);
+            next_lidar_ms = now_ms + (legs_ms ? 20 : 200);
+            if (s_lidar.poll(now_ms) && leg_out) {
+                const float tx = PRM(POS_LIDAR_TILT_X) * (float)DEG_TO_RAD;
+                const float ty = PRM(POS_LIDAR_TILT_Y) * (float)DEG_TO_RAD;
+                const float beam[3] = { sinf(ty) * cosf(tx), -sinf(tx), cosf(ty) * cosf(tx) };
+                float d[3];
+                rotate(s_att.R, beam, d);
+                const float cos_beam = -d[2];              // component pointing DOWN
+                const RangeFix &f = s_lidar.fix();
+                const bool not_maxed = s_lidar.range_m() < LIDAR_CEILING_M;
+                if (f.valid && not_maxed && cos_beam > 0.906f &&
+                    f.range_m <= PRM(POS_LIDAR_MAX))
+                    s_est.fuse_range(f, cos_beam, PRM(POS_LIDAR_OFFSET), now_ms);
+            }
         }
+        s_lidar_leg_out = leg_out;
+        if (leg_out) s_sensor_ok |= ARIADNA_SENS_LIDAR_GATE;
+        else         s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR_GATE;
         if (s_lidar.healthy()) s_sensor_ok |= ARIADNA_SENS_LIDAR;
         else                   s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR;
     }

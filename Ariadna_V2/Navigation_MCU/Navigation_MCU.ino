@@ -237,6 +237,18 @@ static void params_apply(void)
     g.fin_ascent_mode = v[ARIADNA_P_G_FIN_ASCENT];
     g.fin_adapt      = v[ARIADNA_P_G_FIN_ADAPT];
     g.fin_gain0      = v[ARIADNA_P_G_FIN_GAIN0];
+    g.cd_body        = v[ARIADNA_P_G_CD_BODY];
+    g.thrust_scale   = v[ARIADNA_P_G_THRUST_SCALE];
+    g.ign_delay_pad  = v[ARIADNA_P_G_IGN_DELAY_PAD];
+    g.drag_adapt     = v[ARIADNA_P_G_DRAG_ADAPT];
+    g.diameter       = v[ARIADNA_P_G_DIAMETER];
+    // the ignition band table, as the diagnostic GUI computed it with LandSim
+    g.tbl_vz0        = v[ARIADNA_P_TBL_VZ0];
+    g.tbl_dvz        = v[ARIADNA_P_TBL_DVZ];
+    for (int i = 0; i < DG_IGN_N; i++) {
+        g.tbl_hmin[i] = v[ARIADNA_P_TBL_HMIN_00 + i];
+        g.tbl_hmax[i] = v[ARIADNA_P_TBL_HMAX_00 + i];
+    }
     dg_set_params(&g);
 
     s_seq_cfg.cover_lead_s = v[ARIADNA_P_SEQ_COVER_LEAD];
@@ -637,13 +649,22 @@ static bool self_test(void)
         ok = false;
     }
 
-    // Ignition table: inside the envelope, and never above the apogee.
+    // Ignition search: inside the envelope, never above the apogee, and a
+    // band table that is a band (h_min below h_max wherever there is one).
     for (float h0 = 100.0f; h0 <= 220.0f; h0 += 40.0f) {
-        float hc = dg_h_cmd_lookup(h0, 0.0f);
-        if (!(hc > 20.0f && hc < h0 - 10.0f)) {
+        float hc = dg_ign_compute(h0, 0.0f, 0.0f, 1.0f, nullptr, nullptr, nullptr, nullptr);
+        if (!(hc > 15.0f && hc < h0 - 0.9f)) {
             NAV_PRINT("POST h_cmd(%.0f)=%.1f\n", h0, hc);
             ok = false;
         }
+    }
+    {
+        const dg_params_t *gp = dg_get_params();
+        for (int i = 0; i < DG_IGN_N; i++)
+            if (gp->tbl_hmax[i] > 0.0f && gp->tbl_hmax[i] < gp->tbl_hmin[i]) {
+                NAV_PRINT("POST ignition band %d inverted\n", i);
+                ok = false;
+            }
     }
 
     // The clamp plan from a typical ignition state must be solvable and
@@ -836,6 +857,7 @@ void loop()
             act.flags |= ARIADNA_ACT_TVC_PARK;
         }
         if (s_seq.cover_open) act.flags |= ARIADNA_ACT_COVER_OPEN;
+        act.events = s_seq.events;
         if (s_fired_mask & 0x03) act.flags |= ARIADNA_ACT_IGNITE;
 
         link_send(ARIADNA_PKT_ACTUATOR, &act, sizeof(act));
@@ -873,6 +895,9 @@ void loop()
         st.events      = s_seq.events;
         st.pyro_active = s_out_mask;
         st.params_seen = s_params_seen_n;
+        st.drag_scale  = s_dg_out.drag_scale;
+        st.band_lo     = s_dg_out.h_band_lo;
+        st.band_hi     = s_dg_out.h_band_hi;
         st.flags       = (uint8_t)((permit       ? ARIADNA_NST_ARMED      : 0) |
                                    (s_post_pass  ? ARIADNA_NST_POST_PASS  : 0) |
                                    (state_fresh  ? ARIADNA_NST_LINK_OK    : 0) |

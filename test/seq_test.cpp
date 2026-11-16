@@ -216,8 +216,18 @@ static void test_params()
         { ARIADNA_P_G_FIN_CTRL_LEAD, d.fin_ctrl_lead, "fin_ctrl_lead" },
         { ARIADNA_P_G_FIN_ASCENT, d.fin_ascent_mode, "fin_ascent" },
         { ARIADNA_P_G_FIN_ADAPT, d.fin_adapt, "fin_adapt" }, { ARIADNA_P_G_FIN_GAIN0, d.fin_gain0, "fin_gain0" },
+        { ARIADNA_P_G_CD_BODY, d.cd_body, "cd_body" }, { ARIADNA_P_G_THRUST_SCALE, d.thrust_scale, "thrust_scale" },
+        { ARIADNA_P_G_IGN_DELAY_PAD, d.ign_delay_pad, "ign_delay_pad" },
+        { ARIADNA_P_G_DRAG_ADAPT, d.drag_adapt, "drag_adapt" }, { ARIADNA_P_G_DIAMETER, d.diameter, "diameter" },
+        { ARIADNA_P_TBL_VZ0, d.tbl_vz0, "tbl_vz0" }, { ARIADNA_P_TBL_DVZ, d.tbl_dvz, "tbl_dvz" },
     };
-    for (const auto &m : map) {
+    for (int i = 0; i < DG_IGN_N; i++) {
+        CHECK(std::fabs(p.v[ARIADNA_P_TBL_HMIN_00 + i] - d.tbl_hmin[i]) < 1e-4f, "tbl.hmin default = guidance table");
+        CHECK(std::fabs(p.v[ARIADNA_P_TBL_HMAX_00 + i] - d.tbl_hmax[i]) < 1e-4f, "tbl.hmax default = guidance table");
+    }
+    CHECK(ARIADNA_PARAM_COUNT < 255, "parameter count fits the packet");
+    CHECK(p.v[ARIADNA_P_POS_LIDAR_DELAY] == 500.0f, "lidar waits 500 ms after the legs");
+        for (const auto &m : map) {
         bool ok = std::fabs(p.v[m.id] - m.v) <= 1e-4f * (1.0f + std::fabs(m.v));
         if (!ok) std::printf("  %s: table %g, guidance %g\n", m.n, (double)p.v[m.id], (double)m.v);
         CHECK(ok, "parameter default equals the guidance module's");
@@ -237,7 +247,8 @@ static void test_params()
     CHECK(ariadna_param_set(&p, ARIADNA_P_SEQ_LEGS_PULSE, 0.1f) && p.v[ARIADNA_P_SEQ_LEGS_PULSE] == 0.5f,
           "set clamps to the minimum");
     CHECK(!ariadna_param_set(&p, ARIADNA_P_G_WN_TVC, NAN), "NaN refused");
-    CHECK(!ariadna_param_set(&p, 45, 1.0f), "unknown id refused");
+    CHECK(!ariadna_param_set(&p, 92, 1.0f), "unknown id refused");
+    CHECK(!ariadna_param_set(&p, 250, 1.0f), "id past the table refused");
 
     // the CRC sees a single changed value
     ariadna_params_t a, b;

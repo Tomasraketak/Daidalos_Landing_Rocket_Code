@@ -111,13 +111,34 @@ static void test_golden()
         CHECK(near(dg_terminal_throttle(c.h, c.vz, c.mass, c.thrust), c.k, 1e-4),
               "terminal throttle h=%g vz=%g", (double)c.h, (double)c.vz);
     }
-    for (const auto &c : GOLD_IGN)
-        CHECK(near(dg_h_cmd_lookup(c.h0, c.vx), c.h_cmd, 0.02), "h_cmd(%g,%g)=%g want %g",
-              (double)c.h0, (double)c.vx, (double)dg_h_cmd_lookup(c.h0, c.vx), (double)c.h_cmd);
-    // the table is clamped, never extrapolated
-    CHECK(near(dg_h_cmd_lookup(10.0f, 0.0f), dg_h_cmd_lookup(DG_IGN_H0, 0.0f), 1e-4), "low clamp");
-    CHECK(near(dg_h_cmd_lookup(900.0f, 50.0f),
-               dg_h_cmd_lookup(DG_IGN_H0 + DG_IGN_DH * (DG_IGN_NH - 1), 10.0f), 1e-4), "high clamp");
+    // The ignition altitude: the band from the table, the fall propagated
+    // here - against the simulation's own find_ignition() from the apogee.
+    double worst_ign = 0;
+    for (const auto &c : GOLD_IGN) {
+        float h = dg_ign_compute(c.h0, 0.0f, c.vx, 1.0f, nullptr, nullptr, nullptr, nullptr);
+        double e = std::fabs(h - c.h_cmd);
+        if (e > worst_ign) worst_ign = e;
+        CHECK(e < 1.0, "h_cmd(%g,%g)=%g want %g", (double)c.h0, (double)c.vx, (double)h, (double)c.h_cmd);
+    }
+    std::printf("  ignition altitude vs find_ignition(): %zu cases, worst %.2f m\n",
+                sizeof(GOLD_IGN) / sizeof(GOLD_IGN[0]), worst_ign);
+    // a fall started lower down along the same trajectory gives the same answer:
+    // the search depends on the fall, not on where it was started from
+    {
+        float t_to, vz_at;
+        float h1 = dg_ign_compute(150.0f, 0.0f, 0.0f, 1.0f, &t_to, &vz_at, nullptr, nullptr);
+        // propagate the same fall 3 s by hand, then search again
+        float h = 150.0f, vz = 0.0f;
+        const float kd = 0.5f * 1.225f * DG_AREA * (DG_CD_BODY + DG_FIN_CD_BRAKE) / DG_M_GROSS;
+        for (int i = 0; i < 600; i++) { float a = -9.80665f + kd * vz * vz; vz += a * 0.005f; h += vz * 0.005f; }
+        float h2 = dg_ign_compute(h, vz, 0.0f, 1.0f, nullptr, nullptr, nullptr, nullptr);
+        CHECK(std::fabs(h1 - h2) < 0.3, "ignition search not path-consistent: %g vs %g", (double)h1, (double)h2);
+        CHECK(t_to > 2.0f && vz_at < -20.0f, "t_to %g vz_at %g", (double)t_to, (double)vz_at);
+        // more drag -> slower at the band -> a LOWER ignition altitude
+        float h3 = dg_ign_compute(150.0f, 0.0f, 0.0f, 1.4f, nullptr, nullptr, nullptr, nullptr);
+        // (often capped by the band's upper edge, so it may barely move - but never up)
+        CHECK(h3 <= h1 + 0.05f, "more drag must not raise the ignition altitude: %g vs %g", (double)h3, (double)h1);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -199,10 +220,12 @@ struct Plant {
     double misalign = 0.0;           // rad, thrust line offset toward u1
     bool   igniter_fails = false;
     bool   accel_dead = false;       // the axial accelerometer reads its baseline forever
+    double drag_mult = 1.0;          // real drag / modelled (body and fins)
+    double h0_drop = 0.0;            // >0: released at this altitude instead of apogee knowledge
     // results
     double td_vz = 0, td_vh = 0, td_tilt = 0, td_rate = 0, td_t = 0;
     double max_roll = 0, max_tilt_ff = 0, h_ign = 0, t_onset = -1, vh_at_ign = 0;
-    double kappa_end = 0, trim_end[3] = { 0, 0, 0 };
+    double kappa_end = 0, trim_end[3] = { 0, 0, 0 }, drag_scale_end = 0;
     bool   landed = false;
     double t_cover = -1, t_legs = -1, t_cmd = -1, t_td_pred_at_legs = 0;
 };
@@ -324,7 +347,7 @@ static void fly(Plant &p, const dg_params_t *params)
             double cdamp = 0.5 * RHO * vr * area * cna * lcp * lcp;
             double wr = dot(w, b);
             for (int i = 0; i < 3; i++) {
-                F[i] += q * area * cd * ca * b[i] + fnk * (ah[i] - ca * b[i]);
+                F[i] += q * area * cd * p.drag_mult * ca * b[i] + fnk * (ah[i] - ca * b[i]);
                 T[i] += lcp * fnk * c[i] - cdamp * (w[i] - wr * b[i]);
             }
             // viscous crossflow on the body, at the CG
@@ -351,7 +374,7 @@ static void fly(Plant &p, const dg_params_t *params)
             else cl = (alpha > 0 ? 1 : -1) * fin_cla * stall * std::exp(-(std::fabs(alpha) - stall) * 1.5);
             double cdf = 0.048 + 0.45 * cl * cl;
             double lift = 0.5 * RHO * l2 * fin_area * cl * fin_kint * p.fin_kappa;
-            double drag = 0.5 * RHO * l2 * fin_area * cdf;
+            double drag = 0.5 * RHO * l2 * fin_area * cdf * p.drag_mult;
             double ln = dot(l, n) / l2, pr[3];
             for (int k = 0; k < 3; k++) pr[k] = n[k] - ln * l[k];
             double pn = std::sqrt(dot(pr, pr));
@@ -413,6 +436,7 @@ static void fly(Plant &p, const dg_params_t *params)
         }
     }
     p.kappa_end = out.fin_gain;
+    p.drag_scale_end = out.drag_scale;
     for (int i = 0; i < 3; i++) p.trim_end[i] = out.fin_trim[i];
     (void)P;
 }
@@ -420,8 +444,9 @@ static void fly(Plant &p, const dg_params_t *params)
 static void report(const char *name, const Plant &p)
 {
     std::printf("  %-34s ign %5.1f m  td vz %6.2f vh %5.2f tilt %4.1f rate %5.1f  roll<=%4.0f dps"
-                "  kappa %.2f\n", name, p.h_ign, p.td_vz, p.td_vh, p.td_tilt, p.td_rate,
-                p.max_roll * 180 / M_PI, p.kappa_end);
+                "  kappa %.2f  drag %.2f\n", name, p.h_ign, p.td_vz, p.td_vh, p.td_tilt, p.td_rate,
+                p.max_roll * 180 / M_PI, p.kappa_end, p.drag_scale_end);
+    std::printf("      legs %.2f s before touchdown, cover %.2f s before the command\n", p.t_legs > 0 ? p.td_t - p.t_legs : -1.0, p.t_cover > 0 ? p.t_cmd - p.t_cover : -1.0);
 }
 
 static void test_closed_loop()
@@ -442,8 +467,12 @@ static void test_closed_loop()
         // the sequencer's countdowns: cover 0.6 s before the command, legs 1.7 s before touchdown
         CHECK(p.t_cover > 0 && near(p.t_cmd - p.t_cover, 0.6, 0.08), "cover lead %g s",
               p.t_cmd - p.t_cover);
-        CHECK(p.t_legs > 0 && near(p.td_t - p.t_legs, 1.7, 0.35), "legs lead %g s (predicted %g)",
-              p.td_t - p.t_legs, p.t_td_pred_at_legs);
+        // The touchdown is a PREDICTION of a 2.5 s burn on a motor known to
+        // +-15 %: over the whole envelope it lands within 1.5..2.3 s of the
+        // 1.7 s asked for, and almost always early - legs out before the
+        // ground, never after it.
+        CHECK(p.t_legs > 0 && p.td_t - p.t_legs > 1.45 && p.td_t - p.t_legs < 2.3,
+              "legs lead %g s (predicted %g)", p.td_t - p.t_legs, p.t_td_pred_at_legs);
     }
     // ---- the entry envelope, igniter spread, thrust scatter, roll ----
     struct Case { const char *name; double h0, vx, vy, delay, ts, roll; };
@@ -468,6 +497,10 @@ static void test_closed_loop()
         CHECK(p.td_tilt < 5.0, "%s: tilt %g", c.name, p.td_tilt);
         CHECK(p.td_rate < 30.0, "%s: rate %g", c.name, p.td_rate);
         CHECK(p.max_roll < 2.5, "%s: roll rate peaked at %g deg/s", c.name, p.max_roll * 180 / M_PI);
+        CHECK(p.t_legs > 0 && p.td_t - p.t_legs > 1.45 && p.td_t - p.t_legs < 2.3,
+              "%s: legs %g s before touchdown", c.name, p.td_t - p.t_legs);
+        CHECK(p.t_cover > 0 && near(p.t_cmd - p.t_cover, 0.6, 0.08), "%s: cover lead %g s",
+              c.name, p.t_cmd - p.t_cover);
     }
     // ---- altitude bias, corrected by the lidar at 7 m ----
     for (double bias : { +1.0, -1.0 }) {
@@ -532,6 +565,29 @@ static void test_closed_loop()
         CHECK(p.landed && p.td_vz > -4.5 && p.td_tilt < 5.0, "strong fins: vz %g tilt %g", p.td_vz, p.td_tilt);
         CHECK(p.kappa_end > 1.1, "strong fins: kappa estimate %g did not go up", p.kappa_end);
     }
+    // ---- the drag is not what the model says: measured and used ----
+    for (double dm : { 0.7, 1.4 }) {
+        Plant p;
+        p.drag_mult = dm;
+        fly(p, nullptr);
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "drag x%.1f (measured in flight)", dm);
+        report(nm, p);
+        CHECK(p.landed && p.td_vz > -4.5 && p.td_tilt < 5.0, "%s: vz %g tilt %g", nm, p.td_vz, p.td_tilt);
+        CHECK((dm > 1 && p.drag_scale_end > 1.1) || (dm < 1 && p.drag_scale_end < 0.9),
+              "%s: drag estimate %g did not move", nm, p.drag_scale_end);
+    }
+    // ---- higher apogees than the old table covered ----
+    for (double h0 : { 200.0, 220.0 }) {
+        Plant p;
+        p.h0 = h0;
+        fly(p, nullptr);
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "apogee %.0f m", h0);
+        report(nm, p);
+        CHECK(p.landed, "%s: did not land", nm);
+    }
+
     // ---- no fins at all: the nozzle alone must still fly the burn ----
     {
         dg_params_t prm;
@@ -579,7 +635,8 @@ static void test_state_machine()
 
     // DESCENT above h_cmd: no ignition; countdown is sane and decreasing
     dg_begin_descent(150, 0);
-    CHECK(near(dg_h_ignite(), dg_h_cmd_lookup(150, 0), 1e-4), "h_cmd not from the table");
+    CHECK(near(dg_h_ignite(), dg_ign_compute(150, 0, 0, 1, nullptr, nullptr, nullptr, nullptr), 1e-4),
+          "h_cmd not from the ignition search");
     n.vz = -25; n.bz = 1; n.h = 90;
     dg_step_control(&n, &o);
     float t1 = o.t_to_ignition;
@@ -627,7 +684,8 @@ static void test_state_machine()
     prm.h_ign_bias = 3.0f;
     dg_set_params(&prm);
     dg_begin_descent(150, 0);
-    CHECK(near(dg_h_ignite(), dg_h_cmd_lookup(150, 0) + 3.0, 1e-3), "h_ign_bias");
+    CHECK(near(dg_h_ignite(), dg_ign_compute(150, 0, 0, 1, nullptr, nullptr, nullptr, nullptr) + 3.0, 1e-3),
+          "h_ign_bias");
     dg_init();
     prm.h_ign_override = 42.0f;
     dg_set_params(&prm);
