@@ -199,6 +199,8 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(INO)
 	$(CXX) $(CXXFLAGS) -Istub -I$(NAV_DIR) \
 	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
+	$(CXX) $(CXXFLAGS) -DARDUINO=100 -Ifull_stub -I$(V2)/Master_MCU \
+	    -x c++ -fsyntax-only $(V2)/Master_MCU/Master_MCU.ino
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Actuator_Console \
 	    -x c++ -fsyntax-only $(EX_DIR)/Actuator_Console/Actuator_Console.ino
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Pyro_Companion \

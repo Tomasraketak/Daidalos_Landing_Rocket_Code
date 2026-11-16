@@ -13,6 +13,11 @@
 //    * runs the LoRa downlink to the ground station
 //    * owns arming, the RBF interlock, and the buzzer and RGB annunciators
 //
+//    * holds the PARAMETER TABLE (EEPROM) and streams it to the other two
+//      boards while the vehicle is on the ground
+//    * talks to the diagnostic GUI over USB — only while a host has the
+//      port open, and never by waiting for it (section 13)
+//
 //  It contains NO guidance mathematics. It does not decide when to ignite,
 //  where to point the nozzle, or how much thrust to keep — that is the
 //  Navigation MCU's job, and this board's only opinion about it is whether
@@ -63,12 +68,16 @@
 // is to read it from the same file. `cd ../../test && make sync` keeps
 // this copy identical to the verified original.
 #include "guidance.h"
+#include "ariadna_params.h"
+#include "ariadna_seq.h"        // ARIADNA_EV_* event bits, for the downlink
+#include "actcon_pyro.h"        // bench pyro bridge, TEST mode only
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
 
 // The shared annunciator engine. ARIADNA_RGB_PIN must be set BEFORE the
 // include: the header instantiates the pixel object at that pin, and the
@@ -77,6 +86,9 @@
 #include "ariadna_rgb.h" 
 
 #include <string.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 
 // =====================================================================
@@ -181,12 +193,13 @@ enum {
     CH_TVC_X   = 0,
     CH_TVC_Y   = 1,
     CH_CLAMP   = 2,
-    CH_FIN_0   = 3,     // FUTURE
-    CH_FIN_1   = 4,
-    CH_FIN_2   = 5,
-    CH_FIN_3   = 6,
-    CH_SPARE   = 7,
-    PCA_N_USED = 8
+    CH_FIN_0   = 3,     // fin 1: on body axis 1 (the TVC X side)
+    CH_FIN_1   = 4,     // fin 2: 90 deg on, toward body axis 2
+    CH_FIN_2   = 5,     // fin 3: opposite fin 1
+    CH_FIN_3   = 6,     // fin 4: opposite fin 2
+    CH_COVER   = 7,     // aerocover latch
+    PCA_N_USED = 8,
+    PCA_N_CH   = 16
 };
 
 // ---- servo calibration ------------------------------------------------
@@ -198,19 +211,23 @@ enum {
 // vehicle toward pad +x / +y. Get either backwards and the attitude loop
 // becomes positive feedback and diverges in well under a second. Bench
 // test 3 in the README exists to catch exactly this.
-static const float TVC_TRIM_X_US   = 1500.0f;
-static const float TVC_TRIM_Y_US   = 1500.0f;
-static const float TVC_US_PER_DEG  = 10.0f;
-static const float TVC_SIGN_X      = +1.0f;
-static const float TVC_SIGN_Y      = +1.0f;
-
-// Thrust clamp: pulse widths at fully diverted and fully open. Calibrate
-// these against MEASURED thrust in a static fire, not by eye.
-static const float CLAMP_US_CLOSED = 1150.0f;
-static const float CLAMP_US_OPEN   = 1900.0f;
-
-static const float FIN_TRIM_US     = 1500.0f;
-static const float FIN_US_PER_DEG  = 10.0f;
+//
+// ALL OF THESE ARE PARAMETERS NOW (ariadna_params.h, group "srv."), set
+// from the diagnostic GUI and kept in EEPROM, because every one is a
+// property of how a horn was pressed onto a spline. The names below are
+// kept so the servo code reads as it always did.
+static ariadna_params_t s_params;
+#define PRM(NAME)        (s_params.v[ARIADNA_P_##NAME])
+#define TVC_TRIM_X_US    PRM(SRV_TVC_TRIM_X)
+#define TVC_TRIM_Y_US    PRM(SRV_TVC_TRIM_Y)
+#define TVC_US_PER_DEG   PRM(SRV_TVC_US_DEG)
+#define TVC_SIGN_X       PRM(SRV_TVC_SIGN_X)
+#define TVC_SIGN_Y       PRM(SRV_TVC_SIGN_Y)
+#define CLAMP_US_CLOSED  PRM(SRV_CLAMP_CLOSED)
+#define CLAMP_US_OPEN    PRM(SRV_CLAMP_OPEN)
+#define FIN_US_PER_DEG   PRM(SRV_FIN_US_DEG)
+#define FIN_TRIM_US(i)   (s_params.v[ARIADNA_P_SRV_FIN1_TRIM + (i)])
+#define FIN_SIGN(i)      (s_params.v[ARIADNA_P_SRV_FIN1_SIGN + (i)] < 0.0f ? -1.0f : 1.0f)
 
 // Absolute travel guard. A bad command must not stall a servo against its
 // end stop and burn out on the pad.
@@ -227,15 +244,21 @@ static const uint32_t LOG_HZ         = 50;
 static const uint32_t LINK_TIMEOUT_MS = 300;
 
 // ---- state machine ----------------------------------------------------
-// Handover to the Navigation MCU happens at the altitude it arms at. Read
-// from guidance.h so the two can never disagree.
-static const float GUIDANCE_ENTRY_M = DG_H_START;
+// GUIDANCE is entered when the Navigation MCU reports the ignition command.
+// If that board cannot be heard, the fallback altitude from guidance.h is
+// used instead, so the Position MCU still de-weights the barometer.
+static const float GUIDANCE_FALLBACK_M = DG_H_HANDOVER_FALLBACK;
 
+// Everything this board says on USB goes through usb_printf() (section 13):
+// a RAM ring drained only as fast as the host takes it, and only while a
+// host has the port open. Nothing here can make a control tick wait for a
+// laptop.
+static void usb_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #define MASTER_PRINT(...)                                         \
     do {                                                          \
         _Pragma("GCC diagnostic push")                            \
         _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")  \
-        Serial.printf(__VA_ARGS__);                               \
+        usb_printf(__VA_ARGS__);                                  \
         _Pragma("GCC diagnostic pop")                             \
     } while (0)
 
@@ -248,6 +271,19 @@ static const float GUIDANCE_ENTRY_M = DG_H_START;
 // in section 4. Declaring the type here is what lets log_push(const
 // LogRecord *) have a prototype at all.
 struct LogRecord;
+
+// Forward declarations. The Arduino IDE generates these by itself, but
+// `make syntax` compiles this file as plain C++ where it does not - and a
+// build that only works inside one IDE cannot be checked on a workstation.
+static void params_load(void);
+static void params_stream(void);
+static bool params_synced(void);
+static void usb_service(void);
+static void test_service(void);
+static void diag_emit(void);
+static void pyro_bridge_send(uint8_t cmd, uint8_t ch, uint16_t pulse_ms, uint8_t repeats);
+static inline bool pyro_rep_fresh(void);
+static inline bool nav_status_fresh(void);
 
 static ariadna_rx_t          s_rx_pos;
 static ariadna_rx_t          s_rx_nav;
@@ -287,6 +323,34 @@ static bool     s_post_pass   = false;
 static ariadna_rgb_t  s_rgb;
 static ariadna_buzzer_t s_buzz;
 
+// flash log write pointer (core 1 writes, the USB status only reads)
+static volatile uint32_t s_log_addr = 0;
+static uint32_t s_log_erased_to     = 0;   // everything below this is erased
+
+// aerocover latch: opened on the Navigation MCU's request, latched here
+static bool     s_cover_open  = false;
+
+// parameter sync
+static uint16_t s_param_crc   = 0;
+static bool     s_params_from_eeprom = false;
+
+// TEST mode: the diagnostic GUI drives the actuators directly
+static bool     s_test        = false;
+static float    s_pwm_hz      = 339.0f;          // PCA_PWM_HZ outside TEST
+static uint16_t s_test_us[16];                   // commanded pulse, 0 = off
+static bool     s_test_awake[16];
+static uint32_t s_test_moved_ms[16];
+static uint16_t s_test_lim_lo[16], s_test_lim_hi[16];
+static uint32_t s_test_idle_ms = 500;
+static uint32_t s_gui_last    = 0;
+static bool     s_gui_alive   = false;
+static actcon_pyro_report_t s_pyro_rep;          // from the Navigation MCU, TEST only
+static uint32_t s_pyro_rep_ms = 0;
+static uint32_t s_pyro_seq    = 1;
+static float    s_amps_now    = 0.0f;            // 100 ms mean
+static float    s_amps_max    = 0.0f;            // peak over 10 s
+static uint32_t s_nav_status_ms = 0, s_pos_status_ms = 0;
+
 // =====================================================================
 //  3. PCA9685 — servo bus
 //
@@ -324,7 +388,7 @@ static bool pca_begin(void)
     if (!pca_write8(PCA_MODE1, 0x00)) return false;
     delay(1);
 
-    uint8_t prescale = (uint8_t)(PCA_OSC_HZ / (4096.0f * PCA_PWM_HZ) + 0.5f) - 1;
+    uint8_t prescale = (uint8_t)(PCA_OSC_HZ / (4096.0f * s_pwm_hz) + 0.5f) - 1;
 
     uint8_t mode1;
     if (!pca_read8(PCA_MODE1, &mode1)) return false;
@@ -346,7 +410,7 @@ static inline uint16_t us_to_counts(float us)
     if (us < SERVO_US_MIN) us = SERVO_US_MIN;
     if (us > SERVO_US_MAX) us = SERVO_US_MAX;
     // counts = us * 4096 * f / 1e6
-    float c = us * (4096.0f * PCA_PWM_HZ * 1e-6f);
+    float c = us * (4096.0f * s_pwm_hz * 1e-6f);
     if (c < 0.0f)    c = 0.0f;
     if (c > 4095.0f) c = 4095.0f;
     return (uint16_t)(c + 0.5f);
@@ -380,13 +444,13 @@ static void servos_park(void)
 {
     s_servo_counts[CH_TVC_X] = us_to_counts(TVC_TRIM_X_US);
     s_servo_counts[CH_TVC_Y] = us_to_counts(TVC_TRIM_Y_US);
-    // Mid travel on the pad: neither extreme, so a stuck clamp is not
-    // automatically the worst case.
-    s_servo_counts[CH_CLAMP] = us_to_counts(
-        CLAMP_US_CLOSED + 0.6f * (CLAMP_US_OPEN - CLAMP_US_CLOSED));
-    for (uint8_t i = CH_FIN_0; i <= CH_FIN_3; i++)
-        s_servo_counts[i] = us_to_counts(FIN_TRIM_US);
-    s_servo_counts[CH_SPARE] = us_to_counts(1500.0f);
+    // Wide open on the pad: the clamp starts the burn open (the startup
+    // gate in the guidance), and open is the position that chokes nothing.
+    s_servo_counts[CH_CLAMP] = us_to_counts(CLAMP_US_OPEN);
+    for (uint8_t i = 0; i < 4; i++)
+        s_servo_counts[CH_FIN_0 + i] = us_to_counts(FIN_TRIM_US(i));
+    s_servo_counts[CH_COVER] = us_to_counts(s_cover_open ? PRM(SRV_COVER_UNLOCK)
+                                                         : PRM(SRV_COVER_LOCK));
 }
 
 /**
@@ -417,14 +481,25 @@ static void servos_apply(const ariadna_actuator_t *a)
     s_servo_counts[CH_CLAMP] =
         us_to_counts(CLAMP_US_CLOSED + f * (CLAMP_US_OPEN - CLAMP_US_CLOSED));
 
-    // FUTURE: fins. The Navigation MCU sends zeros and leaves FINS_LIVE
-    // clear, so this branch never runs today — but the path is here and is
-    // exercised by the packet arriving every tick.
-    if (a->flags & ARIADNA_ACT_FINS_LIVE) {
-        for (uint8_t i = 0; i < 4; i++)
-            s_servo_counts[CH_FIN_0 + i] =
-                us_to_counts(FIN_TRIM_US + a->fin_deg[i] * FIN_US_PER_DEG);
+    // Fins. Not live (ascent with fins parked, a lost navigation solution)
+    // means neutral, not "wherever they were": a fin left deflected is a
+    // steady torque nobody is correcting.
+    const bool fins = (a->flags & ARIADNA_ACT_FINS_LIVE) && (a->flags & ARIADNA_ACT_VALID);
+    for (uint8_t i = 0; i < 4; i++) {
+        float d = fins ? a->fin_deg[i] : 0.0f;
+        if (d >  30.0f) d =  30.0f;
+        if (d < -30.0f) d = -30.0f;
+        s_servo_counts[CH_FIN_0 + i] =
+            us_to_counts(FIN_TRIM_US(i) + FIN_SIGN(i) * d * FIN_US_PER_DEG);
     }
+
+    // Aerocover: a request latches. It is honoured only once the vehicle
+    // has actually flown, so a bench packet cannot drop the cover on the pad.
+    if ((a->flags & ARIADNA_ACT_COVER_OPEN) && s_state >= ARIADNA_STATE_ASCENT &&
+        s_state <= ARIADNA_STATE_GUIDANCE)
+        s_cover_open = true;
+    s_servo_counts[CH_COVER] = us_to_counts(s_cover_open ? PRM(SRV_COVER_UNLOCK)
+                                                         : PRM(SRV_COVER_LOCK));
 
     s_servo_ok = pca_write_run(0, s_servo_counts, PCA_N_USED);
 }
@@ -586,11 +661,14 @@ struct LogRecord {
     float    roll, pitch, yaw;
     int32_t  lat, lon;
     float    tvc_x, tvc_y, clamp;
-    float    thrust_est, p_plan;
+    float    thrust_est, k_plan;
     uint16_t vbat_mv, current_ma;
     uint16_t nav_flags;
     uint8_t  state, nav_phase, pyro, health;
-    uint8_t  reserved[6];      // room for fields you will want later
+    uint8_t  events;           // ARIADNA_EV_* from the sequencer
+    int8_t   t_event_ds;       // countdown, 0.1 s, saturating
+    uint8_t  fin_gain_pct;     // estimated fin effectiveness * 100
+    uint8_t  reserved[3];
 };
 #pragma pack(pop)
 ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
@@ -694,7 +772,13 @@ static void annunciate(void)
     case ARIADNA_STATE_ABORT:
         ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER,   ARIADNA_PAT_FAST,  0); break;
     case ARIADNA_STATE_TEST:
-        ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE,    ARIADNA_PAT_SLOW,  0); break;
+        if (pyro_rep_fresh() && s_pyro_rep.firing_mask)
+            ariadna_rgb_set(&s_rgb, ARIADNA_C_RED,   ARIADNA_PAT_SOLID, 0);
+        else if (pyro_rep_fresh() && s_pyro_rep.armed)
+            ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER, ARIADNA_PAT_FAST,  0);
+        else
+            ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE,  ARIADNA_PAT_SLOW,  0);
+        break;
     default:
         ariadna_rgb_set(&s_rgb, ARIADNA_C_RED,     ARIADNA_PAT_SOLID, 0); break;
     }
@@ -707,7 +791,8 @@ static void annunciate(void)
     // state that persists: a sequence already running is not restarted.
     if (s_state == ARIADNA_STATE_RECOVERY) {
         ariadna_buzzer_play(&s_buzz, BEEP_RECOVERY, 2, 1, 2000);
-    } else if (s_state == ARIADNA_STATE_ARMED) {
+    } else if (s_state == ARIADNA_STATE_ARMED ||
+               (s_state == ARIADNA_STATE_TEST && pyro_rep_fresh() && s_pyro_rep.armed)) {
         ariadna_buzzer_play(&s_buzz, BEEP_ARMED, 2, 1, 2000);
     } else {
         ariadna_buzzer_stop(&s_buzz);
@@ -774,8 +859,10 @@ static void poll_position(void)
             s_nav_us   = micros();
             s_have_nav = true;
         } else if (type == ARIADNA_PKT_POS_STATUS) {
-            if (ariadna_unpack(pl, len, &s_pos_status, sizeof(s_pos_status)))
+            if (ariadna_unpack(pl, len, &s_pos_status, sizeof(s_pos_status))) {
                 s_have_pos_status = true;
+                s_pos_status_ms   = millis();
+            }
         }
     }
 }
@@ -799,11 +886,17 @@ static void poll_navigation(void)
             if (ariadna_unpack(pl, len, &s_act, sizeof(s_act))) {
                 s_act_us   = micros();
                 s_have_act = true;
-                servos_apply(&s_act);
+                // In TEST the diagnostic GUI owns the servo outputs.
+                if (!s_test) servos_apply(&s_act);
             }
         } else if (type == ARIADNA_PKT_NAV_STATUS) {
-            if (ariadna_unpack(pl, len, &s_nav_status, sizeof(s_nav_status)))
+            if (ariadna_unpack(pl, len, &s_nav_status, sizeof(s_nav_status))) {
                 s_have_nav_status = true;
+                s_nav_status_ms   = millis();
+            }
+        } else if (type == ACTCON_PKT_PYRO_REPORT) {
+            if (ariadna_unpack(pl, len, &s_pyro_rep, sizeof(s_pyro_rep)))
+                s_pyro_rep_ms = millis();
         }
     }
 }
@@ -833,6 +926,26 @@ static void read_analogue(void)
     s_vbat    = vbat_f;
     s_current = curr_f;
 
+    // 100 ms mean and the peak over ten 1 s buckets, for the bench: a
+    // stalled servo shows as a peak long before it shows as smoke.
+    {
+        static float acc = 0.0f, fast = 0.0f, bucket[10];
+        static uint8_t n = 0, bi = 0;
+        static uint32_t bucket_t0 = 0;
+        fast += 0.5f * (amps - fast);
+        acc += amps;
+        if (++n >= 20) { s_amps_now = acc / 20.0f; acc = 0.0f; n = 0; }
+        if (fast > bucket[bi]) bucket[bi] = fast;
+        if (millis() - bucket_t0 >= 1000) {
+            bucket_t0 = millis();
+            bi = (uint8_t)((bi + 1) % 10);
+            bucket[bi] = fast;
+        }
+        float m = bucket[0];
+        for (uint8_t i = 1; i < 10; i++) if (bucket[i] > m) m = bucket[i];
+        s_amps_max = m;
+    }
+
 #if RBF_REMOVED_IS_HIGH
     s_rbf_out = digitalRead(PIN_RBF) == HIGH;
 #else
@@ -857,6 +970,25 @@ static void set_state(uint8_t s)
     s_state_since = millis();
 }
 
+static bool s_arm_request = false;      // FLIGHTARM from the GUI, when mst.auto_arm = 0
+
+static inline bool nav_status_fresh(void)
+{
+    return s_have_nav_status && (millis() - s_nav_status_ms) < 500;
+}
+static inline bool pos_status_fresh(void)
+{
+    return s_have_pos_status && (millis() - s_pos_status_ms) < 500;
+}
+
+/** Both other boards report the CRC of the parameter table held here. */
+static bool params_synced(void)
+{
+    return nav_status_fresh() && pos_status_fresh() &&
+           s_nav_status.param_crc == s_param_crc &&
+           s_pos_status.param_crc == s_param_crc;
+}
+
 static void state_machine(void)
 {
     const bool nav_ok  = s_have_nav && link_alive(s_nav_us) &&
@@ -876,11 +1008,16 @@ static void state_machine(void)
         break;
 
     case ARIADNA_STATE_IDLE:
-        s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
+        s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_TEST);
+        s_cover_open = false;                   // the latch re-engages on the ground
         // Arming needs the RBF tag out, a healthy navigation solution, and
         // the vehicle actually sitting still on the pad. Any one missing
         // and it stays safe.
-        if (s_rbf_out && nav_ok && on_pad && !bw_open) {
+        // ... and the other two boards must hold THIS board's parameter
+        // table. A Navigation MCU flying yesterday's timings is not armed.
+        if (s_rbf_out && nav_ok && on_pad && !bw_open && params_synced() &&
+            (PRM(MST_AUTO_ARM) > 0.5f || s_arm_request)) {
+            s_arm_request = false;
             // Capture the pad reference at the moment of arming, not at
             // boot: the vehicle may have sat on the pad for an hour while
             // the weather moved.
@@ -903,7 +1040,7 @@ static void state_machine(void)
         // second test exists because a breakwire that fails to part is a
         // known failure and it must not strand the state machine on the
         // pad while the rocket is in the air.
-        if (bw_open || (nav_ok && s_nav.accel_mag > 3.0f) ||
+        if (bw_open || (nav_ok && s_nav.accel_mag > PRM(MST_LAUNCH_G)) ||
             (nav_ok && s_nav.pz > 15.0f)) {
             s_t_launch_ms = millis();
             broadcast_cmd(ARIADNA_CMD_ZERO_CLOCK, 0, s_t_launch_ms);
@@ -926,7 +1063,9 @@ static void state_machine(void)
         // itself on the same altitude and picks its own ignition point.
         // This board only reports it — announcing the handover is not the
         // same as commanding it, and nothing here can hurry the burn.
-        if (nav_ok && s_nav.pz <= GUIDANCE_ENTRY_M && s_nav.vz < -2.0f)
+        if ((nav_status_fresh() && s_nav_status.phase >= DG_PHASE_IGNITING) ||
+            (!nav_status_fresh() && nav_ok && s_nav.pz <= GUIDANCE_FALLBACK_M &&
+             s_nav.vz < -2.0f))
             set_state(ARIADNA_STATE_GUIDANCE);
         break;
 
@@ -934,21 +1073,27 @@ static void state_machine(void)
         // Down and stopped, or the guidance module says it is finished.
         if ((nav_ok && s_nav.pz < 3.0f && fabsf(s_nav.vz) < 1.5f &&
              millis() - s_state_since > 1000) ||
-            (s_have_nav_status && s_nav_status.phase == DG_PHASE_DONE))
+            (nav_status_fresh() && s_nav_status.phase == DG_PHASE_DONE))
             set_state(ARIADNA_STATE_LANDED);
         break;
 
     case ARIADNA_STATE_LANDED:
+        s_flags &= (uint8_t)~ARIADNA_MST_ARMED;     // down: no pyro may fire any more
         servos_park();
         pca_write_run(0, s_servo_counts, PCA_N_USED);
         if (millis() - s_state_since > 5000)
             set_state(ARIADNA_STATE_RECOVERY);
         break;
 
+    case ARIADNA_STATE_TEST:
+        // Entered and left only from the diagnostic GUI (section 13).
+        s_flags |= ARIADNA_MST_TEST;
+        s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
+        break;
+
     case ARIADNA_STATE_RECOVERY:
     case ARIADNA_STATE_ABORT:
     case ARIADNA_STATE_ERROR:
-    case ARIADNA_STATE_TEST:
         break;                                  // terminal until power cycle
 
     default:
@@ -1004,10 +1149,13 @@ static void build_telemetry(ariadna_tlm_t *t)
     t->vh_dms  = sat16(sqrtf(s_nav.vx * s_nav.vx + s_nav.vy * s_nav.vy) * 10.0f);
     t->acc_cg  = sat16(s_nav.accel_mag * 100.0f);
 
-    t->roll_ddeg  = sat16(s_pos_status.roll  * 10.0f);
-    t->pitch_ddeg = sat16(s_pos_status.pitch * 10.0f);
-    t->yaw_ddeg   = sat16(s_pos_status.yaw   * 10.0f);
-    t->temp_dc    = sat16(s_pos_status.temp_c * 10.0f);
+    // Attitude: the quaternion from the 240 Hz state, sign fixed so w >= 0.
+    {
+        float sgn = (s_nav.qw < 0.0f) ? -32767.0f : 32767.0f;
+        t->qx = sat16(s_nav.qx * sgn);
+        t->qy = sat16(s_nav.qy * sgn);
+        t->qz = sat16(s_nav.qz * sgn);
+    }
 
     t->tvc_x_cdeg = sat16(s_act.tvc_x_deg * 100.0f);
     t->tvc_y_cdeg = sat16(s_act.tvc_y_deg * 100.0f);
@@ -1016,10 +1164,7 @@ static void build_telemetry(ariadna_tlm_t *t)
 
     t->thrust_n = sat16(s_have_nav_status ? s_nav_status.thrust_est : 0.0f);
 
-    // (V - 2.5) * 100, the encoding the V1 ground station already uses. A
-    // 2S pack never sits below 2.5 V and never above 5.05 V per the
-    // encoding's range, so one byte is plenty.
-    float vb = (s_vbat - 2.5f) * 100.0f;
+    float vb = (s_vbat - 5.0f) * 50.0f;        // 5.0..10.1 V, 20 mV steps
     if (vb < 0.0f)   vb = 0.0f;
     if (vb > 255.0f) vb = 255.0f;
     t->vbat_cv = (uint8_t)vb;
@@ -1073,11 +1218,33 @@ static void build_telemetry(ariadna_tlm_t *t)
     else if (!(s_have_act && link_alive(s_act_us)))      err = 3;
     else if (!s_flash_ok)                                err = 4;
     else if (!s_servo_ok)                                err = 5;
+    else if (s_state <= ARIADNA_STATE_ARMED && !params_synced()) err = 7;
     else if (s_vbat > 0.5f && s_vbat < 7.0f)             err = 6;   // low pack
     f |= (uint8_t)((err << ARIADNA_TF_ERR_SHIFT) & ARIADNA_TF_ERR_MASK);
     t->flags = f;
 
-    t->exp = 0;      // free for your payload experiment
+    // What the sequencer has done, and the countdown to what it does next.
+    t->t_event_ds = ARIADNA_TLM_T_UNKNOWN;
+    if (nav_status_fresh()) {
+        t->events = s_nav_status.events;
+        float te = (s_nav_status.phase >= DG_PHASE_IGNITING) ? s_nav_status.t_to_td
+                                                             : s_nav_status.t_to_ign;
+        if (te >= 0.0f) t->t_event_ds = sat16(te * 10.0f);
+    }
+    if (s_cover_open) t->events |= ARIADNA_EV_COVER;
+    if (s_t_launch_ms) {
+        uint32_t tf = (millis() - s_t_launch_ms) / 1000u;
+        t->t_flight_s = (uint8_t)(tf > 255 ? 255 : tf);
+    }
+    {
+        float px = s_nav.px, py = s_nav.py;
+        if (px >  127.0f) px =  127.0f;
+        if (px < -127.0f) px = -127.0f;
+        if (py >  127.0f) py =  127.0f;
+        if (py < -127.0f) py = -127.0f;
+        t->px_m = (int8_t)px;
+        t->py_m = (int8_t)py;
+    }
 }
 
 // Snapshot handed to core 1 for the downlink. A seqlock again: the LoRa
@@ -1114,7 +1281,7 @@ static bool self_test(void)
     // Servo bus. A PCA9685 that does not acknowledge means no TVC at all.
     uint8_t m1;
     if (!pca_read8(PCA_MODE1, &m1)) {
-        Serial.println("POST PCA9685 not responding");
+        usb_printf("POST PCA9685 not responding\n");
         ok = false;
     }
 
@@ -1122,30 +1289,697 @@ static bool self_test(void)
     // silently halves every servo's travel.
     uint16_t c1500 = us_to_counts(1500.0f);
     uint16_t c1000 = us_to_counts(1000.0f);
-    float expect1500 = 1500.0f * (4096.0f * PCA_PWM_HZ * 1e-6f);
+    float expect1500 = 1500.0f * (4096.0f * s_pwm_hz * 1e-6f);
     if (fabsf((float)c1500 - expect1500) > 2.0f) {
         MASTER_PRINT("POST pulse 1500us -> %u want %.0f\n", c1500, expect1500);
         ok = false;
     }
     if (!(c1000 < c1500)) {
-        Serial.println("POST pulse conversion not monotone");
+        usb_printf("POST pulse conversion not monotone\n");
         ok = false;
     }
     // The travel guard must actually clamp.
     if (us_to_counts(500.0f) != us_to_counts(SERVO_US_MIN) ||
         us_to_counts(3000.0f) != us_to_counts(SERVO_US_MAX)) {
-        Serial.println("POST servo travel guard not clamping");
+        usb_printf("POST servo travel guard not clamping\n");
         ok = false;
     }
 
     if (!s_flash_ok) {
-        Serial.println("POST flash log unavailable");
+        usb_printf("POST flash log unavailable\n");
         // Not fatal: the vehicle can fly without a log, and refusing to
         // fly over a logging fault would be the wrong trade. It is
         // reported in the telemetry error code instead.
     }
 
     return ok;
+}
+
+// =====================================================================
+//  13. PARAMETERS, USB DIAGNOSTICS AND TEST MODE
+//
+//  ---------------------------------------------------------------------
+//  THE RULE: USB MAY NEVER COST THE FLIGHT ANYTHING
+//  ---------------------------------------------------------------------
+//  * Nothing is sent unless a host has the port open (`Serial` is true
+//    only with DTR asserted). In flight there is no host, so this whole
+//    section is two comparisons per tick.
+//  * Text is queued into a RAM ring and handed to the USB stack only in
+//    the amounts it says it can take right now. There is no call in this
+//    file that waits for the host. A full ring drops the LINE, whole.
+//  * Commands are parsed a character at a time, never waited for.
+//  * Everything that moves an actuator or touches a pyro from here needs
+//    TEST mode, and TEST mode can only be entered on the ground.
+//
+//  ---------------------------------------------------------------------
+//  THE PROTOCOL  (115200, one command per line; see the User Manual)
+//  ---------------------------------------------------------------------
+//    HELLO                       -> I ACTCON 1 16 / I DAIDALOS <fw> ...
+//    STATUS                      telemetry lines now
+//    TEST 1 | TEST 0             enter / leave TEST mode
+//    PARAM LIST                  -> PRM <id> <key> <val> <def> <min> <max> <unit> <owner>
+//    PARAM SET <id|key> <value>  (IDLE / TEST only)
+//    PARAM SAVE | LOAD | DEFAULTS
+//    PADREF                      capture the pad reference now
+//    CAL GYRO                    gyro calibration (vehicle still)
+//    FLIGHTARM 1 | 0             arm request when mst.auto_arm = 0 / disarm
+//    HB                          heartbeat (any line counts)
+//   TEST mode only - the Actuator Console's own commands, unchanged:
+//    PWM <hz>, LIM <ch> <min> <max>, SET <ch> <us>, OFF <ch>|ALL,
+//    IDLE <ms>, ARM, DISARM, FIRE <ch> <ms>
+//
+//  Five telemetry lines, 10 Hz each, staggered one per 20 ms:
+//    T {..}  actuators, in exactly the Actuator Console's format
+//    M {..}  this board        N {..}  navigation state (Position MCU)
+//    P {..}  Position status   G {..}  guidance / Navigation status
+// =====================================================================
+
+// ---- parameter store ---------------------------------------------------
+struct ParamImage {
+    uint32_t magic;
+    uint16_t layout;
+    uint16_t crc;
+    float    v[ARIADNA_PARAM_ID_MAX];
+};
+static const uint32_t PARAM_MAGIC = 0x44414931;      // "DAI1"
+
+static void params_load(void)
+{
+    ariadna_params_default(&s_params);
+    s_params_from_eeprom = false;
+    EEPROM.begin(1024);
+    ParamImage img;
+    EEPROM.get(0, img);
+    if (img.magic == PARAM_MAGIC && img.layout == ARIADNA_PARAM_LAYOUT) {
+        ariadna_params_t t;
+        memcpy(t.v, img.v, sizeof(t.v));
+        if (ariadna_params_crc(&t) == img.crc) {
+            // Through ariadna_param_set(), so a stored value outside today's
+            // range is clamped rather than trusted.
+            for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++) {
+                uint8_t id = ARIADNA_PARAM_INFO[i].id;
+                (void)ariadna_param_set(&s_params, id, t.v[id]);
+            }
+            s_params_from_eeprom = true;
+        }
+    }
+    s_param_crc = ariadna_params_crc(&s_params);
+}
+
+/** Blocks for a flash write (and pauses core 1). Ground only. */
+static bool params_save(void)
+{
+    ParamImage img;
+    img.magic  = PARAM_MAGIC;
+    img.layout = ARIADNA_PARAM_LAYOUT;
+    memcpy(img.v, s_params.v, sizeof(img.v));
+    img.crc    = ariadna_params_crc(&s_params);
+    EEPROM.put(0, img);
+    return EEPROM.commit();
+}
+
+static inline bool on_ground_state(void)
+{
+    return s_state == ARIADNA_STATE_BOOT || s_state == ARIADNA_STATE_IDLE ||
+           s_state == ARIADNA_STATE_ARMED || s_state == ARIADNA_STATE_TEST ||
+           s_state == ARIADNA_STATE_ERROR;
+}
+
+/** One parameter every 25 ms to both boards, round-robin, on the ground. */
+static void params_stream(void)
+{
+    static uint32_t next_ms = 0;
+    static uint8_t  idx = 0;
+    if (!on_ground_state()) return;
+    if (millis() < next_ms) return;
+    next_ms = millis() + 25;
+
+    ariadna_param_pkt_t p;
+    memset(&p, 0, sizeof(p));
+    p.id    = ARIADNA_PARAM_INFO[idx].id;
+    p.value = s_params.v[p.id];
+    p.count = ARIADNA_PARAM_COUNT;
+    send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_PARAM, &p, sizeof(p));
+    send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_PARAM, &p, sizeof(p));
+    idx = (uint8_t)((idx + 1) % ARIADNA_PARAM_COUNT);
+}
+
+// ---- the USB transmit ring -----------------------------------------------
+static const uint16_t USB_RING_SZ = 4096;            // power of two
+static char              s_usb_ring[USB_RING_SZ];
+static volatile uint16_t s_usb_head = 0, s_usb_tail = 0;
+static volatile uint32_t s_usb_dropped = 0;
+static mutex_t           s_usb_mutex;                // core 1 prints too, at boot
+static bool              s_usb_mutex_ok = false;
+
+static void usb_puts_n(const char *txt, uint16_t n)
+{
+    if (!s_usb_mutex_ok) { mutex_init(&s_usb_mutex); s_usb_mutex_ok = true; }
+    if (!mutex_try_enter(&s_usb_mutex, nullptr)) { s_usb_dropped++; return; }
+    uint16_t used = (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1));
+    if ((uint32_t)used + n >= USB_RING_SZ - 1) {
+        s_usb_dropped++;                              // all or nothing
+    } else {
+        uint16_t h = s_usb_head;
+        for (uint16_t i = 0; i < n; i++) {
+            s_usb_ring[h] = txt[i];
+            h = (uint16_t)((h + 1) & (USB_RING_SZ - 1));
+        }
+        s_usb_head = h;
+    }
+    mutex_exit(&s_usb_mutex);
+}
+
+static void usb_printf(const char *fmt, ...)
+{
+    char buf[400];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    usb_puts_n(buf, (uint16_t)n);
+}
+
+static void console_line(char *line);
+static uint8_t s_list_idx = 255;        // PARAM LIST in progress: next entry to print
+
+/** Drain the ring as far as the host allows, and read what it sent. */
+static void usb_service(void)
+{
+    static char    line[80];
+    static uint8_t len = 0;
+
+    if (!Serial) {
+        // No host: forget the backlog, so the first thing a host sees when
+        // it connects is the present, not the last four kilobytes.
+        s_usb_tail = s_usb_head;
+        s_gui_alive = false;
+        len = 0;
+        return;
+    }
+
+    int room = Serial.availableForWrite();
+    uint16_t t = s_usb_tail;
+    while (room > 0 && t != s_usb_head) {
+        uint16_t run = (uint16_t)((s_usb_head - t) & (USB_RING_SZ - 1));
+        if (run > USB_RING_SZ - t) run = (uint16_t)(USB_RING_SZ - t);
+        if (run > (uint16_t)room)  run = (uint16_t)room;
+        Serial.write((const uint8_t *)&s_usb_ring[t], run);
+        t = (uint16_t)((t + run) & (USB_RING_SZ - 1));
+        room -= run;
+    }
+    s_usb_tail = t;
+
+    // PARAM LIST, one line per tick: seventy lines at once would not fit
+    // the ring, and a list with holes in it is worse than a slow one.
+    if (s_list_idx < ARIADNA_PARAM_COUNT &&
+        (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ / 2) {
+        const ariadna_param_info_t *q = &ARIADNA_PARAM_INFO[s_list_idx++];
+        MASTER_PRINT("PRM %u %s %.6g %.6g %.6g %.6g %s %c\n", q->id, q->key,
+                     s_params.v[q->id], q->def, q->lo, q->hi, q->unit, q->owner);
+        if (s_list_idx >= ARIADNA_PARAM_COUNT) {
+            usb_printf("OK PARAM LIST %u %u\n", ARIADNA_PARAM_COUNT, s_param_crc);
+            s_list_idx = 255;
+        }
+    }
+
+    uint8_t budget = 64;                              // bytes per tick, bounded
+    while (budget-- && Serial.available()) {
+        const char c = (char)Serial.read();
+        if (c == '\r' || c == '\n') {
+            line[len] = 0;
+            if (len) {
+                s_gui_last = millis();
+                if (!s_gui_alive) { s_gui_alive = true; usb_printf("# GUI connected\n"); }
+                console_line(line);
+            }
+            len = 0;
+        } else if (len < sizeof(line) - 1) {
+            line[len++] = c;
+        }
+    }
+    if (s_gui_alive && millis() - s_gui_last > 1500) {
+        s_gui_alive = false;
+        if (s_test) pyro_bridge_send(ACTCON_CMD_DISARM, 0, 0, 3);
+        usb_printf("# GUI silent - bench pyros disarmed, servos hold\n");
+    }
+}
+
+// ---- TEST mode: the Actuator Console inside the flight firmware -----------
+static float test_max_pulse_us(void)
+{
+    const float lim = 1e6f / s_pwm_hz - 200.0f;       // never closer to the period
+    return lim < 3500.0f ? lim : 3500.0f;
+}
+
+static uint16_t test_clamp_us(uint8_t ch, long us)
+{
+    if (us < s_test_lim_lo[ch]) us = s_test_lim_lo[ch];
+    if (us > s_test_lim_hi[ch]) us = s_test_lim_hi[ch];
+    if (us > (long)test_max_pulse_us()) us = (long)test_max_pulse_us();
+    return (uint16_t)us;
+}
+
+/** One channel: a pulse of s_test_us[ch], or FULL OFF when 0 or idled. */
+static bool test_write_ch(uint8_t ch)
+{
+    Wire.beginTransmission(PCA_ADDR);
+    Wire.write((uint8_t)(PCA_LED0_ON_L + 4 * ch));
+    if (s_test_us[ch] == 0 || !s_test_awake[ch]) {
+        Wire.write(0); Wire.write(0);
+        Wire.write(0); Wire.write(0x10);              // OFF_H bit 4: full off
+    } else {
+        float c = (float)s_test_us[ch] * (4096.0f * s_pwm_hz * 1e-6f) + 0.5f;
+        if (c < 1.0f) c = 1.0f;
+        if (c > 4095.0f) c = 4095.0f;
+        uint16_t n = (uint16_t)c;
+        Wire.write(0); Wire.write(0);
+        Wire.write((uint8_t)(n & 0xFF));
+        Wire.write((uint8_t)(n >> 8));
+    }
+    return Wire.endTransmission() == 0;
+}
+
+static void test_write_all(void)
+{
+    bool ok = true;
+    for (uint8_t ch = 0; ch < PCA_N_CH; ch++) ok = test_write_ch(ch) && ok;
+    s_servo_ok = ok;
+}
+
+static void pyro_bridge_send(uint8_t cmd, uint8_t ch, uint16_t pulse_ms, uint8_t repeats)
+{
+    actcon_pyro_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.cmd      = cmd;
+    c.ch       = ch;
+    c.pulse_ms = pulse_ms;
+    c.seq      = (cmd == ACTCON_CMD_HEARTBEAT) ? 0 : s_pyro_seq++;
+    for (uint8_t i = 0; i < repeats; i++)
+        send_to(&s_tx_nav, NAV_PORT, ACTCON_PKT_PYRO_CMD, &c, sizeof(c));
+}
+
+static void test_enter(void)
+{
+    if (s_test) return;
+    if (s_state == ARIADNA_STATE_ARMED) broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+    s_test = true;
+    s_flags |= ARIADNA_MST_TEST;
+    s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
+    // Like the Actuator Console: every channel starts with NO pulse, so
+    // nothing moves until the GUI moves it.
+    for (uint8_t i = 0; i < PCA_N_CH; i++) { s_test_us[i] = 0; s_test_awake[i] = false; }
+    test_write_all();
+    set_state(ARIADNA_STATE_TEST);
+    broadcast_cmd(ARIADNA_CMD_TEST_MODE, 1, 0);
+}
+
+static void test_leave(void)
+{
+    if (!s_test) return;
+    pyro_bridge_send(ACTCON_CMD_DISARM, 0, 0, 3);
+    s_test = false;
+    s_flags &= (uint8_t)~ARIADNA_MST_TEST;
+    s_pwm_hz = PCA_PWM_HZ;                            // back to the flight refresh rate
+    s_servo_ok = pca_begin();
+    servos_park();
+    pca_write_run(0, s_servo_counts, PCA_N_USED);
+    for (uint8_t ch = PCA_N_USED; ch < PCA_N_CH; ch++) { s_test_us[ch] = 0; (void)test_write_ch(ch); }
+    broadcast_cmd(ARIADNA_CMD_TEST_MODE, 0, 0);
+    broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+    set_state(s_post_pass ? ARIADNA_STATE_IDLE : ARIADNA_STATE_ERROR);
+}
+
+/** Idle-off and the heartbeat to the Navigation MCU's bench pyro logic. */
+static void test_service(void)
+{
+    static uint32_t next_hb = 0;
+    const uint32_t now = millis();
+    if (s_test_idle_ms) {
+        for (uint8_t ch = 0; ch < PCA_N_CH; ch++) {
+            if (s_test_awake[ch] && s_test_us[ch] && now - s_test_moved_ms[ch] >= s_test_idle_ms) {
+                s_test_awake[ch] = false;
+                (void)test_write_ch(ch);
+            }
+        }
+    }
+    // The heartbeat follows the GUI's: no GUI, no heartbeat, and the
+    // Navigation MCU disarms itself half a second later.
+    if (s_gui_alive && now >= next_hb) {
+        next_hb = now + ACTCON_HB_PERIOD_MS;
+        pyro_bridge_send(ACTCON_CMD_HEARTBEAT, 0, 0, 1);
+    }
+}
+
+// ---- commands ----------------------------------------------------------------
+static bool parse_ch(const char *tok, uint8_t *ch)
+{
+    if (!tok) return false;
+    char *end;
+    const long v = strtol(tok, &end, 10);
+    if (end == tok || v < 0 || v >= PCA_N_CH) return false;
+    *ch = (uint8_t)v;
+    return true;
+}
+
+static inline bool pyro_rep_fresh(void) { return s_pyro_rep_ms && millis() - s_pyro_rep_ms < 300; }
+
+static void console_param(char *a1, char *a2, char *a3)
+{
+    if (!a1) { usb_printf("ERR PARAM LIST|SET|SAVE|LOAD|DEFAULTS\n"); return; }
+    for (char *q = a1; *q; q++) *q = (char)toupper((unsigned char)*q);
+
+    if (!strcmp(a1, "LIST")) {
+        s_list_idx = 0;                 // sent a few lines per tick, see usb_service()
+        return;
+    }
+    // Everything below changes the table: on the ground and not armed.
+    if (!(s_state == ARIADNA_STATE_IDLE || s_state == ARIADNA_STATE_TEST ||
+          s_state == ARIADNA_STATE_BOOT || s_state == ARIADNA_STATE_ERROR)) {
+        usb_printf("ERR PARAM only in IDLE or TEST (state %u)\n", s_state);
+        return;
+    }
+    if (!strcmp(a1, "SET")) {
+        if (!a2 || !a3) { usb_printf("ERR PARAM SET <id|key> <value>\n"); return; }
+        const ariadna_param_info_t *info = nullptr;
+        char *end;
+        long id = strtol(a2, &end, 10);
+        if (end != a2 && *end == 0) {
+            info = ariadna_param_find((uint8_t)id);
+        } else {
+            for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++)
+                if (!strcmp(ARIADNA_PARAM_INFO[i].key, a2)) info = &ARIADNA_PARAM_INFO[i];
+        }
+        if (!info) { usb_printf("ERR PARAM unknown '%s'\n", a2); return; }
+        float v = strtof(a3, &end);
+        if (end == a3 || !ariadna_param_set(&s_params, info->id, v)) {
+            usb_printf("ERR PARAM bad value '%s'\n", a3);
+            return;
+        }
+        s_param_crc = ariadna_params_crc(&s_params);
+        if (!s_test) {                                // servo trims show at once
+            servos_park();
+            pca_write_run(0, s_servo_counts, PCA_N_USED);
+        }
+        MASTER_PRINT("OK PARAM %u %s %.6g\n", info->id, info->key, s_params.v[info->id]);
+        return;
+    }
+    if (!strcmp(a1, "SAVE")) {
+        usb_printf(params_save() ? "OK PARAM SAVE %u\n" : "ERR PARAM SAVE failed %u\n", s_param_crc);
+        return;
+    }
+    if (!strcmp(a1, "LOAD")) {
+        params_load();
+        usb_printf("OK PARAM LOAD %s %u\n", s_params_from_eeprom ? "eeprom" : "defaults", s_param_crc);
+        return;
+    }
+    if (!strcmp(a1, "DEFAULTS")) {
+        ariadna_params_default(&s_params);
+        s_param_crc = ariadna_params_crc(&s_params);
+        usb_printf("OK PARAM DEFAULTS %u (not saved)\n", s_param_crc);
+        return;
+    }
+    usb_printf("ERR PARAM LIST|SET|SAVE|LOAD|DEFAULTS\n");
+}
+
+static void console_line(char *line)
+{
+    char *save = nullptr;
+    char *cmd = strtok_r(line, " \t", &save);
+    if (!cmd) return;
+    for (char *q = cmd; *q; q++) *q = (char)toupper((unsigned char)*q);
+    char *a1 = strtok_r(nullptr, " \t", &save);
+    char *a2 = strtok_r(nullptr, " \t", &save);
+    char *a3 = strtok_r(nullptr, " \t", &save);
+    uint8_t ch;
+
+    if (!strcmp(cmd, "HB")) return;
+    if (!strcmp(cmd, "HELLO")) {
+        usb_printf("I ACTCON 1 %u\n", PCA_N_CH);
+        usb_printf("I DAIDALOS %d FLIGHT guidance %d params %u\n", ARIADNA_FW_VERSION,
+                   DG_VERSION, ARIADNA_PARAM_COUNT);
+        return;
+    }
+    if (!strcmp(cmd, "STATUS")) return;               // the stream is always on
+    if (!strcmp(cmd, "PARAM")) { console_param(a1, a2, a3); return; }
+
+    if (!strcmp(cmd, "TEST")) {
+        const bool on = a1 && a1[0] == '1';
+        if (on) {
+            if (s_state != ARIADNA_STATE_IDLE && s_state != ARIADNA_STATE_ARMED &&
+                s_state != ARIADNA_STATE_BOOT && s_state != ARIADNA_STATE_ERROR &&
+                s_state != ARIADNA_STATE_TEST) {
+                usb_printf("ERR TEST not on the ground (state %u)\n", s_state);
+                return;
+            }
+            test_enter();
+            usb_printf("OK TEST 1\n");
+        } else {
+            test_leave();
+            usb_printf("OK TEST 0\n");
+        }
+        return;
+    }
+    if (!strcmp(cmd, "PADREF")) {
+        if (!on_ground_state()) { usb_printf("ERR PADREF not on the ground\n"); return; }
+        broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
+        usb_printf("OK PADREF\n");
+        return;
+    }
+    if (!strcmp(cmd, "CAL")) {
+        if (!on_ground_state() || s_state == ARIADNA_STATE_ARMED) { usb_printf("ERR CAL only in IDLE or TEST\n"); return; }
+        broadcast_cmd(ARIADNA_CMD_CAL_GYRO, 0, 0);
+        usb_printf("OK CAL GYRO - keep the vehicle still for 2 s\n");
+        return;
+    }
+    if (!strcmp(cmd, "FLIGHTARM")) {
+        if (a1 && a1[0] == '1') {
+            s_arm_request = true;
+            usb_printf("OK FLIGHTARM requested - arms when RBF is out and navigation is ready\n");
+        } else {
+            s_arm_request = false;
+            if (s_state == ARIADNA_STATE_ARMED) {
+                s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
+                broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+                set_state(ARIADNA_STATE_IDLE);
+            }
+            usb_printf("OK FLIGHTARM 0\n");
+        }
+        return;
+    }
+
+    // ---- the Actuator Console's commands: TEST mode only -----------------
+    const bool act = !strcmp(cmd, "SET") || !strcmp(cmd, "OFF") || !strcmp(cmd, "IDLE") ||
+                     !strcmp(cmd, "LIM") || !strcmp(cmd, "PWM") || !strcmp(cmd, "ARM") ||
+                     !strcmp(cmd, "FIRE");
+    if (act && !s_test) {
+        // SET is streamed by the GUI: answer it once a second, not 50 times.
+        static uint32_t told = 0;
+        if (millis() - told > 1000) { told = millis(); usb_printf("ERR %s needs TEST mode (send TEST 1)\n", cmd); }
+        return;
+    }
+    if (!strcmp(cmd, "SET")) {
+        if (!parse_ch(a1, &ch) || !a2) { usb_printf("ERR SET <ch> <us>\n"); return; }
+        s_test_us[ch]       = test_clamp_us(ch, strtol(a2, nullptr, 10));
+        s_test_awake[ch]    = true;
+        s_test_moved_ms[ch] = millis();
+        s_servo_ok = test_write_ch(ch);
+        return;
+    }
+    if (!strcmp(cmd, "OFF")) {
+        if (a1 && toupper((unsigned char)a1[0]) == 'A') {
+            for (uint8_t i = 0; i < PCA_N_CH; i++) s_test_us[i] = 0;
+            test_write_all();
+            usb_printf("OK OFF ALL\n");
+            return;
+        }
+        if (!parse_ch(a1, &ch)) { usb_printf("ERR OFF <ch>|ALL\n"); return; }
+        s_test_us[ch] = 0;
+        s_servo_ok = test_write_ch(ch);
+        usb_printf("OK OFF %u\n", ch);
+        return;
+    }
+    if (!strcmp(cmd, "IDLE")) {
+        const long ms = a1 ? strtol(a1, nullptr, 10) : -1;
+        if (ms < 0 || ms > 60000) { usb_printf("ERR IDLE 0..60000 ms\n"); return; }
+        s_test_idle_ms = (uint32_t)ms;
+        usb_printf("OK IDLE %ld\n", ms);
+        return;
+    }
+    if (!strcmp(cmd, "LIM")) {
+        if (!parse_ch(a1, &ch) || !a2 || !a3) { usb_printf("ERR LIM <ch> <min> <max>\n"); return; }
+        long lo = strtol(a2, nullptr, 10), hi = strtol(a3, nullptr, 10);
+        if (lo < 500)  lo = 500;
+        if (hi > 3500) hi = 3500;
+        if (lo >= hi) { usb_printf("ERR LIM %u min >= max\n", ch); return; }
+        s_test_lim_lo[ch] = (uint16_t)lo;
+        s_test_lim_hi[ch] = (uint16_t)hi;
+        if (s_test_us[ch]) {
+            s_test_us[ch] = test_clamp_us(ch, s_test_us[ch]);
+            s_servo_ok = test_write_ch(ch);
+        }
+        usb_printf("OK LIM %u %ld %ld\n", ch, lo, hi);
+        return;
+    }
+    if (!strcmp(cmd, "PWM")) {
+        const long hz = a1 ? strtol(a1, nullptr, 10) : 0;
+        if (hz < 40 || hz > 400) { usb_printf("ERR PWM 40..400\n"); return; }
+        s_pwm_hz = (float)hz;
+        for (uint8_t i = 0; i < PCA_N_CH; i++)
+            if (s_test_us[i]) s_test_us[i] = test_clamp_us(i, s_test_us[i]);
+        s_servo_ok = pca_begin();
+        test_write_all();
+        usb_printf("OK PWM %ld\n", hz);
+        return;
+    }
+    if (!strcmp(cmd, "DISARM")) {                     // always allowed
+        pyro_bridge_send(ACTCON_CMD_DISARM, 0, 0, 3);
+        usb_printf("OK DISARM sent\n");
+        return;
+    }
+    if (!strcmp(cmd, "ARM") || !strcmp(cmd, "FIRE")) {
+        if (!s_rbf_out)        { usb_printf("ERR %s RBF pin is in\n", cmd); return; }
+        if (!pyro_rep_fresh()) { usb_printf("ERR %s Navigation MCU not answering\n", cmd); return; }
+        if (!strcmp(cmd, "ARM")) {
+            pyro_bridge_send(ACTCON_CMD_ARM, 0, 0, 3);
+            usb_printf("OK ARM sent\n");
+            return;
+        }
+        const long pch = a1 ? strtol(a1, nullptr, 10) : 0;
+        const long ms  = a2 ? strtol(a2, nullptr, 10) : (long)ACTCON_PULSE_DEFAULT_MS;
+        if (pch < 1 || pch > ACTCON_N_PYRO) { usb_printf("ERR FIRE channel 1..3\n"); return; }
+        if (!s_pyro_rep.armed) { usb_printf("ERR FIRE not armed\n"); return; }
+        const uint16_t pulse = actcon_clamp_pulse((uint16_t)(ms < 0 ? 0 : ms > 65535 ? 65535 : ms));
+        pyro_bridge_send(ACTCON_CMD_FIRE, (uint8_t)pch, pulse, 3);
+        usb_printf("OK FIRE %ld %u ms\n", pch, pulse);
+        return;
+    }
+    usb_printf("ERR unknown '%s'\n", cmd);
+}
+
+// ---- telemetry lines ---------------------------------------------------------
+static inline uint16_t counts_to_us(uint16_t c)
+{
+    return (uint16_t)((float)c / (4096.0f * s_pwm_hz * 1e-6f) + 0.5f);
+}
+
+static void diag_emit(void)
+{
+    static uint32_t next_ms = 0;
+    static uint8_t  which = 0;
+    if (!Serial) return;
+    if (millis() < next_ms) return;
+    next_ms = millis() + 20;
+
+    char b[400];
+    int n = 0;
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")
+    switch (which) {
+    case 0: {       // T: the Actuator Console's line, key for key
+        uint16_t on = 0, us[PCA_N_CH];
+        for (uint8_t ch = 0; ch < PCA_N_CH; ch++) {
+            if (s_test) {
+                us[ch] = s_test_us[ch];
+                if (s_test_us[ch] && s_test_awake[ch]) on = (uint16_t)(on | (1u << ch));
+            } else {
+                us[ch] = ch < PCA_N_USED ? counts_to_us(s_servo_counts[ch]) : 0;
+                if (ch < PCA_N_USED) on = (uint16_t)(on | (1u << ch));
+            }
+        }
+        const bool rep = s_test && pyro_rep_fresh();
+        n = snprintf(b, sizeof(b),
+            "T {\"t\":%lu,\"pca\":%d,\"hz\":%.0f,\"rbf\":%d,\"vbat\":%.2f,\"i\":%.2f,\"imax\":%.2f,"
+            "\"idle\":%lu,\"maxus\":%.0f,\"on\":%u,\"us\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+            "\"nav\":%d,\"arm\":%d,\"arm_left\":%.1f,\"cont\":[%u,%u,%u],\"thr\":%u,\"cmask\":%u,"
+            "\"fired\":%u,\"firing\":%u,\"rej\":%u,\"test\":%d}\n",
+            (unsigned long)millis(), s_servo_ok ? 1 : 0, s_pwm_hz, s_rbf_out ? 1 : 0, s_vbat,
+            s_amps_now, s_amps_max, (unsigned long)s_test_idle_ms, test_max_pulse_us(), on,
+            us[0], us[1], us[2], us[3], us[4], us[5], us[6], us[7], us[8], us[9], us[10],
+            us[11], us[12], us[13], us[14], us[15],
+            rep ? 1 : 0, rep ? s_pyro_rep.armed : 0, rep ? s_pyro_rep.arm_left_ds / 10.0f : 0.0f,
+            s_pyro_rep.raw[0], s_pyro_rep.raw[1], s_pyro_rep.raw[2], s_pyro_rep.threshold,
+            rep ? s_pyro_rep.cont_mask : (s_have_nav_status ? s_nav_status.pyro_cont : 0),
+            rep ? s_pyro_rep.fired_mask : (s_have_nav_status ? s_nav_status.pyro_fired : 0),
+            rep ? s_pyro_rep.firing_mask : (s_have_nav_status ? s_nav_status.pyro_active : 0),
+            rep ? s_pyro_rep.last_reject : 0, s_test ? 1 : 0);
+        break;
+    }
+    case 1:         // M: this board
+        n = snprintf(b, sizeof(b),
+            "M {\"t\":%lu,\"fw\":%d,\"gv\":%d,\"st\":%u,\"fl\":%u,\"tl\":%lu,\"vbat\":%.2f,\"i\":%.2f,"
+            "\"rbf\":%d,\"bw\":%d,\"post\":%d,\"servo\":%d,\"flash\":%d,\"lora\":%d,\"log\":%lu,"
+            "\"logdrop\":%lu,\"tlm\":[%lu,%lu],\"pos\":[%lu,%lu,%d],\"nav\":[%lu,%lu,%d],"
+            "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu}\n",
+            (unsigned long)millis(), ARIADNA_FW_VERSION, DG_VERSION, s_state, s_flags,
+            (unsigned long)s_t_launch_ms, s_vbat, s_current, s_rbf_out ? 1 : 0,
+            digitalRead(PIN_BREAKWIRE) == HIGH ? 1 : 0, s_post_pass ? 1 : 0, s_servo_ok ? 1 : 0,
+            s_flash_ok ? 1 : 0, s_lora_ok ? 1 : 0, (unsigned long)s_log_addr,
+            (unsigned long)s_log_dropped, (unsigned long)s_tlm_sent, (unsigned long)s_tlm_skipped,
+            (unsigned long)s_rx_pos.rx_ok, (unsigned long)(s_rx_pos.rx_crc + s_rx_pos.rx_len),
+            (s_have_nav && link_alive(s_nav_us)) ? 1 : 0,
+            (unsigned long)s_rx_nav.rx_ok, (unsigned long)(s_rx_nav.rx_crc + s_rx_nav.rx_len),
+            (s_have_act && link_alive(s_act_us)) ? 1 : 0,
+            s_param_crc, params_synced() ? 1 : 0, s_params_from_eeprom ? 1 : 0,
+            s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped);
+        break;
+    case 2:         // N: the navigation state
+        n = snprintf(b, sizeof(b),
+            "N {\"p\":[%.2f,%.2f,%.2f],\"v\":[%.2f,%.2f,%.2f],\"a\":[%.2f,%.2f,%.2f],"
+            "\"q\":[%.4f,%.4f,%.4f,%.4f],\"u\":[%.3f,%.3f,%.3f],\"w\":[%.3f,%.3f,%.3f],"
+            "\"g\":%.2f,\"fl\":%u,\"ql\":%u,\"ok\":%d}\n",
+            s_nav.px, s_nav.py, s_nav.pz, s_nav.vx, s_nav.vy, s_nav.vz,
+            s_nav.ax, s_nav.ay, s_nav.az, s_nav.qw, s_nav.qx, s_nav.qy, s_nav.qz,
+            s_nav.ux, s_nav.uy, s_nav.uz, s_nav.wx, s_nav.wy, s_nav.wz,
+            s_nav.accel_mag, s_nav.flags, s_nav.quality,
+            (s_have_nav && link_alive(s_nav_us)) ? 1 : 0);
+        break;
+    case 3:         // P: Position MCU status
+        n = snprintf(b, sizeof(b),
+            "P {\"ok\":%d,\"fw\":%u,\"pcrc\":%u,\"pseen\":%u,\"rpy\":[%.1f,%.1f,%.1f],\"lat\":%ld,"
+            "\"lon\":%ld,\"galt\":%.1f,\"sats\":%u,\"fix\":%u,\"hdop\":%u,\"temp\":%.1f,"
+            "\"sig\":[%.2f,%.2f],\"uwb\":[%u,%u,%u,%u],\"uwbs\":[%.2f,%.2f],\"trim\":%.2f,"
+            "\"lidar\":[%.2f,%u],\"ins\":%u,\"att\":%u,\"hz\":%.0f,\"sens\":%u,\"ovf\":%u,"
+            "\"cal\":%u,\"rx\":[%lu,%lu],\"pp\":%.0f}\n",
+            pos_status_fresh() ? 1 : 0, s_pos_status.fw_version, s_pos_status.param_crc,
+            s_pos_status.params_seen, s_pos_status.roll, s_pos_status.pitch, s_pos_status.yaw,
+            (long)s_pos_status.lat, (long)s_pos_status.lon, s_pos_status.gps_alt,
+            s_pos_status.sats, s_pos_status.fix, s_pos_status.hdop_x10, s_pos_status.temp_c,
+            s_pos_status.sigma_pos_h, s_pos_status.sigma_vel_h, s_pos_status.uwb_anchors,
+            s_pos_status.uwb_mask, s_pos_status.uwb_mode, s_pos_status.uwb_rejects,
+            s_pos_status.uwb_sigma_h, s_pos_status.uwb_resid, s_pos_status.baro_trim,
+            s_pos_status.lidar_m, s_pos_status.lidar_strength, s_pos_status.ins_mode,
+            s_pos_status.att_src, s_pos_status.fusion_hz, s_pos_status.sensor_ok,
+            s_pos_status.imu_overflow, s_pos_status.cal_state,
+            (unsigned long)s_pos_status.rx_ok, (unsigned long)s_pos_status.rx_bad,
+            s_pos_status.pad_pressure);
+        break;
+    default:        // G: guidance / Navigation MCU status and what it commands
+        n = snprintf(b, sizeof(b),
+            "G {\"ok\":%d,\"fw\":%u,\"pcrc\":%u,\"pseen\":%u,\"ph\":%u,\"k\":%.2f,\"thr\":%.1f,"
+            "\"hign\":%.1f,\"tc\":%.3f,\"te\":%.3f,\"roll\":%.2f,\"tign\":%.2f,\"ttd\":%.2f,"
+            "\"ts\":%.3f,\"fg\":%.2f,\"apo\":%.1f,\"res\":%.2f,\"rx\":[%lu,%lu],\"plan\":%lu,"
+            "\"loop\":%u,\"ovr\":%u,\"cont\":%u,\"fired\":%u,\"act\":%u,\"nfl\":%u,\"ev\":%u,"
+            "\"tvc\":[%.2f,%.2f],\"cl\":%.2f,\"fin\":[%.1f,%.1f,%.1f,%.1f],\"afl\":%u}\n",
+            nav_status_fresh() ? 1 : 0, s_nav_status.fw_version, s_nav_status.param_crc,
+            s_nav_status.params_seen, s_nav_status.phase, s_nav_status.k_plan,
+            s_nav_status.thrust_est, s_nav_status.h_ignite, s_nav_status.tilt_cmd,
+            s_nav_status.tilt_err, s_nav_status.roll_rate, s_nav_status.t_to_ign,
+            s_nav_status.t_to_td, s_nav_status.t_scale, s_nav_status.fin_gain,
+            s_nav_status.h_apogee, s_nav_status.plan_resid,
+            (unsigned long)s_nav_status.rx_ok, (unsigned long)s_nav_status.rx_bad,
+            (unsigned long)s_nav_status.plan_iters, s_nav_status.loop_max_us,
+            s_nav_status.overruns, s_nav_status.pyro_cont, s_nav_status.pyro_fired,
+            s_nav_status.pyro_active, s_nav_status.flags, s_nav_status.events,
+            s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp, s_act.fin_deg[0], s_act.fin_deg[1],
+            s_act.fin_deg[2], s_act.fin_deg[3], s_act.flags);
+        break;
+    }
+    _Pragma("GCC diagnostic pop")
+    which = (uint8_t)((which + 1) % 5);
+    if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
 }
 
 // =====================================================================
@@ -1168,6 +2002,9 @@ void setup()
     analogReadResolution(12);
 
     Serial.begin(ARIADNA_CONSOLE_BAUD);
+
+    // Parameters before anything that reads one (servo trims, below).
+    params_load();
 
     // 0xFF: the SK6812 is powered from the board's own rail, so there is
     // no LED power-enable pin to drive as there is on the XIAOs.
@@ -1207,13 +2044,19 @@ void setup()
     memset(&s_act,        0, sizeof(s_act));
     memset(&s_nav_status, 0, sizeof(s_nav_status));
     memset(&s_pos_status, 0, sizeof(s_pos_status));
+    memset(&s_pyro_rep,   0, sizeof(s_pyro_rep));
+    s_nav.qw = 1.0f;
     s_act.clamp = DG_CLAMP_MAX;
+    for (uint8_t i = 0; i < PCA_N_CH; i++) {
+        s_test_lim_lo[i] = (uint16_t)SERVO_US_MIN;
+        s_test_lim_hi[i] = (uint16_t)SERVO_US_MAX;
+    }
 
     s_post_pass = self_test();
     MASTER_PRINT("\nAriadna V2 Master MCU — POST %s\n", s_post_pass ? "PASS" : "FAIL");
-    MASTER_PRINT("# servo bus %s, flash %s, guidance entry %.0f m\n",
-                 s_servo_ok ? "ok" : "FAIL", s_flash_ok ? "ok" : "FAIL",
-                 GUIDANCE_ENTRY_M);
+    MASTER_PRINT("# fw %d, servo bus %s, flash %s, parameters from %s\n",
+                 ARIADNA_FW_VERSION, s_servo_ok ? "ok" : "FAIL", s_flash_ok ? "ok" : "FAIL",
+                 s_params_from_eeprom ? "EEPROM" : "DEFAULTS");
 
     // Release the Navigation MCU now that both UARTs are up.
     digitalWrite(PIN_RST_NAV, HIGH);
@@ -1226,7 +2069,6 @@ void loop()
     static uint32_t next_us   = 0;
     static uint32_t next_log_ms = 0;
     static uint32_t next_bcast_ms = 0;
-    static uint32_t next_print_ms = 0;
     const  uint32_t period    = 5000;      // 200 Hz
 
     uint32_t now = micros();
@@ -1243,6 +2085,9 @@ void loop()
     // ---- housekeeping ---------------------------------------------------
     read_analogue();
     state_machine();
+    params_stream();
+    usb_service();        // diagnostic GUI: a no-op unless a host has the port open
+    if (s_test) test_service();
     annunciate();
     ariadna_rgb_service(&s_rgb);
     ariadna_buzzer_service(&s_buzz);
@@ -1300,7 +2145,16 @@ void loop()
         r.tvc_y = s_act.tvc_y_deg;
         r.clamp = s_act.clamp;
         r.thrust_est = s_have_nav_status ? s_nav_status.thrust_est : 0.0f;
-        r.p_plan     = s_have_nav_status ? s_nav_status.p_plan : 0.0f;
+        r.k_plan     = s_have_nav_status ? s_nav_status.k_plan : 0.0f;
+        r.events     = s_have_nav_status ? s_nav_status.events : 0;
+        {
+            float te = !s_have_nav_status ? -1.0f
+                     : (s_nav_status.phase >= DG_PHASE_IGNITING ? s_nav_status.t_to_td
+                                                                : s_nav_status.t_to_ign);
+            r.t_event_ds = (int8_t)(te < 0.0f ? -1 : (te > 12.7f ? 127 : (int)(te * 10.0f)));
+            float fg = s_have_nav_status ? s_nav_status.fin_gain * 100.0f : 0.0f;
+            r.fin_gain_pct = (uint8_t)(fg > 255.0f ? 255.0f : (fg < 0.0f ? 0.0f : fg));
+        }
         r.vbat_mv    = (uint16_t)(s_vbat * 1000.0f);
         r.current_ma = (uint16_t)(s_current * 1000.0f);
         r.nav_flags  = s_nav.flags;
@@ -1314,22 +2168,9 @@ void loop()
         log_push(&r);
     }
 
-    // ---- USB console, last and rate limited ------------------------------
-    if (millis() >= next_print_ms) {
-        next_print_ms = millis() + 500;
-        MASTER_PRINT("st=%u h=%.1f vz=%.1f tvc=%.2f/%.2f clamp=%.2f "
-                     "vb=%.2f i=%.2f pos=%lu/%lu nav=%lu/%lu drop=%lu tlm=%lu/%lu\n",
-                     s_state, s_nav.pz, s_nav.vz,
-                     s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp,
-                     s_vbat, s_current,
-                     (unsigned long)s_rx_pos.rx_ok,
-                     (unsigned long)(s_rx_pos.rx_crc + s_rx_pos.rx_len),
-                     (unsigned long)s_rx_nav.rx_ok,
-                     (unsigned long)(s_rx_nav.rx_crc + s_rx_nav.rx_len),
-                     (unsigned long)s_log_dropped,
-                     (unsigned long)s_tlm_sent,
-                     (unsigned long)s_tlm_skipped);
-    }
+    // ---- USB diagnostics ----------------------------------------------------
+    // Last, and only queued here: usb_service() above does the sending.
+    diag_emit();
 }
 
 // =====================================================================
@@ -1338,8 +2179,6 @@ void loop()
 //  Everything here can block for tens or hundreds of milliseconds. That is
 //  precisely why it is here and not on core 0.
 // =====================================================================
-static uint32_t s_log_addr       = 0;
-static uint32_t s_log_erased_to  = 0;   // everything below this is erased
 
 /**
  * Keep erased space ahead of the write pointer.
