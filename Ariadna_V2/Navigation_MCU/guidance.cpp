@@ -1,236 +1,271 @@
 // =====================================================================
-//  Daidalos landing guidance — implementation
+//  Daidalos landing guidance, version 2 — implementation
 //
-//  RP2350 notes (Cortex-M33 @ 150 MHz, FPv5-SP single precision):
+//  See guidance.h for the interface and the frames, and the LandSim_Light
+//  README, "The flight algorithm, step by step", for the reasoning behind
+//  every number. Section numbers below (S3, S4 ...) refer to that text.
 //
-//   * float only. Every literal carries an `f`. A bare `1.0` promotes the
-//     whole expression to double, which is software-emulated and 10-50x
-//     slower on this core.
-//   * The thrust direction is carried as a NORMALISED VECTOR, never as an
-//     angle. That removes atan2f from the guidance law and sinf/cosf from
-//     the projection inner loop — together about 65 % of the cost of a
-//     projection step, and the biggest single win in the port.
-//   * asinf is replaced by x + x^3/6. The nozzle never exceeds 5 deg,
-//     where that series is accurate to better than 1e-5 rad.
-//   * The trajectory projection integrates with RK2 at dt = 0.04 s.
-//   * The root find is a safeguarded false-position (Illinois) solve,
-//     warm-started from the previous answer, and AMORTISED: one projection
-//     per call. A full solve costs ~7 projections, so it converges in
-//     ~35 ms at 200 Hz — well inside the 100 ms replan period — without
-//     ever producing a multi-millisecond spike.
-//   * No malloc, no recursion, no unbounded loops in the flight path.
-//
-//  Measured budget for this structure: ~0.8 % of one core for the planner
-//  at 10 Hz plus ~0.05 % for the 200 Hz attitude loop.
+//  RULES OF THIS FILE
+//    * float only. The M33 has no double-precision hardware.
+//    * no malloc, no recursion, every loop has a compile-time bound.
+//    * everything that divides is clamped first (t_go, 1/T, 1/q, the axial
+//      airspeed in the crossflow term). Each of them blows up somewhere in
+//      a real flight.
 // =====================================================================
 #include "guidance.h"
+
 #include <math.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------
-//  Motor: thrust against NORMALISED burn time tau in [0,1].
-//  The grain burns on its own clock; the clamp cannot slow it down, so tau
-//  advances with wall time and NOT with the commanded thrust.
-//
-//  MEASURED ON THE STAND, not a design curve. The stand reported, for each
-//  fraction of peak thrust, the instants the thrust crossed it going up and
-//  coming back down, timed from the ignition command:
-//
-//     %peak      N     rise[s]  decay[s]        %peak      N     rise    decay
-//        5     6.02    1.4500   4.0633            75    90.31   1.7555  3.2416
-//       10    12.04    1.5000   3.9964            90   108.37   1.8732  3.0369
-//       25    30.10    1.5643   3.7841            95   114.39   1.9048  2.9239
-//       50    60.20    1.5914   3.5436           100   120.41   2.7047  2.7047
-//
-//  Re-referenced below to thrust ONSET rather than to the command, so tau = 0
-//  is when thrust starts and the 1.4 s of nothing before it lives in
-//  DG_IGN_DELAY_LO/HI. The two zero end points are a linear extrapolation of
-//  the measured 5-10 % segments and carry 0.35 N.s between them, 0.16 %.
-//
-//  THIS MOTOR IS NOT THE ONE THE ENVELOPE WAS SIZED AGAINST. Peak thrust is
-//  120.41 N where the placeholder assumed 230, the burn is 2.73 s not 1.75,
-//  and the igniter takes 1.25-1.80 s rather than 0.10-0.30 s. Read the entry
-//  envelope in ../README.md before flying anything: the vehicle can no longer
-//  reach most of it.
+//  small helpers
 // ---------------------------------------------------------------------
-static const int   TCURVE_N = 17;
-static const float TCURVE_TAU[17] = {
-    0.000000f, 0.018314f, 0.036627f, 0.060179f, 0.070105f, 0.130210f,
-    0.173321f, 0.184895f, 0.477877f, 0.558164f, 0.599553f, 0.674529f,
-    0.785144f, 0.873233f, 0.950993f, 0.975496f, 1.000000f
-};
-static const float TCURVE_F[17] = {
-      0.00f,   6.02f,  12.04f,  30.10f,  60.20f,  90.31f,
-    108.37f, 114.39f, 120.41f, 114.39f, 108.37f,  90.31f,
-     60.20f,  30.10f,  12.04f,   6.02f,   0.00f
-};
-
-// Uniform resample of the curve, built once at init so the flight path never
-// runs the 17-point linear scan. O(1): one truncate, two loads and a lerp.
-//
-// It now spans the full [0, 1] and there is no special leading-ramp case. The
-// old curve rose to 215 N in the first 1.1 % of the burn, which no coarse
-// uniform grid could resample, so the ramp below TAU_IGN was evaluated exactly
-// instead. The measured curve has no such spike: it climbs to 5 % over the
-// first 1.8 %, and its steepest stretch is in the MIDDLE (25 % to 50 % of peak
-// in 10 ms). A special case at the start would do nothing for that, so the
-// table is simply finer.
-//
-// 512 intervals is 5.3 ms per cell: worst resampling error 0.68 N, 0.56 % of
-// peak, and the total impulse comes back exact to 3 decimal places. 2052 bytes
-// against 520 KB of SRAM. A 64-entry table -- what the old spiky curve used --
-// would smear the 25-50 % knee by 9.1 N.
-#define TLUT_N   512
-static float s_tlut[TLUT_N + 1];
-
-// Minimum ignition altitude against entry vertical speed at DG_H_START.
-// Generated offline by the simulation's find_ignition() solve, which costs
-// ~46 ms and must never run in flight. Horizontal entry speed changes this by
-// less than 0.3 m across 0..15 m/s, so the table is one-dimensional.
-//
-// These are three times the altitudes the placeholder motor needed (38.9 m at
-// 20 m/s where it wanted 18.7), because the peak thrust halved. Above ~45 m/s
-// the required altitude exceeds DG_H_START outright and the entry is simply
-// infeasible -- the table stops there rather than pretending otherwise.
-static const int   IGN_N = 6;
-static const float IGN_VZ[6]   = { 20.0f, 25.0f, 30.0f, 35.0f, 40.0f, 45.0f };
-static const float IGN_HMIN[6] = { 38.90f, 42.20f, 46.26f, 51.11f, 56.88f, 83.29f };
-
-// tan(max_tilt) against altitude. max_tilt = min(45 deg, 3*h + 5 deg).
-#define TAN_N 32
-#define TAN_H_MAX 15.0f          // above this the 45 deg cap applies, tan = 1
-static float s_tanlut[TAN_N + 1];
-
-// ---------------------------------------------------------------------
-//  Small helpers
-// ---------------------------------------------------------------------
-static inline float clampf(float v, float lo, float hi) {
+static inline float clampf(float v, float lo, float hi)
+{
     return v < lo ? lo : (v > hi ? hi : v);
 }
-
-// Release barrier for the one cross-core handover in this file.
-//
-// The planner runs on core 1 and returns immediately unless S.phase is BURN, so
-// S.phase is what publishes the solver state to it. Everything the planner will
-// read must be stored BEFORE that phase write becomes visible, or core 1 can
-// start iterating on a half-reset solver. This is the only ordering constraint
-// in the module: every other shared item is a naturally aligned 32-bit word,
-// where a torn read is impossible and a stale read is harmless.
-#if defined(__GNUC__)
-#define DG_PUBLISH()  __atomic_thread_fence(__ATOMIC_RELEASE)
-#else
-#define DG_PUBLISH()  ((void)0)
-#endif
-
-// asin for small arguments: |x| <= sin(5 deg) here, error < 1e-5 rad.
-static inline float fast_asinf(float x) {
-    x = clampf(x, -0.30f, 0.30f);
-    return x + x * x * x * (1.0f / 6.0f);
-}
-
-float dg_thrust_ref(float tau) {
-    if (tau <= 0.0f || tau >= 1.0f) return 0.0f;
-    float f = tau * (float)TLUT_N;
-    int   i = (int)f;
-    if (i >= TLUT_N) return 0.0f;
-    float w = f - (float)i;
-    return s_tlut[i] + (s_tlut[i + 1] - s_tlut[i]) * w;
-}
-
-static float tan_max_tilt(float h) {
-    if (h >= TAN_H_MAX) return 1.0f;            // 45 deg cap
-    if (h <= 0.0f)      return s_tanlut[0];
-    float f = h * ((float)TAN_N / TAN_H_MAX);
-    int   i = (int)f;
-    float w = f - (float)i;
-    return s_tanlut[i] + (s_tanlut[i + 1] - s_tanlut[i]) * w;
-}
-
-// ---------------------------------------------------------------------
-//  Guidance law — thrust DIRECTION as a unit vector, no angle, no atan2.
-//
-//    t_go = 2h / |vz|                (time to go, constant deceleration)
-//    a_x  = -vx / t_go               (optimal for a terminal VELOCITY
-//                                     constraint with free final position)
-//    a_z  = |vz| / t_go + g
-//  plus a credit for the drag that is already decelerating the vehicle, so
-//  the law stops asking thrust to do work the air is doing for free.
-//  Returns t_go; writes the unit thrust direction to sin_th / cos_th.
-// ---------------------------------------------------------------------
-float dg_guidance_tilt(float h, float vx, float vz, float mass,
-                       float *sin_th, float *cos_th)
+static inline float dot3(const float a[3], const float b[3])
 {
-    float avz = fabsf(vz);
-    float svz = avz > 0.5f ? avz : 0.5f;
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+static inline void cross3(const float a[3], const float b[3], float o[3])
+{
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+static const float DEG = 0.01745329252f;      // rad per degree
+static const float RAD = 57.29577951f;        // degrees per rad
+
+// ---------------------------------------------------------------------
+//  parameters
+// ---------------------------------------------------------------------
+static dg_params_t P;
+
+void dg_params_default(dg_params_t *p)
+{
+    p->mass_gross    = DG_M_GROSS;
+    p->mass_prop     = DG_M_PROP;
+    p->wn_tvc        = DG_WN_TVC;
+    p->zeta_tvc      = DG_ZETA_TVC;
+    p->sched_tvc     = DG_SCHED_TVC;
+    p->att_ki        = 2.0f;
+    p->att_i_lim     = 0.05f;
+    p->wn_fin        = DG_WN_FIN;
+    p->zeta_fin      = DG_ZETA_FIN;
+    p->sched_fin     = DG_SCHED_FIN;
+    p->roll_gain     = DG_ROLL_GAIN;
+    p->roll_max_deg  = 2.0f;
+    p->tilt_min_deg  = 1.5f;
+    p->tilt_slope    = 1.5f;
+    p->tilt_cap_deg  = 20.0f;
+    p->alt_pad       = 1.0f;
+    p->h_ign_bias    = 0.0f;
+    p->h_ign_override = 0.0f;
+    p->plan_target   = -0.5f;
+    p->plan_margin   = 0.03f;
+    p->plan_hold     = 0.30f;
+    p->onset_bump    = 4.0f;
+    p->onset_timeout = 0.5f;
+    p->onset_assumed = 0.15f;
+    p->fin_enable    = 1.0f;
+    p->fin_max_deg   = DG_FIN_MAX_DEG;
+    p->fin_brake     = 1.0f;
+    p->fin_min_airspeed = 8.0f;
+    p->fin_drift_gain   = 1.5f;
+    p->fin_drift_max_deg = 5.0f;
+    p->fin_ctrl_lead = 40.0f;
+    p->fin_ascent_mode = 2.0f;
+    p->fin_adapt     = 1.0f;
+    p->fin_gain0     = 1.0f;
+}
+
+// ---------------------------------------------------------------------
+//  state
+//
+//  Core 0 owns everything here except the three planner outputs, which
+//  core 1 writes. Every cross-core field is one naturally aligned 32-bit
+//  word: a torn read is impossible and a stale one is one planner period
+//  old, which is what a 10 Hz plan is anyway.
+// ---------------------------------------------------------------------
+typedef struct {
+    volatile dg_phase_t phase;
+    volatile float t;            // s, this module's own clock (ticks * dt)
+    float h_apogee, vh_apogee;
+    float h_cmd;                 // commanded ignition altitude
+    float t_cmd;                 // time of the ignition command
+    volatile float t_burn0;      // time of thrust onset (valid in BURN)
+    bool  onset_detected;        // false while the onset is only assumed
+    bool  lidar_acquired;
+    float a_base;                // axial specific force just before the command
+    uint8_t bump_ticks;
+    volatile float t_scale;      // estimated thrust / table
+    float k_act;                 // modelled clamp position
+    float k_cmd;
+    bool  gate_open;             // clamp held open through the startup
+    float ie[3];                 // attitude error integral
+    float t_done;
+    // planner outputs (core 1)
+    volatile float k_level;
+    volatile float plan_resid;
+    volatile float t_td_abs;     // predicted touchdown, on this module's clock
+    volatile float t_plan;       // when the plan was made
+    volatile float t_nom_burn;   // DESCENT: predicted command-to-touchdown time
+    // fin adaptation
+    float kappa;
+    float trim[3];               // rad: axis 1, axis 2, roll
+    float w_prev[3];
+    bool  w_prev_ok;
+    float yf[3], rf[3];          // filtered measurements and regressors
+    float ym[3], rm[3];          // their slow means
+    float r_hist[4][3];          // regressor delay line
+    uint8_t r_pos;
+    float fin_last[4];
+} dg_state_t;
+
+static dg_state_t S;
+
+void dg_set_params(const dg_params_t *p) { P = *p; }
+const dg_params_t *dg_get_params(void)   { return &P; }
+
+void dg_init(void)
+{
+    static bool have_params = false;
+    if (!have_params) { dg_params_default(&P); have_params = true; }
+    memset(&S, 0, sizeof(S));
+    S.phase     = DG_PHASE_IDLE;
+    S.t_scale   = 1.0f;
+    S.k_act     = DG_CLAMP_MAX;
+    S.k_cmd     = DG_CLAMP_MAX;
+    S.k_level   = DG_CLAMP_MAX;
+    S.gate_open = true;
+    S.t_burn0   = -1.0f;
+    S.t_td_abs  = -1.0f;
+    S.t_nom_burn = -1.0f;
+    S.kappa     = clampf(P.fin_gain0, 0.4f, 2.0f);
+}
+
+// =====================================================================
+//  MOTOR TABLE (S11: thrust and cumulative impulse against time)
+// =====================================================================
+static inline uint8_t motor_seg(float t)
+{
+    // last index i with T[i] <= t; the table has 17 points, a scan is fine
+    uint8_t i = 1;
+    while (i + 1 < DG_MOTOR_N - 1 && DG_MOTOR_T[i + 1] <= t) i++;
+    return i;
+}
+
+float dg_thrust_ref(float t)
+{
+    if (t < 0.0f || t > DG_BURN_T) return 0.0f;
+    uint8_t i = motor_seg(t);
+    float span = DG_MOTOR_T[i + 1] - DG_MOTOR_T[i];
+    if (span < 1e-9f) return DG_MOTOR_F[i + 1];
+    float f = (t - DG_MOTOR_T[i]) / span;
+    return DG_MOTOR_F[i] + f * (DG_MOTOR_F[i + 1] - DG_MOTOR_F[i]);
+}
+
+float dg_burned(float t)
+{
+    if (t <= 0.0f)       return 0.0f;
+    if (t >= DG_BURN_T)  return P.mass_prop;
+    uint8_t i = motor_seg(t);
+    float span = DG_MOTOR_T[i + 1] - DG_MOTOR_T[i];
+    float f = span < 1e-9f ? 1.0f : (t - DG_MOTOR_T[i]) / span;
+    float cum = DG_MOTOR_CUM[i] + f * (DG_MOTOR_CUM[i + 1] - DG_MOTOR_CUM[i]);
+    return P.mass_prop * cum / DG_I_TOTAL;
+}
+
+static inline float mass_at(float t_burn)
+{
+    return P.mass_gross - dg_burned(t_burn);
+}
+
+// =====================================================================
+//  IGNITION ALTITUDE (S3) — computed on the ground, looked up in flight
+// =====================================================================
+float dg_h_cmd_lookup(float h_apogee, float vh)
+{
+    float fh = (h_apogee - DG_IGN_H0) / DG_IGN_DH;
+    fh = clampf(fh, 0.0f, (float)(DG_IGN_NH - 1));
+    int ih = (int)fh;
+    if (ih > DG_IGN_NH - 2) ih = DG_IGN_NH - 2;
+    float th = fh - (float)ih;
+
+    vh = clampf(fabsf(vh), DG_IGN_VX[0], DG_IGN_VX[DG_IGN_NV - 1]);
+    int iv = 0;
+    while (iv < DG_IGN_NV - 2 && DG_IGN_VX[iv + 1] <= vh) iv++;
+    float tv = (vh - DG_IGN_VX[iv]) / (DG_IGN_VX[iv + 1] - DG_IGN_VX[iv]);
+
+    float a = DG_IGN_TABLE[ih][iv]     + tv * (DG_IGN_TABLE[ih][iv + 1]     - DG_IGN_TABLE[ih][iv]);
+    float c = DG_IGN_TABLE[ih + 1][iv] + tv * (DG_IGN_TABLE[ih + 1][iv + 1] - DG_IGN_TABLE[ih + 1][iv]);
+    return a + th * (c - a);
+}
+
+float dg_h_ignite(void) { return S.h_cmd; }
+
+void dg_begin_ascent(void)
+{
+    if (S.phase == DG_PHASE_IDLE) S.phase = DG_PHASE_ASCENT;
+}
+
+void dg_begin_descent(float h_apogee, float vh_apogee)
+{
+    if (S.phase != DG_PHASE_IDLE && S.phase != DG_PHASE_ASCENT) return;
+    S.h_apogee  = h_apogee;
+    S.vh_apogee = vh_apogee;
+    float h = (P.h_ign_override > 0.0f)
+            ? P.h_ign_override
+            : dg_h_cmd_lookup(h_apogee, vh_apogee) + P.h_ign_bias;
+    // The command may never sit above where the vehicle already is.
+    if (h > h_apogee - 2.0f) h = h_apogee - 2.0f;
+    if (h < 5.0f)            h = 5.0f;
+    S.h_cmd = h;
+    S.phase = DG_PHASE_DESCENT;
+}
+
+// =====================================================================
+//  GUIDANCE LAW (S4): commanded thrust direction
+// =====================================================================
+float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
+                      float *ux, float *uy, float *uz)
+{
+    float svz = fabsf(vz) > 0.5f ? fabsf(vz) : 0.5f;
     float hh  = h > 0.1f ? h : 0.1f;
     float t_go = 2.0f * hh / svz;
     if (t_go < 0.25f) t_go = 0.25f;
 
-    float ax = -vx / t_go;
-    float az = avz / t_go + DG_G;
+    float k_h = 1.0f / t_go;
+    float ax = -k_h * vx;
+    float ay = -k_h * vy;
+    float az = fabsf(vz) / t_go + DG_G;
 
-    // drag credit
-    float v2 = vx * vx + vz * vz;
-    if (v2 > 0.0001f) {
-        float v  = sqrtf(v2);
-        float df = 0.5f * DG_RHO * DG_AREA * DG_CD_AXIAL * v2 / mass;
-        ax += df * vx / v;      // drag already fights vx
-        az += df * vz / v;      // vz < 0 descending, so this LOWERS the demand
+    // credit the drag: the air is already decelerating the vehicle
+    float v = sqrtf(vx * vx + vy * vy + vz * vz);
+    if (v > 0.01f) {
+        float df = 0.5f * DG_RHO * DG_AREA * DG_CD_BODY * v * v;
+        float s  = df / (v * mass);
+        ax += s * vx;
+        ay += s * vy;
+        az += s * vz;
     }
-
     if (az < 0.1f) az = 0.1f;
 
-    // tilt limit, applied in vector form
-    float tmax = tan_max_tilt(h);
-    float lim  = az * tmax;
-    if (ax >  lim) ax =  lim;
-    if (ax < -lim) ax = -lim;
-
-    float n = sqrtf(ax * ax + az * az);
-    if (n < 1e-6f) { *sin_th = 0.0f; *cos_th = 1.0f; return t_go; }
-    *sin_th = ax / n;
-    *cos_th = az / n;
-    return t_go;
-}
-
-// ---------------------------------------------------------------------
-//  3-D commanded direction. Costs one square root more than the planar law.
-//
-//  The 3-D solution is EXACTLY the planar one rotated into the azimuth of the
-//  horizontal velocity, because every horizontal term in the law -- the -v/t_go
-//  demand and the drag credit -- is parallel to that velocity. Verified against
-//  the model to 2e-16 over 200 000 states, so this is an identity and not an
-//  approximation. It is also why the trajectory projection below never needs a
-//  second horizontal channel.
-// ---------------------------------------------------------------------
-float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
-                      float *ux, float *uy, float *uz)
-{
-    float vh2 = vx * vx + vy * vy;
-    float sn, cs;
-    float t_go = dg_guidance_tilt(h, sqrtf(vh2), vz, mass, &sn, &cs);
-    *uz = cs;
-    if (vh2 > 1e-12f) {
-        float inv = sn / sqrtf(vh2);
-        *ux = vx * inv;
-        *uy = vy * inv;
-    } else {
-        *ux = 0.0f;
-        *uy = 0.0f;
+    // tilt cone: wide up high, tight near the pad, the same in every azimuth
+    float max_tilt = clampf(h * P.tilt_slope + P.tilt_min_deg, 0.0f, P.tilt_cap_deg) * DEG;
+    float tmax = tanf(max_tilt);
+    float rh = sqrtf(ax * ax + ay * ay);
+    if (rh > tmax * az && rh > 1e-12f) {
+        float s = tmax * az / rh;
+        ax *= s;
+        ay *= s;
     }
+    float n = 1.0f / sqrtf(ax * ax + ay * ay + az * az);
+    *ux = ax * n;  *uy = ay * n;  *uz = az * n;
     return t_go;
 }
 
-// ---------------------------------------------------------------------
-//  Gimbal axes: an orthonormal basis of the plane perpendicular to b, built by
-//  orthogonalising the BODY-FIXED reference axis g against b.
-//
-//  Because g is body-fixed, u1 and u2 turn with the airframe. That is the whole
-//  reason g is on the wire: the servos are bolted to the vehicle, so as it rolls
-//  the direction each one pushes rotates with it. A basis anchored to world x
-//  would drift away from the hardware at the roll rate, and the only symptom
-//  would be a vehicle steering somewhere other than where it meant to.
-// ---------------------------------------------------------------------
 void dg_gimbal_basis(float bx, float by, float bz,
                      float gx, float gy, float gz,
                      float *u1x, float *u1y, float *u1z,
@@ -238,565 +273,767 @@ void dg_gimbal_basis(float bx, float by, float bz,
 {
     float d  = gx * bx + gy * by + gz * bz;
     float ax = gx - d * bx, ay = gy - d * by, az = gz - d * bz;
-    float n2 = ax * ax + ay * ay + az * az;
-    if (n2 < 1e-9f) {
-        // g has collapsed onto b. Cannot happen in flight; can happen to a caller
-        // sending garbage. Fall back to the world-x projection so the loop still
-        // produces a sane deflection rather than a NaN.
-        ax = 1.0f - bx * bx; ay = -bx * by; az = -bx * bz;
-        n2 = ax * ax + ay * ay + az * az;
-        if (n2 < 1e-9f) {
-            ax = -by * bx; ay = 1.0f - by * by; az = -by * bz;
-            n2 = ax * ax + ay * ay + az * az;
-            if (n2 < 1e-9f) { ax = 1.0f; ay = 0.0f; az = 0.0f; n2 = 1.0f; }
-        }
+    float n  = sqrtf(ax * ax + ay * ay + az * az);
+    if (n < 1e-6f) {
+        ax = 1.0f - bx * bx;  ay = -bx * by;  az = -bx * bz;
+        n = sqrtf(ax * ax + ay * ay + az * az);
+        if (n < 1e-6f) { ax = 0.0f; ay = 1.0f; az = 0.0f; n = 1.0f; }
     }
-    float inv = 1.0f / sqrtf(n2);
-    float a = ax * inv, b_ = ay * inv, c = az * inv;
-    *u1x = a; *u1y = b_; *u1z = c;
-    *u2x = by * c - bz * b_;             // u2 = b x u1
-    *u2y = bz * a - bx * c;
-    *u2z = bx * b_ - by * a;
+    ax /= n;  ay /= n;  az /= n;
+    *u1x = ax;  *u1y = ay;  *u1z = az;
+    *u2x = by * az - bz * ay;
+    *u2y = bz * ax - bx * az;
+    *u2z = bx * ay - by * ax;
 }
 
-// ---------------------------------------------------------------------
-//  Throttle plan: one scalar p in [0,4] fills four clamp segments BACKWARDS
-//  from burnout, so low p means "coast, then slam" — the right shape for a
-//  fuel-optimal burn, and monotone in p, which is what makes a 1-D root find
-//  legitimate. Segments span the REMAINING burn from the plan's start.
-// ---------------------------------------------------------------------
-static void p_to_clamps(float p, float k[4]) {
-    for (int i = 0; i < 4; i++) k[i] = DG_CLAMP_MIN;
+// =====================================================================
+//  CLAMP LAW (S8)
+// =====================================================================
+bool dg_terminal_active(float h, float vz, float thrust_avail, float mass)
+{
+    return h < DG_H_TERM && vz > -3.0f && thrust_avail > 1.6f * mass * DG_G;
+}
+
+float dg_terminal_throttle(float h, float vz, float mass, float thrust_avail)
+{
+    float hh = h > 0.05f ? h : 0.05f;
+    float vz_ref = -clampf(sqrtf(2.0f * DG_A_TERM * hh), 0.8f, 2.5f);
+    float a_cmd = DG_G + DG_KP_VZ * (vz_ref - vz);
+    if (a_cmd > DG_A_TERM_MAX) a_cmd = DG_A_TERM_MAX;
+    if (thrust_avail < 1.0f) return DG_CLAMP_MIN;
+    return clampf(mass * a_cmd / thrust_avail, DG_CLAMP_MIN, DG_CLAMP_MAX);
+}
+
+static inline float k_from_plan(float k_level, bool hold_over, float h, float vz,
+                                float mass, float thrust_avail)
+{
+    if (dg_terminal_active(h, vz, thrust_avail, mass))
+        return dg_terminal_throttle(h, vz, mass, thrust_avail);
+    if (hold_over) return DG_CLAMP_MAX;
+    return k_level;
+}
+
+// Forward-integrate the vertical channel to the ground, ballistic fall
+// after burnout included: a plan that over-brakes, stops in mid-air with a
+// spent grain and falls back must be seen as the failure it is.
+float dg_project_vz(float h0, float vz0, float t0, float k_level, float t_scale,
+                    float *t_td)
+{
+    float h = h0, vz = vz0, t = t0;
+    const float kd = 0.5f * DG_RHO * DG_AREA * DG_CD_BURN;
+    const float dt = DG_PLAN_DT;
+    // The planned level is held for plan_hold and the projection then
+    // assumes FULL clamp. Counted in steps, not by comparing an accumulated
+    // float time against the limit: that comparison is decided by rounding
+    // (15 * 0.02 is or is not > 0.3) and one step of difference is 0.6 m/s.
+    const int n_hold = (int)(P.plan_hold / dt + 0.5f);
+    int n = 0;
+    while (h > 0.0f && n < DG_PLAN_NMAX) {
+        float tn   = dg_thrust_ref(t) * t_scale;
+        float mass = mass_at(t);
+        float k    = k_from_plan(k_level, n >= n_hold, h, vz, mass, tn);
+        float a    = (tn * k - kd * vz * fabsf(vz)) / mass - DG_G;
+        float vn   = vz + a * dt;
+        h  += 0.5f * (vz + vn) * dt;
+        vz  = vn;
+        t  += dt;
+        n++;
+    }
+    if (t_td) *t_td = t - t0;
+    return vz;
+}
+
+// The touchdown speed is NOT monotone in the clamp level: too little
+// crashes, enough lands, too much stops the vehicle in mid-air and drops
+// it. So: scan, bracket the FIRST crossing from below, bisect only that;
+// if nothing reaches the target, ternary-search the peak.
+float dg_solve_plan(float h, float vz, float t, float t_scale,
+                    float *resid, float *t_td)
+{
+    const int   n_scan = 10;
+    const float kmin = DG_CLAMP_MIN, kmax = DG_CLAMP_MAX;
+    const float target = P.plan_target;
+    float best_k = kmin, best_f = -1.0e9f, best_t = 0.0f;
+    float prev_k = kmin;
+    float lo = -1.0f, hi = -1.0f, tt = 0.0f;
+
+    for (int i = 0; i < n_scan; i++) {
+        float k = kmin + (kmax - kmin) * (float)i / (float)(n_scan - 1);
+        float f = dg_project_vz(h, vz, t, k, t_scale, &tt) - target;
+        if (f > best_f) { best_f = f; best_k = k; best_t = tt; }
+        if (f >= 0.0f) {
+            if (i == 0) {
+                if (resid) *resid = f;
+                if (t_td)  *t_td  = tt;
+                return kmin;
+            }
+            lo = prev_k;  hi = k;  best_t = tt;
+            break;
+        }
+        prev_k = k;
+    }
+
+    if (lo < 0.0f) {
+        float a = best_k - (kmax - kmin) / (float)(n_scan - 1);
+        float c = best_k + (kmax - kmin) / (float)(n_scan - 1);
+        if (a < kmin) a = kmin;
+        if (c > kmax) c = kmax;
+        for (int i = 0; i < 12; i++) {
+            float m1 = a + (c - a) / 3.0f;
+            float m2 = c - (c - a) / 3.0f;
+            float t1, t2;
+            float f1 = dg_project_vz(h, vz, t, m1, t_scale, &t1) - target;
+            float f2 = dg_project_vz(h, vz, t, m2, t_scale, &t2) - target;
+            if (f1 > best_f) { best_f = f1; best_k = m1; best_t = t1; }
+            if (f2 > best_f) { best_f = f2; best_k = m2; best_t = t2; }
+            if (f1 < f2) a = m1; else c = m2;
+        }
+        if (resid) *resid = best_f;
+        if (t_td)  *t_td  = best_t;
+        return best_k;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        float mid = 0.5f * (lo + hi);
+        float f = dg_project_vz(h, vz, t, mid, t_scale, &tt) - target;
+        if (f >= 0.0f) { hi = mid; best_t = tt; }
+        else             lo = mid;
+    }
+    if (resid) *resid = 0.0f;
+    if (t_td)  *t_td  = best_t;
+    return hi;
+}
+
+// =====================================================================
+//  FIN MIXER (S6)
+//
+//  delta_i = roll + A cos(phi_i) + B sin(phi_i) + crossflow_i + brake*(+,-,+,-)
+//
+//  `kappa` and `trim` are the on-line estimates: the fins are assumed to
+//  deliver kappa times the modelled torque per radian, plus a constant
+//  offset of `trim` radians of equivalent deflection per channel. With
+//  kappa = 1 and trim = 0 this is the simulation's mixer exactly.
+// =====================================================================
+void dg_fin_mix(const float b[3], const float u1[3], const float u2[3],
+                const float v[3], const float tau[3], float tau_roll,
+                float brake, float kappa, const float trim[3],
+                bool control, float out_deg[4])
+{
+    const float fin_max = P.fin_max_deg;
+    const float amax    = DG_FIN_STALL_DEG - DG_FIN_STALL_MARGIN;
+
+    float v2 = dot3(v, v);
+    float q  = 0.5f * DG_RHO * v2;
+    float k_t = 2.0f * DG_FIN_ARM * q * DG_FIN_AREA * DG_FIN_CL_ALPHA * DG_FIN_K_INT;
+    float k_r = 4.0f * DG_FIN_ROLL_ARM * q * DG_FIN_AREA * DG_FIN_CL_ALPHA * DG_FIN_K_INT;
+    // Below this airspeed the 1/q in the inversion runs away and the four
+    // fins saturate asymmetrically, which is a roll torque.
+    if (sqrtf(v2) < P.fin_min_airspeed) { k_t = 0.0f; k_r = 0.0f; }
+    if (!control) k_t = 0.0f;
+
+    float a_cmd = 0.0f, b_cmd = 0.0f, d_roll = 0.0f;
+    if (k_t > 1e-6f) {
+        // NOTE THE MINUS: the fins are aft of the CG, so for the same force
+        // they make the opposite torque to the nozzle.
+        a_cmd = (-dot3(tau, u1) / k_t - trim[0]) / kappa;
+        b_cmd = (-dot3(tau, u2) / k_t - trim[1]) / kappa;
+    }
+    if (k_r > 1e-6f) {
+        d_roll = (tau_roll / k_r - trim[2]) / kappa;
+        d_roll = clampf(d_roll, -P.roll_max_deg * DEG, P.roll_max_deg * DEG);
+    }
+    a_cmd  = clampf(a_cmd * RAD, -fin_max, fin_max);
+    b_cmd  = clampf(b_cmd * RAD, -fin_max, fin_max);
+    d_roll = d_roll * RAD;
+
+    float va = -dot3(v, b);                 // axial airspeed, nose to tail
+    if (va < 3.0f) va = 3.0f;
+
+    float ctrl[4];
+    float room = fin_max;
     for (int i = 0; i < 4; i++) {
-        float fill = p - (float)i;
-        int   idx  = 3 - i;
-        if (fill >= 1.0f)      k[idx] = DG_CLAMP_MAX;
-        else if (fill > 0.0f)  k[idx] = DG_CLAMP_MIN +
-                                        (DG_CLAMP_MAX - DG_CLAMP_MIN) * fill;
+        // phi_i = i * 90 deg: cos/sin are 1,0 / 0,1 / -1,0 / 0,-1
+        const float ca = (i == 0) ? 1.0f : (i == 2 ? -1.0f : 0.0f);
+        const float sa = (i == 1) ? 1.0f : (i == 3 ? -1.0f : 0.0f);
+        float r[3] = { ca * u1[0] + sa * u2[0], ca * u1[1] + sa * u2[1],
+                       ca * u1[2] + sa * u2[2] };
+        float n[3];
+        cross3(b, r, n);
+        float xflow = (dot3(v, n) / va) * RAD;
+        // With the attitude loop not flying the fins, leave them to see the
+        // crossflow: that is what makes a fin a fin. Cancelling it turns
+        // them into weathervanes and leaves only the body's own margin.
+        float xf_c = (k_t > 1e-6f) ? xflow : 0.0f;
+        float c = d_roll + a_cmd * ca + b_cmd * sa + xf_c;
+        // never command a fin past the stall: clip the ANGLE OF ATTACK
+        float a_i = c - xflow;
+        if (a_i > amax)       c = xflow + amax;
+        else if (a_i < -amax) c = xflow - amax;
+        c = clampf(c, -fin_max, fin_max);
+        ctrl[i] = c;
+        float r1 = fin_max - fabsf(c);
+        if (r1 < room) room = r1;
+        float r2 = amax - fabsf(c - xflow);
+        if (r2 < room) room = r2;
+    }
+    if (room < 0.0f) room = 0.0f;
+    // control first, brake with what is left, and THE SAME on all four
+    if (brake > room) brake = room;
+    for (int i = 0; i < 4; i++) {
+        float alt = (i % 2 == 0) ? 1.0f : -1.0f;
+        out_deg[i] = clampf(ctrl[i] + brake * alt, -fin_max, fin_max);
     }
 }
 
-static inline float clamp_from_plan(float tau, const float k[4], float tau0) {
-    if (tau >= 1.0f) return DG_CLAMP_MIN;
-    float span = 1.0f - tau0;
-    if (span < 1e-6f) return k[3];
-    int seg = (int)((tau - tau0) / (span * 0.25f));
-    if (seg < 0) seg = 0;
-    if (seg > 3) seg = 3;
-    return k[seg];
-}
+// =====================================================================
+//  FIN ADAPTATION
+//
+//  The simulation's fins are a CFD table. The real ones will not match it:
+//  the lift slope, the hinge linkage ratio, a servo horn one spline off.
+//  So the controller measures what the fins actually do.
+//
+//  Model, per transverse axis and for roll, in "equivalent deflection":
+//
+//      y = kappa * (delivered command) + trim
+//
+//  where y is the deflection the MODEL says would have produced the
+//  angular acceleration the gyro just measured (after removing the torques
+//  the controller models: body aero and the gyroscopic term). kappa = 1
+//  and trim = 0 mean the model is right.
+//
+//  Estimation is a normalised gradient step, deliberately not a recursive
+//  least squares: with no excitation an RLS covariance winds up, and the
+//  free fall is mostly un-excited. The step for kappa is scaled by the
+//  command energy, so it only moves when the fins are actually working;
+//  the trims move slowly all the time. Measurement and regressor go
+//  through the same first-order filter, and the regressor is delayed by
+//  the servo and link latency, so the comparison is like for like.
+//
+//  It runs only with the motor OFF. During the burn the nozzle is the
+//  dominant torque and the regression would learn the nozzle's errors as
+//  fin errors; the estimates are frozen at ignition.
+// =====================================================================
+static const float ADAPT_TAU     = 0.06f;    // s, filter on both sides
+static const float ADAPT_TAU_MEAN = 1.0f;    // s, the slow means
+static const float ADAPT_MU_K    = 0.03f;    // per tick, kappa
+static const float ADAPT_MU_C    = 0.004f;   // per tick, trims
+static const float ADAPT_KMIN    = 0.4f;
+static const float ADAPT_KMAX    = 2.0f;
+static const float ADAPT_TRIM_MAX = 4.0f * 0.01745329252f;
 
-// ---------------------------------------------------------------------
-//  Trajectory projection. Returns a SIGNED, CONTINUOUS, MONOTONE-IN-p miss:
-//    > 0  arrested the descent this many metres ABOVE the pad
-//    < 0  reached the pad still moving, expressed as the extra altitude that
-//         would have been needed to stop, -vz^2/(2g)
-//  Both branches go to zero at a perfect landing, so the root find is well
-//  posed. Exits the instant it touches down. RK2, dt = 0.04 s.
-// ---------------------------------------------------------------------
-float dg_project_miss(float h, float vx, float vz, float tau,
-                      float mass, float clamp_now, float p)
+static void fin_adapt_step(const dg_nav_t *nav, const float b[3], const float u1[3],
+                           const float u2[3], const float tau_model[3],
+                           float I_t, float I_a, float w_roll)
 {
-    const float dt = 0.04f;
-    float k[4];
-    p_to_clamps(p, k);
-    const float tau0 = tau;
-    const float dtau = dt / DG_BURN_T;
-
-    for (int step = 0; step < 400; step++) {
-        float tgt = clamp_from_plan(tau, k, tau0);
-
-        // hold the clamp shut once stopping is no longer the problem
-        float v_imp = sqrtf(vx * vx + vz * vz + 2.0f * DG_G * (h > 0.0f ? h : 0.0f));
-        if (v_imp < 1.75f || vz >= 0.0f) tgt = DG_CLAMP_MIN;
-
-        float dk = DG_CLAMP_RATE * dt;
-        if      (tgt - clamp_now >  dk) clamp_now += dk;
-        else if (clamp_now - tgt >  dk) clamp_now -= dk;
-        else                            clamp_now  = tgt;
-
-        float raw    = dg_thrust_ref(tau);
-        float thrust = clamp_now * raw;
-
-        float sn, cs;
-        dg_guidance_tilt(h, vx, vz, mass, &sn, &cs);
-
-        float v2 = vx * vx + vz * vz;
-        float ax = thrust * sn / mass;
-        float az = thrust * cs / mass - DG_G;
-        if (v2 > 0.0001f) {
-            float v  = sqrtf(v2);
-            float df = 0.5f * DG_RHO * DG_AREA * DG_CD_AXIAL * v2 / mass;
-            ax -= df * vx / v;
-            az -= df * vz / v;
-        }
-
-        // RK2 (midpoint) on the vertical channel, which is the one that decides
-        // the outcome; the horizontal channel is slow enough for Euler.
-        float vz_mid = vz + 0.5f * az * dt;
-        float h_next = h + vz_mid * dt;
-        float vz_next = vz + az * dt;
-
-        if (vz_next >= 0.0f && vz < 0.0f) {              // stopped in the air
-            float f = -vz / (vz_next - vz);
-            return h + vz * dt * f;
-        }
-        if (h_next <= 0.0f) {                            // reached the pad
-            float f = (vz < -1e-6f) ? (h / (-vz * dt)) : 0.0f;
-            float vz_at = vz + az * dt * f;
-            return -(vz_at * vz_at) / (2.0f * DG_G);
-        }
-
-        h  = h_next;
-        vx += ax * dt;
-        vz = vz_next;
-        if (tau < 1.0f) {
-            tau += dtau;
-            if (tau > 1.0f) tau = 1.0f;
-            mass -= raw * DG_MASS_PER_NS * dt;           // RAW thrust: the grain
-            if (mass < DG_M_INITIAL - DG_M_PROP)         // burns whatever the
-                mass = DG_M_INITIAL - DG_M_PROP;         // clamp is doing
-        }
+    const float w[3] = { nav->wx, nav->wy, nav->wz };
+    if (!S.w_prev_ok) {
+        memcpy(S.w_prev, w, sizeof(w));
+        S.w_prev_ok = true;
+        return;
     }
-    return h;
+    float dw[3] = { (w[0] - S.w_prev[0]) * DG_CTRL_HZ, (w[1] - S.w_prev[1]) * DG_CTRL_HZ,
+                    (w[2] - S.w_prev[2]) * DG_CTRL_HZ };
+    memcpy(S.w_prev, w, sizeof(w));
+
+    const float v[3] = { nav->vx, nav->vy, nav->vz };
+    float v2 = dot3(v, v);
+    float q  = 0.5f * DG_RHO * v2;
+    float k_t = 2.0f * DG_FIN_ARM * q * DG_FIN_AREA * DG_FIN_CL_ALPHA * DG_FIN_K_INT;
+    float k_r = 4.0f * DG_FIN_ROLL_ARM * q * DG_FIN_AREA * DG_FIN_CL_ALPHA * DG_FIN_K_INT;
+    if (sqrtf(v2) < P.fin_min_airspeed + 4.0f || k_t < 1e-3f) return;
+
+    // What the fins were last told, as angles of attack per channel.
+    float va = -dot3(v, b);
+    if (va < 3.0f) va = 3.0f;
+    float a[4];
+    for (int i = 0; i < 4; i++) {
+        const float ca = (i == 0) ? 1.0f : (i == 2 ? -1.0f : 0.0f);
+        const float sa = (i == 1) ? 1.0f : (i == 3 ? -1.0f : 0.0f);
+        float r[3] = { ca * u1[0] + sa * u2[0], ca * u1[1] + sa * u2[1],
+                       ca * u1[2] + sa * u2[2] };
+        float n[3];
+        cross3(b, r, n);
+        // angle of attack actually flown: deflection, minus the crossflow,
+        // minus what the fin's own motion (w x p) adds. The last term is the
+        // fins' aerodynamic damping; putting it in the regressor rather than
+        // in the model means it scales with kappa, as it physically does.
+        float p[3] = { DG_FIN_ARM * b[0] + DG_FIN_ROLL_ARM * r[0],
+                       DG_FIN_ARM * b[1] + DG_FIN_ROLL_ARM * r[1],
+                       DG_FIN_ARM * b[2] + DG_FIN_ROLL_ARM * r[2] };
+        float wxp[3];
+        cross3(w, p, wxp);
+        a[i] = S.fin_last[i] * DEG - (dot3(v, n) + dot3(wxp, n)) / va;
+    }
+    float reg_now[3] = { 0.5f * (a[0] - a[2]), 0.5f * (a[1] - a[3]),
+                         0.25f * (a[0] + a[1] + a[2] + a[3]) };
+
+    // delay line: 3 ticks of servo + link latency
+    float reg[3];
+    memcpy(reg, S.r_hist[S.r_pos], sizeof(reg));
+    memcpy(S.r_hist[S.r_pos], reg_now, sizeof(reg_now));
+    S.r_pos = (uint8_t)((S.r_pos + 1) & 3);
+
+    // The deflection the model says explains the measured acceleration.
+    // tau_fin = I*dw - tau_model, and tau_fin.u1 = -k_t * (deflection).
+    float tm[3] = { I_t * dw[0] - tau_model[0], I_t * dw[1] - tau_model[1],
+                    I_t * dw[2] - tau_model[2] };
+    float y[3] = { -dot3(tm, u1) / k_t, -dot3(tm, u2) / k_t,
+                   I_a * dot3(dw, b) / k_r };
+    (void)w_roll;
+
+    float alpha = DG_CTRL_DT / (ADAPT_TAU + DG_CTRL_DT);
+    for (int i = 0; i < 3; i++) {
+        S.yf[i] += alpha * (y[i]   - S.yf[i]);
+        S.rf[i] += alpha * (reg[i] - S.rf[i]);
+    }
+
+    // kappa is learned from the CHANGES only (signals with their slow means
+    // removed), the trims from the means. A constant the model does not
+    // know about - wind on the fins, a bent fin - is then a trim, and cannot
+    // masquerade as a gain just because the command happens to be non-zero.
+    float beta = DG_CTRL_DT / (ADAPT_TAU_MEAN + DG_CTRL_DT);
+    float num = 0.0f, den = 2.5e-5f;          // (0.29 deg)^2 dead zone
+    for (int i = 0; i < 3; i++) {
+        S.ym[i] += beta * (S.yf[i] - S.ym[i]);
+        S.rm[i] += beta * (S.rf[i] - S.rm[i]);
+        float dy = S.yf[i] - S.ym[i];
+        float dr = S.rf[i] - S.rm[i];
+        num += dr * (dy - S.kappa * dr);
+        den += dr * dr;
+    }
+    S.kappa = clampf(S.kappa + ADAPT_MU_K * num / den, ADAPT_KMIN, ADAPT_KMAX);
+    for (int i = 0; i < 3; i++) {
+        float e = S.ym[i] - (S.kappa * S.rm[i] + S.trim[i]);
+        S.trim[i] = clampf(S.trim[i] + ADAPT_MU_C * e, -ADAPT_TRIM_MAX, ADAPT_TRIM_MAX);
+    }
 }
 
-// ---------------------------------------------------------------------
-//  Amortised Illinois root find on miss(p) = 0.
-//  One projection per call. State persists across calls.
-// ---------------------------------------------------------------------
-typedef struct {
-    float lo, hi, f_lo, f_hi;
-    float p;
-    int   iter;
-    bool  bracketed;
-    bool  have_answer;
-} dg_solver_t;
-
-static dg_solver_t s_sol;
-static float s_p_answer;
-static float s_p_warm;
-static bool  s_warm_valid;
-
-static void solver_restart(void) {
-    s_sol.lo = 0.0f;  s_sol.hi = 4.0f;
-    s_sol.iter = 0;
-    s_sol.bracketed = false;
-    s_sol.have_answer = false;
-    s_sol.p = s_warm_valid ? clampf(s_p_warm, 0.05f, 3.95f) : 2.0f;
-}
-
-// Non-amortised solve. Used by the host test and by dg_arm(); NOT called from
-// the 200 Hz path.
-float dg_solve_p_full(float h, float vx, float vz, float tau,
-                      float mass, float clamp_now)
+// =====================================================================
+//  200 Hz CONTROL STEP
+// =====================================================================
+void dg_step_control(const dg_nav_t *nav, dg_out_t *out)
 {
-    float lo = 0.0f, hi = 4.0f;
-    float f_lo = dg_project_miss(h, vx, vz, tau, mass, clamp_now, lo);
-    if (f_lo > 0.0f) return 0.0f;                 // even shut it overshoots
-    float f_hi = dg_project_miss(h, vx, vz, tau, mass, clamp_now, hi);
-    if (f_hi < 0.0f) return 4.0f;                 // not enough motor
+    S.t += DG_CTRL_DT;
+    const float now = S.t;
 
-    float p = 0.5f * (lo + hi);
-    for (int i = 0; i < 12; i++) {
-        if (hi - lo < 1e-4f) break;
-        float den = f_hi - f_lo;
-        p = (fabsf(den) < 1e-12f) ? 0.5f * (lo + hi)
-                                  : lo + (hi - lo) * (-f_lo) / den;
-        float edge = 0.05f * (hi - lo);
-        p = clampf(p, lo + edge, hi - edge);
-        float f_p = dg_project_miss(h, vx, vz, tau, mass, clamp_now, p);
-        if (f_p < 0.0f) { lo = p; f_lo = f_p; f_hi *= 0.5f; }
-        else            { hi = p; f_hi = f_p; f_lo *= 0.5f; }
-    }
-    return p;
-}
+    // ---- defaults: everything parked, clamp where it was ----
+    out->servo1_deg = 0.0f;
+    out->servo2_deg = 0.0f;
+    out->clamp      = S.k_cmd;
+    out->fins_live  = false;
+    for (int i = 0; i < 4; i++) out->fin_deg[i] = 0.0f;
+    out->ignite     = (S.phase == DG_PHASE_IGNITING || S.phase == DG_PHASE_BURN);
+    out->thrust_on  = (S.phase == DG_PHASE_BURN) && S.onset_detected;
+    out->phase      = S.phase;
+    out->t_to_ignition  = -1.0f;
+    out->t_to_touchdown = -1.0f;
+    out->h_cmd      = S.h_cmd;
+    out->tilt_cmd   = 0.0f;
+    out->tilt_err   = 0.0f;
+    out->roll_rate  = 0.0f;
+    out->thrust_est = 0.0f;
+    out->t_scale    = S.t_scale;
+    out->k_plan     = S.k_level;
+    out->plan_resid = S.plan_resid;
+    out->fin_gain   = S.kappa;
+    out->fin_trim[0] = S.trim[0] * RAD;
+    out->fin_trim[1] = S.trim[1] * RAD;
+    out->fin_trim[2] = S.trim[2] * RAD;
+    out->t_burn     = (S.phase == DG_PHASE_BURN) ? now - S.t_burn0 : -1.0f;
 
-// ---------------------------------------------------------------------
-//  Persistent guidance state
-// ---------------------------------------------------------------------
-static struct {
-    dg_phase_t phase;
-    float h_ign;            // commanded ignition altitude
-    float tau;              // burn fraction, advances on the grain clock
-    float mass;
-    float clamp_act;        // actual clamp position
-    float servo1_act;       // actual servo positions, one per gimbal axis
-    float servo2_act;
-    float eix, eiy, eiz;    // integral of the attitude-error vector
-    float t_ignite_cmd;     // time the igniter was commanded, <0 = not yet
-    float t_burn_start;     // time thrust was assumed to begin
-    float p_plan;
-    float k_plan[4];
-    float tau_plan0;
-    float last_t;
-    bool  armed;
-} S;
-
-void dg_init(void) {
-    memset(&S, 0, sizeof(S));
-    S.phase        = DG_PHASE_IDLE;
-    S.mass         = DG_M_INITIAL;
-    S.clamp_act    = 0.6f;
-    S.t_ignite_cmd = -1.0f;
-    S.t_burn_start = -1.0f;
-    S.p_plan       = 4.0f;
-    p_to_clamps(4.0f, S.k_plan);
-    s_p_answer   = 4.0f;
-    s_warm_valid = false;
-    solver_restart();
-
-    for (int i = 0; i <= TLUT_N; i++) {
-        float tau = (float)i / (float)TLUT_N;
-        float v = 0.0f;
-        if (tau > 0.0f && tau < 1.0f) {
-            for (int j = 0; j < TCURVE_N - 1; j++) {
-                if (tau >= TCURVE_TAU[j] && tau <= TCURVE_TAU[j + 1]) {
-                    float span = TCURVE_TAU[j + 1] - TCURVE_TAU[j];
-                    float w = (span > 1e-9f) ? (tau - TCURVE_TAU[j]) / span : 0.0f;
-                    v = TCURVE_F[j] + (TCURVE_F[j + 1] - TCURVE_F[j]) * w;
-                    break;
-                }
-            }
-        }
-        s_tlut[i] = v;
-    }
-    for (int i = 0; i <= TAN_N; i++) {
-        float h = (float)i * (TAN_H_MAX / (float)TAN_N);
-        float deg = 3.0f * h + 5.0f;
-        if (deg > 45.0f) deg = 45.0f;
-        s_tanlut[i] = tanf(deg * (float)M_PI / 180.0f);
-    }
-}
-
-void dg_arm(float vx0, float vz0) {
-    (void)vx0;                          // < 0.3 m of influence, see IGN_HMIN
-    float a = fabsf(vz0);
-    float hmin;
-    if      (a <= IGN_VZ[0])         hmin = IGN_HMIN[0];
-    else if (a >= IGN_VZ[IGN_N - 1]) hmin = IGN_HMIN[IGN_N - 1];
-    else {
-        int i = 0;
-        while (i < IGN_N - 2 && a > IGN_VZ[i + 1]) i++;
-        float w = (a - IGN_VZ[i]) / (IGN_VZ[i + 1] - IGN_VZ[i]);
-        hmin = IGN_HMIN[i] + (IGN_HMIN[i + 1] - IGN_HMIN[i]) * w;
-    }
-    S.h_ign = hmin;
-    S.phase = DG_PHASE_COAST;
-    S.armed = true;
-}
-
-float dg_h_ignite(void) { return S.h_ign; }
-
-// ---------------------------------------------------------------------
-//  Planner — core 1. One projection per call.
-// ---------------------------------------------------------------------
-void dg_step_planner(const dg_nav_t *nav)
-{
-    if (S.phase != DG_PHASE_BURN || !nav->valid) return;
-
-    float h = nav->h, vx = nav->vx, vz = nav->vz;
-
-    if (!s_sol.bracketed) {
-        // two probes establish the bracket, one per call
-        if (s_sol.iter == 0) {
-            s_sol.f_lo = dg_project_miss(h, vx, vz, S.tau, S.mass,
-                                         S.clamp_act, s_sol.lo);
-            s_sol.iter = 1;
-            if (s_sol.f_lo > 0.0f) {            // shut clamp still overshoots
-                s_p_answer = 0.0f; s_sol.have_answer = true;
-                s_p_warm = 0.0f; s_warm_valid = true;
-                solver_restart();
-            }
-            return;
-        }
-        s_sol.f_hi = dg_project_miss(h, vx, vz, S.tau, S.mass,
-                                     S.clamp_act, s_sol.hi);
-        s_sol.bracketed = true;
-        s_sol.iter = 0;
-        if (s_sol.f_hi < 0.0f) {                // not enough motor: full open
-            s_p_answer = 4.0f; s_sol.have_answer = true;
-            s_p_warm = 4.0f; s_warm_valid = true;
-            solver_restart();
-        }
+    if (S.phase == DG_PHASE_IDLE || S.phase == DG_PHASE_DONE) {
+        S.k_cmd = DG_CLAMP_MAX;
+        out->clamp = S.k_cmd;
         return;
     }
 
-    float den = s_sol.f_hi - s_sol.f_lo;
-    float p = (fabsf(den) < 1e-12f) ? 0.5f * (s_sol.lo + s_sol.hi)
-                                    : s_sol.lo + (s_sol.hi - s_sol.lo)
-                                                 * (-s_sol.f_lo) / den;
-    float edge = 0.05f * (s_sol.hi - s_sol.lo);
-    p = clampf(p, s_sol.lo + edge, s_sol.hi - edge);
-
-    float f_p = dg_project_miss(h, vx, vz, S.tau, S.mass, S.clamp_act, p);
-    if (f_p < 0.0f) { s_sol.lo = p; s_sol.f_lo = f_p; s_sol.f_hi *= 0.5f; }
-    else            { s_sol.hi = p; s_sol.f_hi = f_p; s_sol.f_lo *= 0.5f; }
-
-    s_sol.p = p;
-    s_sol.iter++;
-
-    if (s_sol.iter >= 8 || (s_sol.hi - s_sol.lo) < 1e-3f) {
-        s_p_answer   = p;
-        s_p_warm     = p;
-        s_warm_valid = true;
-        solver_restart();
-    }
-}
-
-// ---------------------------------------------------------------------
-//  Attitude loop + ignition + actuators — core 0, 200 Hz.
-// ---------------------------------------------------------------------
-void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out)
-{
-    const float dt = DG_CTRL_DT;
-
-    out->ignite    = false;
-    out->p_plan    = s_p_answer;
-    out->phase     = S.phase;
-    out->tilt_cmd  = 0.0f;
-    out->tilt_err  = 0.0f;
-    out->roll_rate = 0.0f;
-
-    if (!nav->valid || S.phase == DG_PHASE_IDLE || S.phase == DG_PHASE_DONE) {
-        S.servo1_act = 0.0f;
-        S.servo2_act = 0.0f;
-        out->servo1_deg = 0.0f;
-        out->servo2_deg = 0.0f;
-        out->clamp      = S.clamp_act;
-        out->thrust_est = 0.0f;
+    // A lost navigation solution parks the nozzle and the fins and FREEZES
+    // the clamp. Shutting it mid-burn guarantees a crash and the grain
+    // finishes burning either way. The burn clock keeps running.
+    if (!nav->valid) {
+        S.w_prev_ok = false;
         return;
     }
 
-    // ---------------- ignition, triggered on PREDICTED altitude ----------
-    // Firing on a clock forces the pad to cover the WORST-CASE igniter delay.
-    // Leading by the MEAN delay and firing on altitude shrinks the pad to the
-    // delay SPREAD, which is where the accuracy at the top of the envelope
-    // comes from. The pad must still cover the spread in the low direction:
-    // igniting high is recoverable by clamping down, igniting low is not.
-    if (S.phase == DG_PHASE_COAST) {
-        // The trigger is CENTRED on the delay distribution. It used to be padded
-        // high by half the spread, because a hoverslam was asymmetric: igniting
-        // high was recoverable by clamping down, igniting low was not. The
-        // measured motor inverts that. Its 2.73 s burn cannot be shortened, its
-        // tail drops below vehicle weight for the last ~13 % of the curve, and at
-        // a thrust/weight of 3.8 the clamp can no longer stretch the schedule.
-        // Light high and the vehicle arrests at altitude with no motor left, then
-        // falls. Measured over 480 flights from 120 m: 6.5 % padded high, 14.2 %
-        // centred.
-        //
-        // Both the trigger altitude and the prediction now carry 0.5*g*t^2. At the
-        // old 0.2 s delay that term was 0.2 m and could be dropped; at 1.5 s it is
-        // 11 m, a fifth of the ignition altitude.
-        const float dmean = 0.5f * (DG_IGN_DELAY_LO + DG_IGN_DELAY_HI);
-        float h_trig = S.h_ign;
-        float h_pred = nav->h + nav->vz * dmean - 0.5f * DG_G * dmean * dmean;
-        if (S.t_ignite_cmd < 0.0f && h_pred <= h_trig) {
-            S.t_ignite_cmd = nav->t;
-            S.t_burn_start = nav->t + dmean;   // best estimate of light-up
-            out->ignite = true;
+    float b[3] = { nav->bx, nav->by, nav->bz };
+    {
+        float n = sqrtf(dot3(b, b));
+        if (n < 0.5f) return;
+        b[0] /= n;  b[1] /= n;  b[2] /= n;
+    }
+    const float v[3] = { nav->vx, nav->vy, nav->vz };
+    const float w[3] = { nav->wx, nav->wy, nav->wz };
+
+    // ---- the altitude the guidance works from ----
+    // Until the lidar has the ground, assume the vehicle may be alt_pad
+    // LOWER than the altimeter says; drop the margin the moment it acquires.
+    if (nav->lidar_ok) S.lidar_acquired = true;
+    const float h_est = nav->h - (S.lidar_acquired ? 0.0f : P.alt_pad);
+
+    // ---- phase logic ----------------------------------------------------
+    if (S.phase == DG_PHASE_DESCENT) {
+        // time until the ignition command, from a constant-deceleration fall
+        float dh = h_est - S.h_cmd;
+        float vd = -nav->vz;                              // positive downward
+        float kd = 0.5f * DG_RHO * DG_AREA * DG_CD_FREE / P.mass_gross;
+        float a  = DG_G - kd * vd * fabsf(vd);
+        if (dh <= 0.0f) {
+            out->t_to_ignition = 0.0f;
+        } else if (fabsf(a) > 0.05f) {
+            float disc = vd * vd + 2.0f * a * dh;
+            out->t_to_ignition = disc > 0.0f ? (-vd + sqrtf(disc)) / a
+                                             : (vd > 0.5f ? dh / vd : 99.0f);
+        } else {
+            out->t_to_ignition = vd > 0.5f ? dh / vd : 99.0f;
         }
-        if (S.t_ignite_cmd >= 0.0f && nav->t >= S.t_burn_start) {
-            // Reset the solver BEFORE announcing the phase: core 1 wakes on the
-            // phase change and would otherwise be able to see a partly reset
-            // bracket.
-            S.tau = 0.0f;
-            solver_restart();
-            DG_PUBLISH();
+        if (out->t_to_ignition < 0.0f)  out->t_to_ignition = 0.0f;
+        if (out->t_to_ignition > 99.0f) out->t_to_ignition = 99.0f;
+        if (S.t_nom_burn > 0.0f)
+            out->t_to_touchdown = out->t_to_ignition + S.t_nom_burn;
+
+        // axial specific force just before the command: the baseline the
+        // onset detector measures the bump against
+        S.a_base += 0.05f * (nav->a_axial - S.a_base);
+
+        // The command. Thrust axis must be in the upper hemisphere: a motor
+        // lit while pointing down accelerates the vehicle into the ground.
+        if (h_est <= S.h_cmd && nav->vz < -3.0f && b[2] > 0.0f) {
+            S.phase      = DG_PHASE_IGNITING;
+            S.t_cmd      = now;
+            S.bump_ticks = 0;
+            S.t_plan     = -1.0f;
+        }
+    } else if (S.phase == DG_PHASE_IGNITING) {
+        // Thrust onset comes from the accelerometer, never from the command:
+        // the igniter delay is the dominant uncertainty and everything
+        // downstream is timed from the real onset.
+        if (nav->a_axial - S.a_base > P.onset_bump) {
+            if (++S.bump_ticks >= 2) {
+                S.t_burn0 = now - 0.04f;      // ~11 N is 40 ms up the curve
+                S.onset_detected = true;
+                S.phase = DG_PHASE_BURN;
+            }
+        } else {
+            S.bump_ticks = 0;
+        }
+        if (S.phase == DG_PHASE_IGNITING && now - S.t_cmd > P.onset_timeout) {
+            // No bump seen. If the motor did light and the accelerometer
+            // path is what failed, flying blind on an assumed onset beats
+            // not flying. A later bump still re-synchronises the clock.
+            S.t_burn0 = S.t_cmd + P.onset_assumed;
+            S.onset_detected = false;
             S.phase = DG_PHASE_BURN;
         }
+        if (S.phase == DG_PHASE_BURN) {
+            S.ie[0] = S.ie[1] = S.ie[2] = 0.0f;       // the integral starts at ignition
+            S.gate_open = true;
+        }
+    } else if (S.phase == DG_PHASE_BURN) {
+        if (!S.onset_detected && now - S.t_burn0 < DG_BURN_T) {
+            // Assumed onset: keep looking for the real one. The detector ran
+            // every tick since the command, so a bump seen now IS the rising
+            // edge (a late igniter, or the backup one) and the burn clock is
+            // re-synchronised to it.
+            if (nav->a_axial - S.a_base > P.onset_bump) {
+                if (++S.bump_ticks >= 2) {
+                    S.t_burn0 = now - 0.04f;
+                    S.onset_detected = true;
+                    S.gate_open = true;
+                    S.t_scale = 1.0f;
+                }
+            } else {
+                S.bump_ticks = 0;
+            }
+        }
+        float tb = now - S.t_burn0;
+        // down and stopped, or long after burnout
+        if ((h_est < 0.5f && fabsf(nav->vz) < 1.0f && tb > 0.5f) || tb > DG_BURN_T + 4.0f) {
+            if (S.t_done <= 0.0f) S.t_done = now;
+            if (now - S.t_done > 0.3f || tb > DG_BURN_T + 4.0f) S.phase = DG_PHASE_DONE;
+        } else {
+            S.t_done = 0.0f;
+        }
     }
 
-    // ---------------- grain clock ----------------
-    // tau advances with WALL TIME. The clamp diverts exhaust; it does not slow
-    // the burn, and it cannot extend it.
-    if (S.phase == DG_PHASE_BURN) {
-        S.tau += dt / DG_BURN_T;
-        if (S.tau > 1.0f) S.tau = 1.0f;
-    }
-
-    float raw_thrust   = (S.phase == DG_PHASE_BURN) ? dg_thrust_ref(S.tau) : 0.0f;
-    float thrust_est   = S.clamp_act * raw_thrust;
-    out->thrust_est    = thrust_est;
-
-    if (S.phase == DG_PHASE_BURN) {
-        S.mass -= raw_thrust * DG_MASS_PER_NS * dt;
-        float m_dry = DG_M_INITIAL - DG_M_PROP;
-        if (S.mass < m_dry) S.mass = m_dry;
-    }
-
-    // ---------------- clamp command ----------------
-    float clamp_tgt = S.clamp_act;
-    if (S.phase == DG_PHASE_BURN) {
-        p_to_clamps(s_p_answer, S.k_plan);
-        clamp_tgt = clamp_from_plan(S.tau, S.k_plan, S.tau_plan0);
-        float v_imp = sqrtf(nav->vx * nav->vx + nav->vy * nav->vy
-                            + nav->vz * nav->vz
-                            + 2.0f * DG_G * (nav->h > 0.0f ? nav->h : 0.0f));
-        if (v_imp < 1.75f || nav->vz >= 0.0f) clamp_tgt = DG_CLAMP_MIN;
-        if (nav->vz >= 0.0f && nav->h < 1.0f) clamp_tgt = DG_CLAMP_MIN;
-    }
-    float dk = DG_CLAMP_RATE * dt;
-    if      (clamp_tgt - S.clamp_act >  dk) S.clamp_act += dk;
-    else if (S.clamp_act - clamp_tgt >  dk) S.clamp_act -= dk;
-    else                                     S.clamp_act  = clamp_tgt;
-    S.clamp_act = clampf(S.clamp_act, DG_CLAMP_MIN, DG_CLAMP_MAX);
-    out->clamp  = S.clamp_act;
-
-    // ---------------- attitude ----------------
-    // Before ignition the gimbal produces NO torque, so both servos are parked.
-    // Any apparent "tracking error" during the coast is not a control failure:
-    // there is nothing to control with.
-    if (S.phase != DG_PHASE_BURN || thrust_est < 1.0f) {
-        S.servo1_act = 0.0f;
-        S.servo2_act = 0.0f;
-        out->servo1_deg = 0.0f;
-        out->servo2_deg = 0.0f;
+    const dg_phase_t phase = S.phase;
+    const float tb = (phase == DG_PHASE_BURN) ? now - S.t_burn0 : -1.0f;
+    const bool  engine_on = (tb >= 0.0f && tb <= DG_BURN_T);
+    const float mass = (tb > 0.0f) ? mass_at(tb) : P.mass_gross;
+    out->phase     = phase;
+    out->ignite    = (phase == DG_PHASE_IGNITING || phase == DG_PHASE_BURN);
+    out->thrust_on = (phase == DG_PHASE_BURN) && S.onset_detected;
+    out->t_burn    = tb;
+    if (phase == DG_PHASE_DONE) {
+        S.k_cmd = DG_CLAMP_MAX;
+        out->clamp = S.k_cmd;
         return;
     }
 
-    // Normalise the reported body axis: a fusion filter's unit vector drifts off
-    // the sphere, and every cross product below assumes |b| = 1.
-    float bx = nav->bx, by = nav->by, bz = nav->bz;
-    float bn2 = bx * bx + by * by + bz * bz;
-    if (bn2 < 1e-6f) { bx = 0.0f; by = 0.0f; bz = 1.0f; }
-    else if (fabsf(bn2 - 1.0f) > 1e-4f) {
-        float bi = 1.0f / sqrtf(bn2);
-        bx *= bi; by *= bi; bz *= bi;
-    }
+    // ---- body-fixed gimbal / fin axes ----
+    float u1[3], u2[3];
+    dg_gimbal_basis(b[0], b[1], b[2], nav->gx, nav->gy, nav->gz,
+                    &u1[0], &u1[1], &u1[2], &u2[0], &u2[1], &u2[2]);
 
-    // Split the measured rate into ROLL and TRANSVERSE. The gimbal cannot produce
-    // a torque about the body axis, so feeding a roll rate into the rate loop would
-    // ask for something impossible and the inversion would answer with a deflection
-    // that does something else instead. The roll rate is not discarded, though: it
-    // drives the gyroscopic feedforward below.
-    float wx = nav->wx, wy = nav->wy, wz = nav->wz;
-    float w_roll = wx * bx + wy * by + wz * bz;
-    wx -= w_roll * bx;
-    wy -= w_roll * by;
-    wz -= w_roll * bz;
+    // ---- where to point (S4) ----
+    float u[3];
+    float vh = sqrtf(v[0] * v[0] + v[1] * v[1]);
+    if (phase == DG_PHASE_ASCENT) {
+        u[0] = 0.0f;  u[1] = 0.0f;  u[2] = -1.0f;         // nose up
+    } else if (phase == DG_PHASE_DESCENT && h_est > S.h_cmd + P.fin_ctrl_lead) {
+        // Long free fall: hold the body axis vertical, optionally leaned
+        // INTO the drift so the airframe's own normal force pushes back.
+        u[0] = 0.0f;  u[1] = 0.0f;  u[2] = 1.0f;
+        if (P.fin_drift_gain > 0.0f && vh > 0.2f && nav->vz < -P.fin_min_airspeed) {
+            float tl = tanf(clampf(vh * P.fin_drift_gain, 0.0f, P.fin_drift_max_deg) * DEG);
+            u[0] = tl * v[0] / vh;
+            u[1] = tl * v[1] / vh;
+            float n = 1.0f / sqrtf(u[0] * u[0] + u[1] * u[1] + 1.0f);
+            u[0] *= n;  u[1] *= n;  u[2] = n;
+        }
+    } else {
+        (void)dg_guidance_dir(h_est, v[0], v[1], v[2], mass, &u[0], &u[1], &u[2]);
+    }
+    out->tilt_cmd = acosf(clampf(fabsf(u[2]), -1.0f, 1.0f));
+
+    // ---- attitude error as a rotation vector (S5 step 1) ----
+    float e[3];
+    cross3(b, u, e);
+    float cn = sqrtf(dot3(e, e));
+    float bu = dot3(b, u);
+    float ang = 0.0f;
+    if (cn > 1e-9f) {
+        ang = asinf(clampf(cn, -1.0f, 1.0f));
+        if (bu < 0.0f) ang = 3.14159265f - ang;
+        float sc = ang / cn;
+        e[0] *= sc;  e[1] *= sc;  e[2] *= sc;
+    } else {
+        e[0] = e[1] = e[2] = 0.0f;
+        if (bu < 0.0f) ang = 3.14159265f;
+    }
+    out->tilt_err = ang;
+
+    // ---- split off the roll (S5 step 2) ----
+    float w_roll = dot3(w, b);
+    float wt[3] = { w[0] - w_roll * b[0], w[1] - w_roll * b[1], w[2] - w_roll * b[2] };
     out->roll_rate = w_roll;
 
-    float ucx, ucy, ucz;
-    dg_guidance_dir(nav->h, nav->vx, nav->vy, nav->vz, S.mass, &ucx, &ucy, &ucz);
-    out->tilt_cmd = acosf(clampf(ucz, -1.0f, 1.0f));      // telemetry only
+    const float I_t = mass * DG_IT_PER_KG;
+    const float I_a = mass * DG_IA_PER_KG;
 
-    float u1x, u1y, u1z, u2x, u2y, u2z;
-    dg_gimbal_basis(bx, by, bz, nav->gx, nav->gy, nav->gz,
-                    &u1x, &u1y, &u1z, &u2x, &u2y, &u2z);
-
-    // Attitude error as a ROTATION VECTOR: e = b x u_cmd points along the axis
-    // that closes the error and has magnitude sin(error). This is the vector form
-    // of the planar sin(cmd - theta), and it needs no atan2, no wrapping and no
-    // Euler angles. It is perpendicular to b by construction, so the loop can
-    // never command a roll it cannot produce.
-    float ex = by * ucz - bz * ucy;
-    float ey = bz * ucx - bx * ucz;
-    float ez = bx * ucy - by * ucx;
-    float e_sin2 = ex * ex + ey * ey + ez * ez;
-    if (e_sin2 > 0.09f) {                         // beyond ~17 deg, saturate
-        float sc = 0.3f / sqrtf(e_sin2);          // gracefully -- the planar law
-        ex *= sc; ey *= sc; ez *= sc;             // clamped at the same 0.30
-        e_sin2 = 0.09f;
-    }
-    // rescale sin(error) to the angle: asin(x)/x = 1 + x^2/6 over this range
-    float e_corr = 1.0f + e_sin2 * (1.0f / 6.0f);
-    ex *= e_corr; ey *= e_corr; ez *= e_corr;
-    out->tilt_err = sqrtf(e_sin2) * e_corr;
-
-    // Cascade: outer attitude P -> rate command, inner rate P -> angular accel.
-    // Closing this gives wn^2 = k_rate*k_th and 2*zeta*wn = k_rate, so the two
-    // knobs are a bandwidth and a damping ratio. Both channels use the SAME
-    // pair: the transverse inertia is identical about either axis, so there is
-    // nothing to tune separately.
-    const float k_rate = 2.0f * DG_ZETA * DG_OMEGA_N;
-    const float k_th   = DG_OMEGA_N / (2.0f * DG_ZETA);
-
-    S.eix += ex * dt;
-    S.eiy += ey * dt;
-    S.eiz += ez * dt;
-    float ei2 = S.eix * S.eix + S.eiy * S.eiy + S.eiz * S.eiz;
-    if (ei2 > 0.0625f) {                          // magnitude limit, 0.25 rad.s
-        float sc = 0.25f / sqrtf(ei2);
-        S.eix *= sc; S.eiy *= sc; S.eiz *= sc;
+    // ---- aero feedforward (S5 step 4): tau = q A CNa Lcp (b x a_hat) ----
+    float v2 = dot3(v, v);
+    float q  = 0.5f * DG_RHO * v2;
+    float taf[3] = { 0.0f, 0.0f, 0.0f };
+    if (v2 > 0.0025f) {
+        float vr = sqrtf(v2);
+        float ah[3] = { -v[0] / vr, -v[1] / vr, -v[2] / vr };
+        float c[3];
+        cross3(b, ah, c);
+        float ffk = q * DG_AREA * DG_CN_ALPHA * DG_L_CP;
+        taf[0] = ffk * c[0];  taf[1] = ffk * c[1];  taf[2] = ffk * c[2];
     }
 
-    float I_pitch = S.mass * (DG_L_BODY * DG_L_BODY * (1.0f / 12.0f));
-    float g_ir = I_pitch * k_rate;
-    float trx  = g_ir * (k_th * ex + DG_KI_ATT * S.eix - wx);
-    float trqy = g_ir * (k_th * ey + DG_KI_ATT * S.eiy - wy);
-    float trqz = g_ir * (k_th * ez + DG_KI_ATT * S.eiz - wz);
-
-    // ---- gyroscopic decoupling ----
-    // A spinning airframe turns a demand on one gimbal channel into a response on
-    // the other. For an axisymmetric body Euler's equations reduce to
-    //     I_t * dw_t/dt = tau_t - (I_t - I_a) * w_roll * (b x w_t)
-    // so the cross-axis term is known exactly from quantities already in hand, and
-    // cancelling it costs one cross product.
-    //
-    // Keep the size of this in proportion. The coupling is a cross-axis rate
-    // feedback of gain ~1.5 rad/s at 90 deg/s against a 9 rad/s loop bandwidth, and
-    // the precession torque is about 2 % of what the gimbal can make. Measured in
-    // the simulation, the feedforward is worth +0.45 points of landing rate overall
-    // and about +1.0 between 45 and 75 deg/s. It is cheap and correctly signed, not
-    // a rescue.
-    float gyk = (I_pitch - S.mass * DG_I_AXIAL_COEF) * w_roll;
-    trx  += gyk * (by * wz - bz * wy);
-    trqy += gyk * (bz * wx - bx * wz);
-    trqz += gyk * (bx * wy - by * wx);
-
-    // Cancel the weathercocking torque the fins generate at angle of attack.
-    // tau_aero = L_CP * (b x F_normal), F_normal = q*A*CNA*(a_hat - (a_hat.b)b),
-    // so the whole feedforward collapses to one cross product -- and, unlike an
-    // atan2 formulation, it has no azimuth to go singular when the vehicle is
-    // exactly aligned with the airflow.
-    float v2 = nav->vx * nav->vx + nav->vy * nav->vy + nav->vz * nav->vz;
-    if (v2 > 1.0f) {
-        float v = sqrtf(v2);
-        float ahx = -nav->vx / v, ahy = -nav->vy / v, ahz = -nav->vz / v;
-        float kf = 0.5f * DG_RHO * v2 * DG_AREA * DG_CN_ALPHA * DG_L_CP;
-        trx  -= kf * (by * ahz - bz * ahy);
-        trqy -= kf * (bz * ahx - bx * ahz);
-        trqz -= kf * (bx * ahy - by * ahx);
+    // ---- clamp actuator model: where the clamp really is ----
+    {
+        float d = S.k_cmd - S.k_act;
+        float step = DG_CLAMP_RATE * DG_CTRL_DT;
+        S.k_act += clampf(d, -step, step);
+        S.k_act = clampf(S.k_act, DG_CLAMP_MIN, DG_CLAMP_MAX);
     }
 
-    // Dynamic inversion, in vector form. The gimbal produces
-    //     tau = -L * T * (b x s)
-    // with s the nozzle deflection, perpendicular to b -- which inverts EXACTLY
-    // to s = (b x tau) / (L * T). No linearisation; the round trip is exact to
-    // 1e-14. Thrust sweeps ~230x over a burn, and inverting it is what makes one
-    // fixed gain pair valid throughout.
-    float t_inv = thrust_est > 25.0f ? thrust_est : 25.0f;
-    float ti = 1.0f / (t_inv * DG_L_GIMBAL);
-    float sx = (by * trqz - bz * trqy) * ti;
-    float sy = (bz * trx  - bx * trqz) * ti;
-    float sz = (bx * trqy - by * trx)  * ti;
+    // ---- thrust-scale estimator: the most valuable measurement on board ----
+    // Only with a DETECTED onset. If the bump was never seen the axial
+    // accelerometer path is not to be believed, and an estimator fed a dead
+    // signal would talk the planner into a motor running 30 % weak.
+    if (engine_on && tb > 0.05f && S.onset_detected) {
+        float t_table = dg_thrust_ref(tb);
+        float f_aero = 0.5f * DG_RHO * DG_AREA * DG_CD_BURN * v2 *
+                       clampf(-dot3(v, b) / sqrtf(v2 + 1e-9f), -1.0f, 1.0f);
+        float t_meas = nav->a_axial * mass - f_aero;
+        float denom  = t_table * S.k_act;
+        if (denom > 15.0f && t_meas > 0.0f) {
+            float raw = clampf(t_meas / denom, 0.6f, 1.4f);
+            float ts  = S.t_scale + (raw - S.t_scale) * clampf(DG_CTRL_DT / 0.25f, 0.0f, 1.0f);
+            S.t_scale = clampf(ts, 0.7f, 1.3f);
+        }
+    }
+    float t_est = engine_on ? dg_thrust_ref(tb) * S.t_scale * S.k_act : 0.0f;
+    out->thrust_est = t_est;
+    out->t_scale    = S.t_scale;
+    if (t_est < 8.0f) t_est = 8.0f;            // floor for the inversion
 
-    // Project onto the two gimbal axes. The basis is orthonormal, so these are
-    // the sines of the two nozzle angles exactly.
-    float sd1 = clampf(sx * u1x + sy * u1y + sz * u1z, -0.0872f, 0.0872f);
-    float sd2 = clampf(sx * u2x + sy * u2y + sz * u2z, -0.0872f, 0.0872f);
-    const float DEG = 180.0f / (float)M_PI;
-    float c1 = fast_asinf(sd1) * DEG * DG_TVC_RATIO;
-    float c2 = fast_asinf(sd2) * DEG * DG_TVC_RATIO;
+    // ---- which loop is flying, and how hard (S7) ----
+    float wn_a, zeta_a, fac;
+    if (engine_on) {
+        wn_a = P.wn_tvc;  zeta_a = P.zeta_tvc;
+        fac = (P.sched_tvc != 0.0f) ? powf(t_est / DG_T_SCHED_REF, P.sched_tvc) : 1.0f;
+    } else {
+        wn_a = P.wn_fin;  zeta_a = P.zeta_fin;
+        fac = (P.sched_fin != 0.0f && q > 1.0f) ? powf(q / DG_Q_SCHED_REF, P.sched_fin) : 1.0f;
+    }
+    wn_a *= clampf(fac, DG_SCHED_LO, DG_SCHED_HI);
+    const float k_rate = 2.0f * zeta_a * wn_a;
+    const float k_th   = wn_a / (2.0f * zeta_a);
 
-    c1 = roundf(clampf(c1, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG) / DG_SERVO_QUANT)
-         * DG_SERVO_QUANT;
-    c2 = roundf(clampf(c2, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG) / DG_SERVO_QUANT)
-         * DG_SERVO_QUANT;
+    float oc[3] = { k_th * e[0], k_th * e[1], k_th * e[2] };
+    // Integral, nozzle only: a misaligned nozzle or a CG off the axis is a
+    // CONSTANT torque, and a proportional loop answers it with a constant
+    // attitude error. Kept perpendicular to b and clamped.
+    if (P.att_ki > 0.0f && engine_on) {
+        for (int i = 0; i < 3; i++) S.ie[i] += e[i] * DG_CTRL_DT;
+        float dpi = dot3(S.ie, b);
+        for (int i = 0; i < 3; i++) S.ie[i] -= dpi * b[i];
+        float inn = sqrtf(dot3(S.ie, S.ie));
+        if (inn > P.att_i_lim)
+            for (int i = 0; i < 3; i++) S.ie[i] *= P.att_i_lim / inn;
+        for (int i = 0; i < 3; i++) oc[i] += k_th * P.att_ki * S.ie[i];
+    }
+    float tr[3];
+    for (int i = 0; i < 3; i++) tr[i] = I_t * k_rate * (oc[i] - wt[i]) - taf[i];
+    // gyroscopic decoupling (S5 step 5)
+    float bxw[3];
+    cross3(b, wt, bxw);
+    const float gyk = (I_t - I_a) * w_roll;
+    for (int i = 0; i < 3; i++) tr[i] += gyk * bxw[i];
 
-    float ds = DG_SERVO_RATE * dt;
-    if      (c1 - S.servo1_act >  ds) S.servo1_act += ds;
-    else if (S.servo1_act - c1 >  ds) S.servo1_act -= ds;
-    else                              S.servo1_act  = c1;
-    if      (c2 - S.servo2_act >  ds) S.servo2_act += ds;
-    else if (S.servo2_act - c2 >  ds) S.servo2_act -= ds;
-    else                              S.servo2_act  = c2;
+    // ---- dynamic inversion: torque -> nozzle angle (S5 step 6) ----
+    float cmd1 = 0.0f, cmd2 = 0.0f;
+    if (engine_on) {
+        float sq[3];
+        cross3(b, tr, sq);
+        float inv = 1.0f / (t_est * DG_L_GIMBAL);
+        float sd1 = clampf(dot3(sq, u1) * inv, -0.999f, 0.999f);
+        float sd2 = clampf(dot3(sq, u2) * inv, -0.999f, 0.999f);
+        cmd1 = clampf(asinf(sd1) * RAD * DG_TVC_RATIO, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG);
+        cmd2 = clampf(asinf(sd2) * RAD * DG_TVC_RATIO, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG);
+        cmd1 = floorf(cmd1 / DG_SERVO_QUANT + 0.5f) * DG_SERVO_QUANT;
+        cmd2 = floorf(cmd2 / DG_SERVO_QUANT + 0.5f) * DG_SERVO_QUANT;
+    }
+    out->servo1_deg = cmd1;
+    out->servo2_deg = cmd2;
 
-    out->servo1_deg = S.servo1_act;
-    out->servo2_deg = S.servo2_act;
+    // ---- fins (S6) ----
+    if (P.fin_enable > 0.5f) {
+        // torque the nozzle will actually deliver; the fins get the rest
+        float rf[3] = { tr[0], tr[1], tr[2] };
+        if (engine_on) {
+            float s1 = sinf(cmd1 / DG_TVC_RATIO * DEG);
+            float s2 = sinf(cmd2 / DG_TVC_RATIO * DEG);
+            float gs[3] = { s1 * u1[0] + s2 * u2[0], s1 * u1[1] + s2 * u2[1],
+                            s1 * u1[2] + s2 * u2[2] };
+            float tg[3];
+            cross3(b, gs, tg);
+            for (int i = 0; i < 3; i++) rf[i] -= -DG_L_GIMBAL * t_est * tg[i];
+        }
+        float tau_roll = I_a * P.roll_gain * (0.0f - w_roll);
 
-    // touchdown / burnout latch
-    if (nav->h <= 0.25f && nav->vz > -0.5f) S.phase = DG_PHASE_DONE;
-    S.last_t = nav->t;
+        // The attitude part only flies once the airframe is within reach of
+        // its target: after apogee the vehicle turns over by itself, and a
+        // loop demanding 180 degrees of correction from stalled fins at
+        // walking pace only spins it up.
+        bool control = (bu > 0.5f);
+        float brake = 0.0f;
+        if (phase == DG_PHASE_ASCENT) {
+            if (P.fin_ascent_mode < 0.5f)      { control = false; tau_roll = 0.0f; }
+            else if (P.fin_ascent_mode < 1.5f) { control = false; }
+        } else if (!engine_on && P.fin_brake > 0.5f) {
+            brake = P.fin_max_deg;             // deployed while the motor is unlit
+        }
+        const float trim0[3] = { 0.0f, 0.0f, 0.0f };
+        const bool  adapt = P.fin_adapt > 0.5f;
+        dg_fin_mix(b, u1, u2, v, rf, tau_roll, brake,
+                   adapt ? S.kappa : clampf(P.fin_gain0, 0.4f, 2.0f),
+                   adapt ? S.trim : trim0, control, out->fin_deg);
+        out->fins_live = !(phase == DG_PHASE_ASCENT && P.fin_ascent_mode < 0.5f);
+
+        // learn from what the previous commands did
+        if (adapt && !engine_on && control &&
+            (phase == DG_PHASE_DESCENT || phase == DG_PHASE_IGNITING)) {
+            // the torques the controller models besides the fins: body
+            // weathercock, body damping, gyroscopic coupling
+            float c_damp = 0.5f * DG_RHO * sqrtf(v2) * DG_AREA * DG_CN_ALPHA * DG_L_CP * DG_L_CP;
+            float tm[3];
+            for (int i = 0; i < 3; i++) tm[i] = taf[i] - c_damp * wt[i] - gyk * bxw[i];
+            fin_adapt_step(nav, b, u1, u2, tm, I_t, I_a, w_roll);
+        } else {
+            S.w_prev_ok = false;
+        }
+        memcpy(S.fin_last, out->fin_deg, sizeof(S.fin_last));
+        out->fin_gain = S.kappa;
+        out->fin_trim[0] = S.trim[0] * RAD;
+        out->fin_trim[1] = S.trim[1] * RAD;
+        out->fin_trim[2] = S.trim[2] * RAD;
+    }
+
+    // ---- clamp command (S8) ----
+    if (phase == DG_PHASE_IGNITING || engine_on) {
+        float t_nom = engine_on ? dg_thrust_ref(tb) * S.t_scale : 0.0f;
+        float k = k_from_plan(S.k_level, false, h_est, nav->vz, mass, t_nom);
+        // Startup gate: held wide open until the TABLE says the motor makes
+        // 30 % of peak, latched, so tail-off is left to the planner.
+        if (S.gate_open && engine_on && dg_thrust_ref(tb) >= DG_THRUST_GATE * DG_PEAK_THRUST)
+            S.gate_open = false;
+        if (S.gate_open) k = DG_CLAMP_MAX;
+        S.k_cmd = k;
+    } else {
+        S.k_cmd = DG_CLAMP_MAX;
+    }
+    out->clamp  = S.k_cmd;
+    out->k_plan = S.k_level;
+    out->plan_resid = S.plan_resid;
+
+    if (phase == DG_PHASE_IGNITING || phase == DG_PHASE_BURN) {
+        float t_td = S.t_td_abs - now;
+        if (S.t_td_abs > 0.0f) out->t_to_touchdown = t_td > 0.0f ? t_td : 0.0f;
+    }
+}
+
+// =====================================================================
+//  PLANNER — core 1
+//
+//  A full solve is at most 34 projections of ~200 steps each. On the M33
+//  that is a few milliseconds, on a core that has nothing else to do, so
+//  it simply runs to completion ten times a second.
+// =====================================================================
+void dg_step_planner(const dg_nav_t *nav)
+{
+    const dg_phase_t phase = S.phase;
+    const float now = S.t;
+    if (!nav->valid) return;
+    const float h_est = nav->h - (S.lidar_acquired ? 0.0f : P.alt_pad);
+
+    if (phase == DG_PHASE_IGNITING || phase == DG_PHASE_BURN) {
+        if (S.t_plan >= 0.0f && now - S.t_plan < 1.0f / DG_PLAN_HZ) return;
+        if (h_est <= 0.05f) return;
+        float tb = (phase == DG_PHASE_BURN) ? now - S.t_burn0 : 0.0f;
+        if (tb < 0.0f) tb = 0.0f;
+        float resid = 0.0f, t_td = 0.0f;
+        float k = dg_solve_plan(h_est, nav->vz, tb, S.t_scale * (1.0f - P.plan_margin),
+                                &resid, &t_td);
+        S.k_level    = k;
+        S.plan_resid = resid;
+        S.t_td_abs   = now + t_td;
+        S.t_plan     = now;
+        return;
+    }
+
+    if (phase == DG_PHASE_DESCENT) {
+        // Once a second: how long from the ignition command to touchdown, so
+        // the vehicle has a landing countdown before the motor is lit.
+        if (S.t_plan >= 0.0f && now - S.t_plan < 1.0f) return;
+        S.t_plan = now;
+        // state at the command altitude, from an energy balance without drag
+        // loss beyond what has already happened (conservative: a bit fast)
+        float dh = h_est - S.h_cmd;
+        float v_cmd = -sqrtf(nav->vz * nav->vz + 2.0f * DG_G * (dh > 0.0f ? dh : 0.0f));
+        float kd = 0.5f * DG_RHO * DG_AREA * DG_CD_FREE / P.mass_gross;
+        float vt = -sqrtf(DG_G / kd);                 // terminal velocity
+        if (v_cmd < vt) v_cmd = vt;
+        float t_delay = 0.5f * DG_IGN_DELAY_PAD;      // the mean igniter delay
+        float h_on = S.h_cmd - (-v_cmd) * t_delay;
+        if (h_on < 1.0f) h_on = 1.0f;
+        float resid = 0.0f, t_td = 0.0f;
+        (void)dg_solve_plan(h_on, v_cmd, 0.0f, 1.0f - P.plan_margin, &resid, &t_td);
+        S.t_nom_burn = t_delay + t_td;
+    }
 }

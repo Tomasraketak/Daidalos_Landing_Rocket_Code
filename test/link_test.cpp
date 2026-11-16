@@ -68,12 +68,12 @@ static void test_layout(void)
 
     check(sizeof(ariadna_nav_state_t)     == 88, "nav_state is 88 bytes");
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
-    check(sizeof(ariadna_nav_status_t)    == 48, "nav_status is 48 bytes");
-    check(sizeof(ariadna_pos_status_t)    == 84, "pos_status is 84 bytes");
+    check(sizeof(ariadna_nav_status_t)    == 80, "nav_status is 80 bytes");
+    check(sizeof(ariadna_pos_status_t)    == 96, "pos_status is 96 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
-    check(sizeof(ariadna_tlm_t)           == 47, "telemetry is 47 bytes");
-    check(sizeof(ariadna_gs_serial_t)     == 49, "gs serial is 49 bytes");
+    check(sizeof(ariadna_tlm_t)           == 50, "telemetry is 50 bytes");
+    check(sizeof(ariadna_gs_serial_t)     == 52, "gs serial is 52 bytes");
 
     // Every inter-MCU struct must be a multiple of 4 so that the packed
     // and natural layouts agree and no member is ever misaligned.
@@ -94,13 +94,13 @@ static void test_layout(void)
     check(offsetof(ariadna_tlm_t, vz_dms)     == 14, "tlm.vz_dms at 14");
     check(offsetof(ariadna_tlm_t, vh_dms)     == 16, "tlm.vh_dms at 16");
     check(offsetof(ariadna_tlm_t, acc_cg)     == 18, "tlm.acc_cg at 18");
-    check(offsetof(ariadna_tlm_t, roll_ddeg)  == 20, "tlm.roll at 20");
-    check(offsetof(ariadna_tlm_t, pitch_ddeg) == 22, "tlm.pitch at 22");
-    check(offsetof(ariadna_tlm_t, yaw_ddeg)   == 24, "tlm.yaw at 24");
-    check(offsetof(ariadna_tlm_t, temp_dc)    == 26, "tlm.temp at 26");
-    check(offsetof(ariadna_tlm_t, tvc_x_cdeg) == 28, "tlm.tvc_x at 28");
-    check(offsetof(ariadna_tlm_t, tvc_y_cdeg) == 30, "tlm.tvc_y at 30");
-    check(offsetof(ariadna_tlm_t, thrust_n)   == 32, "tlm.thrust at 32");
+    check(offsetof(ariadna_tlm_t, qx)         == 20, "tlm.qx at 20");
+    check(offsetof(ariadna_tlm_t, qy)         == 22, "tlm.qy at 22");
+    check(offsetof(ariadna_tlm_t, qz)         == 24, "tlm.qz at 24");
+    check(offsetof(ariadna_tlm_t, tvc_x_cdeg) == 26, "tlm.tvc_x at 26");
+    check(offsetof(ariadna_tlm_t, tvc_y_cdeg) == 28, "tlm.tvc_y at 28");
+    check(offsetof(ariadna_tlm_t, thrust_n)   == 30, "tlm.thrust at 30");
+    check(offsetof(ariadna_tlm_t, t_event_ds) == 32, "tlm.t_event at 32");
     check(offsetof(ariadna_tlm_t, version)    == 34, "tlm.version at 34");
     check(offsetof(ariadna_tlm_t, state)      == 35, "tlm.state at 35");
     check(offsetof(ariadna_tlm_t, nav_phase)  == 36, "tlm.nav_phase at 36");
@@ -112,11 +112,14 @@ static void test_layout(void)
     check(offsetof(ariadna_tlm_t, pyro)       == 42, "tlm.pyro at 42");
     check(offsetof(ariadna_tlm_t, health)     == 43, "tlm.health at 43");
     check(offsetof(ariadna_tlm_t, flags)      == 44, "tlm.flags at 44");
-    check(offsetof(ariadna_tlm_t, exp)        == 45, "tlm.exp at 45");
+    check(offsetof(ariadna_tlm_t, events)     == 45, "tlm.events at 45");
     check(offsetof(ariadna_tlm_t, uwb)        == 46, "tlm.uwb at 46");
+    check(offsetof(ariadna_tlm_t, t_flight_s) == 47, "tlm.t_flight at 47");
+    check(offsetof(ariadna_tlm_t, px_m)       == 48, "tlm.px at 48");
+    check(offsetof(ariadna_tlm_t, py_m)       == 49, "tlm.py at 49");
 
-    check(offsetof(ariadna_gs_serial_t, rssi) == 47, "gs.rssi at 47");
-    check(offsetof(ariadna_gs_serial_t, snr)  == 48, "gs.snr at 48");
+    check(offsetof(ariadna_gs_serial_t, rssi) == 50, "gs.rssi at 50");
+    check(offsetof(ariadna_gs_serial_t, snr)  == 51, "gs.snr at 51");
 
     // Nothing may exceed the frame buffer.
     check(sizeof(ariadna_nav_state_t) <= ARIADNA_PAYLOAD_MAX, "nav_state fits a frame");

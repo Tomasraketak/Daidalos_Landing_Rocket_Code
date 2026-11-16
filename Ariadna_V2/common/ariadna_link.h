@@ -110,6 +110,13 @@
 // things: that one is a constraint, this one is a convention.
 #define ARIADNA_CONSOLE_BAUD 115200UL
 
+// One version number for the whole flight software, reported by every
+// board in its status packet and shown by the diagnostic GUI. Three boards
+// showing three different numbers is a mixed flash, and a mixed flash is
+// the first thing to rule out when something makes no sense.
+//   major * 100 + minor
+#define ARIADNA_FW_VERSION   300   // 3.00: LandSim_Light guidance, fins, sequencer
+
 // ---------------------------------------------------------------------
 //  Framing constants
 // ---------------------------------------------------------------------
@@ -134,6 +141,7 @@ typedef enum {
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
     ARIADNA_PKT_CMD          = 0x31,  // Master -> Position, Navigation
+    ARIADNA_PKT_PARAM        = 0x32,  // Master -> Position, Navigation (ground only)
     ARIADNA_PKT_TELEMETRY    = 0x40   // Master -> LoRa -> Ground Station
 } ariadna_pkt_t;
 
@@ -237,7 +245,7 @@ typedef enum {
 #define ARIADNA_NAV_GPS_FIX    (1u << 4)
 #define ARIADNA_NAV_PAD_REF    (1u << 5)   // pad altitude reference captured
 #define ARIADNA_NAV_UWB_OK     (1u << 6)   // DWM1000 ranging alive: >=1 fresh anchor
-#define ARIADNA_NAV_LIDAR_OK   (1u << 7)   // FUTURE: TF Luna range valid
+#define ARIADNA_NAV_LIDAR_OK   (1u << 7)   // TF Luna range accepted: pz is lidar referenced
 #define ARIADNA_NAV_ACC_SAT    (1u << 8)   // accelerometer clipped this cycle
 #define ARIADNA_NAV_DEADRECK   (1u << 9)   // extrapolated, not measured
 #define ARIADNA_NAV_POS_ORIGIN (1u << 10)  // horizontal origin set: px/py mean m from the pad
@@ -300,8 +308,9 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_state_t) == 88, "nav_state layout chang
 // --- ariadna_actuator_t.flags ----------------------------------------
 #define ARIADNA_ACT_VALID      (1u << 0)   // commands are live; else hold
 #define ARIADNA_ACT_IGNITE     (1u << 1)   // Navigation has fired its pyro
-#define ARIADNA_ACT_FINS_LIVE  (1u << 2)   // FUTURE: fin commands are meaningful
+#define ARIADNA_ACT_FINS_LIVE  (1u << 2)   // fin commands are meaningful; else park the fins
 #define ARIADNA_ACT_TVC_PARK   (1u << 3)   // park TVC at neutral
+#define ARIADNA_ACT_COVER_OPEN (1u << 4)   // unlatch the aerocover (latched by the Master)
 
 /**
  * Actuator command, Navigation MCU -> Master, 200 Hz.
@@ -321,7 +330,8 @@ typedef struct {
     float    tvc_x_deg;   // TVC servo command, body axis 1
     float    tvc_y_deg;   // ... and body axis 2
     float    clamp;       // thrust-clamp fraction, DG_CLAMP_MIN..DG_CLAMP_MAX
-    float    fin_deg[4];  // FUTURE: controllable aero fins. Zero until flown.
+    float    fin_deg[4];  // fin deflections, deg. Fin i sits i*90 deg from body
+                          // axis 1; positive pushes the fin along b x r_i.
     uint8_t  flags;       // ARIADNA_ACT_* bits
     uint8_t  phase;       // dg_phase_t, mirrored for the Master's LED/buzzer
     uint8_t  _pad[2];
@@ -335,26 +345,41 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_actuator_t) == 36, "actuator layout changed
 #define ARIADNA_NST_PLANNER_OK (1u << 3)   // core 1 still iterating
 #define ARIADNA_NST_BACKUP_ARM (1u << 4)   // backup igniter channel armed
 
+#define ARIADNA_NST_PARAM_OK   (1u << 5)   // every parameter has been received
+#define ARIADNA_NST_TEST_ARMED (1u << 6)   // TEST mode: bench pyro arming is live
+
 /** Navigation MCU housekeeping, 20 Hz. Never in the control path. */
 typedef struct {
     uint32_t t_ms;
-    float    p_plan;       // planner parameter, 0..4
+    float    k_plan;       // planned clamp level, 0.1..1
     float    thrust_est;   // N
     float    h_ignite;     // m, commanded ignition altitude
     float    tilt_cmd;     // rad, commanded tilt from vertical
     float    tilt_err;     // rad, total angle between commanded and actual axis
-    float    roll_rate;    // rad/s about the body axis: uncontrolled, reported only
+    float    roll_rate;    // rad/s about the body axis
+    float    t_to_ign;     // s until the ignition command, < 0 unknown
+    float    t_to_td;      // s until the planned touchdown, < 0 unknown
+    float    t_scale;      // estimated thrust / tabulated thrust
+    float    fin_gain;     // estimated fin effectiveness, 1 = the model
+    float    h_apogee;     // m, apogee this flight (0 before)
+    float    plan_resid;   // m/s, < 0: the plan cannot reach its target
     uint32_t rx_ok;
     uint32_t rx_bad;
     uint32_t plan_iters;   // must keep advancing or core 1 has died
     uint16_t loop_max_us;  // worst 200 Hz loop time seen
     uint16_t overruns;     // missed 200 Hz slots
+    uint16_t fw_version;   // ARIADNA_FW_VERSION of this board
+    uint16_t param_crc;    // CRC of the parameter table this board holds
     uint8_t  phase;        // dg_phase_t
     uint8_t  pyro_cont;    // continuity bitmask, bit n = channel n+1 has a match
     uint8_t  pyro_fired;   // fired bitmask, same bit order
     uint8_t  flags;        // ARIADNA_NST_* bits
+    uint8_t  events;       // ARIADNA_EV_* bits (ariadna_seq.h)
+    uint8_t  pyro_active;  // channels with current flowing right now
+    uint8_t  params_seen;  // how many distinct parameters have arrived
+    uint8_t  _pad;
 } ariadna_nav_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 48, "nav_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 80, "nav_status layout changed");
 
 // --- ariadna_pos_status_t.sensor_ok ----------------------------------
 #define ARIADNA_SENS_IMU       (1u << 0)
@@ -362,7 +387,8 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 48, "nav_status layout cha
 #define ARIADNA_SENS_MAG       (1u << 2)
 #define ARIADNA_SENS_GPS       (1u << 3)
 #define ARIADNA_SENS_UWB       (1u << 4)
-#define ARIADNA_SENS_LIDAR     (1u << 5)   // FUTURE
+#define ARIADNA_SENS_LIDAR     (1u << 5)   // TF Luna answering on I2C
+#define ARIADNA_SENS_INS       (1u << 6)   // INSLIB filter running
 
 /**
  * Position MCU housekeeping and telemetry, 20 Hz.
@@ -417,8 +443,15 @@ typedef struct {
     uint8_t  uwb_mask;       // bit i: anchor slot i contributed
     uint8_t  uwb_mode;       // ariadna_uwb_mode_t: 0 none, 1 LOS, 2 2-D, 3 3-D
     uint8_t  uwb_rejects;    // consecutive innovation-gate rejections
+    float    lidar_m;        // m, last TF Luna range (slant), 0 = none
+    uint16_t fw_version;     // ARIADNA_FW_VERSION of this board
+    uint16_t param_crc;      // CRC of the parameter table this board holds
+    uint8_t  ins_mode;       // INSLIB: 0 none, 1 attitude, 2 coasting, 3 full; 255 = not built
+    uint8_t  att_src;        // 0 TriSense fusion, 1 INSLIB
+    uint8_t  lidar_strength; // signal strength / 256, saturating
+    uint8_t  params_seen;    // how many distinct parameters have arrived
 } ariadna_pos_status_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 84, "pos_status layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 96, "pos_status layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
@@ -470,6 +503,18 @@ typedef struct {
 } ariadna_cmd_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_cmd_t) == 8, "cmd layout changed");
 
+/**
+ * One parameter, Master -> Position and Navigation. Streamed round-robin
+ * while the vehicle is on the ground; see ariadna_params.h.
+ */
+typedef struct {
+    float    value;
+    uint8_t  id;           // ARIADNA_P_*
+    uint8_t  count;        // ARIADNA_PARAM_COUNT at the sender, a layout check
+    uint8_t  _pad[2];
+} ariadna_param_pkt_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_param_pkt_t) == 8, "param packet layout changed");
+
 typedef enum {
     ARIADNA_CMD_NOP        = 0,
     ARIADNA_CMD_SET_PAD_REF= 1,   // capture pad pressure / GPS origin
@@ -484,9 +529,11 @@ typedef enum {
 // ---------------------------------------------------------------------
 //  LoRa downlink packet
 //
-//  Packed to 47 bytes because airtime, not RAM, is the constraint. At
-//  SF7 / BW125 / CR4-5 a 47-byte payload is ~73 ms on air, so the 5 Hz
-//  default downlink is about a 37 % duty cycle. Raising the rate or the
+//  Packed to 50 bytes because airtime, not RAM, is the constraint. LoRa
+//  payload symbols come in blocks: at SF7 a 48..50-byte payload costs one
+//  block more than a 47-byte one (48.8 ms on air instead of 46.2 ms at
+//  BW 250 kHz), and a 51st byte would cost another and push a 10 Hz
+//  downlink past half the channel. So 50 is the ceiling, not a target. Raising the rate or the
 //  size eats that margin directly — check ARIADNA_TLM_HZ in Master_MCU.ino
 //  before adding a field. The most recent addition was the single UWB
 //  status byte, and it was argued for on exactly those grounds: one byte
@@ -499,7 +546,10 @@ typedef enum {
 //  ground_visualizer.py must be updated in lockstep. Its struct format
 //  string is asserted against this layout by ../../test/link_test.cpp.
 // ---------------------------------------------------------------------
-#define ARIADNA_TLM_VERSION  3
+#define ARIADNA_TLM_VERSION  4
+
+// Sentinel for t_event_ds: no countdown is known.
+#define ARIADNA_TLM_T_UNKNOWN  (-32768)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -510,29 +560,39 @@ typedef struct {
     int16_t  vz_dms;       // 14  m/s * 10, NEGATIVE descending
     int16_t  vh_dms;       // 16  horizontal speed, m/s * 10
     int16_t  acc_cg;       // 18  |a| in g * 100
-    int16_t  roll_ddeg;    // 20  deg * 10
-    int16_t  pitch_ddeg;   // 22
-    int16_t  yaw_ddeg;     // 24
-    int16_t  temp_dc;      // 26  degC * 10
-    int16_t  tvc_x_cdeg;   // 28  TVC servo deg * 100
-    int16_t  tvc_y_cdeg;   // 30
-    int16_t  thrust_n;     // 32  estimated thrust, N
+    // Attitude as a quaternion (body -> pad-ENU), "smallest three" style:
+    // x, y, z scaled by 32767 with the sign chosen so that w >= 0, and w
+    // recovered on the ground as sqrt(1 - x^2 - y^2 - z^2). Six bytes, the
+    // same as the Euler triple it replaced, and usable at any attitude.
+    int16_t  qx;           // 20
+    int16_t  qy;           // 22
+    int16_t  qz;           // 24
+    int16_t  tvc_x_cdeg;   // 26  TVC servo deg * 100
+    int16_t  tvc_y_cdeg;   // 28
+    int16_t  thrust_n;     // 30  estimated thrust, N
+    // The countdown, in 0.1 s. Before the ignition command (nav_phase
+    // DESCENT) it is the time to the command; from the command on it is the
+    // time to the planned touchdown. ARIADNA_TLM_T_UNKNOWN when unknown.
+    int16_t  t_event_ds;   // 32
     uint8_t  version;      // 34  == ARIADNA_TLM_VERSION
     uint8_t  state;        // 35  ariadna_state_t
     uint8_t  nav_phase;    // 36  dg_phase_t
     uint8_t  clamp_pct;    // 37  thrust clamp, percent
-    uint8_t  vbat_cv;      // 38  (V - 2.5) * 100, same encoding as V1
+    uint8_t  vbat_cv;      // 38  (V - 5.0) * 50: 5.0..10.1 V in 20 mV steps (2S)
     uint8_t  curr_da;      // 39  amps * 10
     uint8_t  hdop_x10;     // 40
     uint8_t  sats;         // 41
     uint8_t  pyro;         // 42  low nibble continuity, high nibble fired
     uint8_t  health;       // 43  ARIADNA_HLT_* bits
     uint8_t  flags;        // 44  ARIADNA_TF_* bits
-    uint8_t  exp;          // 45  experiment / payload phase, free for you
+    uint8_t  events;       // 45  ARIADNA_EV_* bits: what the sequencer has done
     uint8_t  uwb;          // 46  ARIADNA_TUWB_* — see below
+    uint8_t  t_flight_s;   // 47  seconds since launch detect, saturating at 255
+    int8_t   px_m;         // 48  metres East of the pad, saturating at +-127
+    int8_t   py_m;         // 49  metres North of the pad
 } ariadna_tlm_t;
 #pragma pack(pop)
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_tlm_t) == 47, "telemetry layout changed - update ground_visualizer.py");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_tlm_t) == 50, "telemetry layout changed - update ground_visualizer.py");
 
 // --- ariadna_tlm_t.uwb ------------------------------------------------
 //
@@ -582,7 +642,7 @@ typedef struct {
     int8_t        snr;     // dB
 } ariadna_gs_serial_t;
 #pragma pack(pop)
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 49, "gs serial layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 52, "gs serial layout changed");
 
 // ---------------------------------------------------------------------
 //  Default rates

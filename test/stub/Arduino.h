@@ -73,6 +73,8 @@ public:
     void   setTX(uint8_t) {}
     void   setRX(uint8_t) {}
     int    available(void) { return 0; }
+    int    availableForWrite(void) { return 256; }
+    explicit operator bool() const { return true; }
     int    read(void) { return -1; }
     size_t write(const uint8_t *, size_t) { return 0; }
     void   println(const char *) {}

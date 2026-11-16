@@ -1,6 +1,8 @@
 # Host verification build. The flight algorithm compiles unchanged.
 #
-#   make          numerical check of the algorithm against the Python model
+#   make          legacy V1 guidance (Daidalos_Landing_Guidance) against its model
+#   make guid     guidance v2 (LandSim_Light port): golden vectors + closed loop
+#   make seq      flight event sequencer and the parameter table
 #   make est      Ariadna V2 navigation filter
 #   make uwb      Ariadna V2 UWB multilateration
 #   make uwblink  Ariadna V2 UWB tag I2C frame codec
@@ -35,6 +37,30 @@ all: host_test
 
 host_test: $(SRC) ../Daidalos_Landing_Guidance/guidance.h golden_vectors.h
 	$(CXX) $(CXXFLAGS) -o host_test $(SRC) -lm
+
+# ---------------------------------------------------------------------
+# Guidance v2. guid_golden.h and Ariadna_V2/common/guidance_tables.h are
+# generated from the simulation: `make tables SIM=../../LandSim_Light`.
+# ---------------------------------------------------------------------
+GUID_SRC = $(V2)/common/guidance.cpp
+GUID_DEP = $(V2)/common/guidance.h $(V2)/common/guidance_tables.h
+
+guid: guid_test
+	./guid_test
+
+guid_test: guid_test.cpp $(GUID_SRC) $(GUID_DEP) guid_golden.h
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -o guid_test guid_test.cpp $(GUID_SRC) -lm
+	$(CXX) $(CXXFLAGS) -fsyntax-only $(GUID_SRC)
+
+seq: seq_test
+	./seq_test
+
+seq_test: seq_test.cpp $(V2)/common/ariadna_seq.h $(V2)/common/ariadna_params.h $(GUID_SRC) $(GUID_DEP)
+	$(CXX) $(CXXFLAGS) -o seq_test seq_test.cpp $(GUID_SRC) -lm
+
+SIM ?= ../../LandSim_Light
+tables:
+	python3 ../tools/gen_guidance_tables.py --sim $(SIM)
 
 # ---------------------------------------------------------------------
 # Ariadna V2 link codec. Shared by three MCUs, a ground station and a
@@ -99,13 +125,22 @@ uwb_link_test: uwb_link_test.cpp $(UWBL_H)
 # failure this repository exists to prevent, so the copies are checked
 # rather than trusted. `make sync-fix` refreshes them all.
 # ---------------------------------------------------------------------
-GUIDANCE_SRC = ../Daidalos_Landing_Guidance
+GUIDANCE_SRC = $(V2)/common
 
 # original:copy pairs, relative to this directory
 SYNC_PAIRS = \
   $(GUIDANCE_SRC)/guidance.h:$(NAV_DIR)/guidance.h \
   $(GUIDANCE_SRC)/guidance.cpp:$(NAV_DIR)/guidance.cpp \
   $(GUIDANCE_SRC)/guidance.h:$(V2)/Master_MCU/guidance.h \
+  $(GUIDANCE_SRC)/guidance_tables.h:$(NAV_DIR)/guidance_tables.h \
+  $(GUIDANCE_SRC)/guidance_tables.h:$(V2)/Master_MCU/guidance_tables.h \
+  $(V2)/common/ariadna_params.h:$(NAV_DIR)/ariadna_params.h \
+  $(V2)/common/ariadna_params.h:$(V2)/Master_MCU/ariadna_params.h \
+  $(V2)/common/ariadna_params.h:$(V2)/Position_MCU/ariadna_params.h \
+  $(V2)/common/ariadna_seq.h:$(NAV_DIR)/ariadna_seq.h \
+  $(V2)/common/ariadna_seq.h:$(V2)/Master_MCU/ariadna_seq.h \
+  $(V2)/common/actcon_pyro.h:$(NAV_DIR)/actcon_pyro.h \
+  $(V2)/common/actcon_pyro.h:$(V2)/Master_MCU/actcon_pyro.h \
   $(V2)/common/ariadna_link.h:$(V2)/Master_MCU/ariadna_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Master_MCU/ariadna_uart_dma.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Master_MCU/ariadna_rgb.h \
@@ -209,7 +244,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all est uwb uwblink link sync pyfmt syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink link sync pyfmt syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -217,5 +252,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test link_test est_test uwb_test uwb_link_test actcon_test
-.PHONY: all est uwb uwblink link sync sync-fix pyfmt syntax check golden clean actcon
+	rm -f host_test guid_test seq_test link_test est_test uwb_test uwb_link_test actcon_test
+.PHONY: all guid seq tables est uwb uwblink link sync sync-fix pyfmt syntax check golden clean actcon

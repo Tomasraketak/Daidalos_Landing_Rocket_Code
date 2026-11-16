@@ -1,49 +1,49 @@
 // =====================================================================
-//  Daidalos landing guidance — TVC nozzle angle and thrust-clamp command
+//  Daidalos landing guidance, version 2 — the LandSim_Light algorithm
 //
-//  Pure algorithm: no Arduino headers, no dynamic allocation, no I/O.
-//  Compiles unchanged for the RP2350 and for the host test in ../test/,
-//  which is what lets the port be verified against the Python model
-//  rather than merely compiled.
+//  A port of the flight algorithm of
+//      https://github.com/Tomasraketak/LandSim_Light   (tvc_sim.py)
+//  section "The flight algorithm, step by step" of its README. What the
+//  vehicle decides, when, and with which numbers is the simulation's; the
+//  tables in guidance_tables.h are GENERATED from it by
+//  tools/gen_guidance_tables.py, and test/guid_test.cpp compares this file
+//  against reference values computed by the simulation itself.
 //
-//  Target: RP2350 (Cortex-M33, 150 MHz, SINGLE-precision FPU).
-//  Everything is `float`. A stray `double` here is 10-50x slower because
-//  the M33 has no double-precision hardware — see the notes in guidance.cpp.
+//  Pure algorithm: no Arduino headers, no dynamic allocation, no I/O. It
+//  compiles unchanged for the RP2350 and for the host test.
 //
-//  Vehicle: solid landing motor in the nose, fired downward during a
-//  nose-first descent. A thrust-diverting clamp cuts axial thrust without
-//  net side force. Clamped impulse is WASTED and the ~1.7 s burn cannot
-//  be extended.
+//  Target: RP2350 (Cortex-M33, SINGLE-precision FPU). Everything is float.
 //
-//  THREE DIMENSIONS, TWO GIMBAL AXES, AND THE AIRFRAME MAY ROLL.
+//  ---------------------------------------------------------------------
+//  WHAT IT DECIDES
+//  ---------------------------------------------------------------------
+//    200 Hz   where the thrust should point (ZEV law, drag credit, tilt cone)
+//    200 Hz   two TVC servo angles (cascade attitude loop with an integral,
+//             aero feedforward, gyroscopic decoupling, dynamic inversion)
+//    200 Hz   four fin angles (steering the nozzle cannot do, roll damping,
+//             crossflow cancellation, airbrake, stall limiter) with an
+//             ON-LINE ESTIMATE of how strong the fins really are
+//    10 Hz    the thrust-clamp level (receding-horizon forward simulation)
+//    once     when to fire the igniter (table: apogee altitude x drift)
 //
-//  The nozzle deflects about two perpendicular axes. Roll about the body's
-//  own long axis has no actuator -- fin control is future work -- so the
-//  vehicle simply rotates at whatever rate it inherited, up to 90 deg/s.
-//  This code is built to fly through that rather than to assume it away.
+//  It also reports the two countdowns the rest of the vehicle sequences
+//  on: time to the ignition command and time to touchdown.
 //
-//  Two things follow, and both are handled here:
+//  ---------------------------------------------------------------------
+//  FRAMES
+//  ---------------------------------------------------------------------
+//  World: z up, x and y horizontal, origin at the pad. vz is NEGATIVE while
+//  descending. Attitude is two body-fixed unit vectors, never Euler angles:
 //
-//   1. THE SERVO AXES ROTATE WITH THE AIRFRAME. They are bolted to it. A
-//      controller that assumed they were anchored to the world would steer
-//      into the wrong mixture of channels -- smoothly, with no symptom but
-//      a landing in the wrong place. That is why dg_nav_t carries a second
-//      body-fixed axis, g, alongside the thrust axis b: together they pin
-//      the airframe's roll orientation down.
+//    b   the landing motor's thrust axis: the direction thrust pushes the
+//        vehicle. Standing on the pad b = (0,0,-1); nose-first descent
+//        b = (0,0,+1).
+//    g   a transverse body axis marking the roll orientation: the axis TVC
+//        servo 1 deflects the nozzle in, and the radial direction of fin 0.
 //
-//   2. THE SPIN COUPLES THE TWO CHANNELS. A demand on one produces a
-//      response on the other: a cross-axis rate feedback of gain
-//      (1 - I_axial/I_transverse) * w_roll, about 1.5 rad/s at 90 deg/s
-//      against a 9 rad/s loop bandwidth. That is a perturbation of the
-//      rate loop, not a threat to it -- the precession torque is ~2 % of
-//      what the gimbal can produce. The loop cancels it anyway with a
-//      gyroscopic feedforward, because it costs one cross product and is
-//      worth about half a point of landing rate. Do not expect more.
-//
-//  The gimbal still cannot produce a roll torque (its moment is
-//  (-L*b) x F, perpendicular to b by construction), so the roll rate is
-//  whatever the vehicle arrived with. The loop projects it out of the rate
-//  feedback rather than trying to fight it.
+//  Fin i sits at azimuth i*90 deg from g about b (r_i = cos*u1 + sin*u2,
+//  u2 = b x u1). A POSITIVE deflection of fin i pushes the fin along
+//  n_i = b x r_i. The fins are 0.50 m from the CG on the +b side (the tail).
 // =====================================================================
 #ifndef DAIDALOS_GUIDANCE_H
 #define DAIDALOS_GUIDANCE_H
@@ -51,175 +51,191 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// ---------------------------------------------------------------------
-//  Vehicle / environment constants (must match the simulation model)
-// ---------------------------------------------------------------------
-#define DG_G              9.81f
-#define DG_RHO            1.225f
-#define DG_AREA           0.00865901f   // m^2, 105 mm body
-#define DG_CD_AXIAL       1.0f
-#define DG_CN_ALPHA       2.0f          // normal force slope, C_N = CNA*sin(a)
-#define DG_L_BODY         1.40f         // m
-#define DG_L_GIMBAL       0.70f         // CG -> nose nozzle, m
-#define DG_L_CP           0.35f         // CG -> centre of pressure (aft), m
-#define DG_M_INITIAL      3.20f         // kg, wet
-#define DG_M_PROP         0.330f        // kg of grain
-// Axial (roll) inertia per kg: a solid cylinder is R^2/2, a thin shell R^2, and a real
-// airframe is between. The smaller value is taken deliberately -- the gyroscopic
-// coupling scales with (I_transverse - I_axial), so under-estimating I_axial over-states
-// the coupling the feedforward has to cancel, which is the safe direction to be wrong in.
-#define DG_I_AXIAL_COEF   0.001378f     // m^2; I_axial = mass * this, 105 mm body
-// From the static fire. See the curve and the caveats in guidance.cpp.
-#define DG_I_TOTAL        222.17f       // N.s, full-throttle impulse
-#define DG_BURN_T         2.7302f       // s, nominal burn duration
-#define DG_MASS_PER_NS    0.00148536f   // kg consumed per N.s of RAW impulse
-#define DG_PEAK_THRUST    120.41f       // N, for reference and self-tests
-#define DG_H_START        85.0f         // m, guidance arming altitude
+#include "guidance_tables.h"
 
-// Actuators
+#define DG_VERSION        200          // 2.00 — LandSim_Light port
+
+// ---------------------------------------------------------------------
+//  Fixed constants (the simulation's)
+// ---------------------------------------------------------------------
+#define DG_G              9.80665f
+#define DG_RHO            1.225f
+
 #define DG_SERVO_MAX_DEG  10.0f         // TVC servo travel limit
 #define DG_TVC_RATIO      2.0f          // servo deg per nozzle deg
-#define DG_SERVO_RATE     500.0f        // deg/s
 #define DG_SERVO_QUANT    0.15f         // deg
 #define DG_CLAMP_MIN      0.10f
 #define DG_CLAMP_MAX      1.00f
 #define DG_CLAMP_RATE     12.84f        // clamp fraction per second
+#define DG_THRUST_GATE    0.30f         // clamp held open below this fraction of peak
 
-// Ignition delay, MEASURED: command to thrust onset. The stand timed 1.450 s to
-// the 5 % crossing with 1.300-1.850 s across firings; onset is 50 ms earlier.
-//
-// This is the number that reshaped the vehicle. At 40 m/s the airframe falls 66 m
-// during the nominal delay and arrives 14 m/s faster, and the 0.55 s SPREAD alone
-// is +-13 m of ignition altitude on a ~50 m stopping budget. Every altitude margin
-// in this module was originally sized against 0.10-0.30 s.
-#define DG_IGN_DELAY_LO   1.25f
-#define DG_IGN_DELAY_HI   1.80f
+#define DG_H_TERM         3.0f          // terminal law below this altitude, m
+#define DG_A_TERM         8.0f          // m/s^2, sets the terminal descent profile
+#define DG_A_TERM_MAX     70.0f
+#define DG_KP_VZ          3.0f
+#define DG_T_SCHED_REF    100.0f        // N
+#define DG_Q_SCHED_REF    700.0f        // Pa
+#define DG_SCHED_LO       0.35f
+#define DG_SCHED_HI       2.0f
+#define DG_FIN_STALL_MARGIN 1.5f        // deg
+#define DG_PLAN_DT        0.02f         // s, projection step in flight
+#define DG_PLAN_NMAX      1500          // 30 s of projection, hard bound
 
-// Attitude loop gains (see tvc_gains.json / tools/precalibrate.py).
-// omega_n is a BANDWIDTH in rad/s and zeta a damping ratio: both survive the
-// dynamic inversion, which is why one fixed pair is valid across the whole burn.
-#define DG_OMEGA_N        9.0f
-#define DG_ZETA           1.0f
-#define DG_KI_ATT         0.0f          // calibrated to zero: the rate loop holds
-                                        // attitude against nozzle bias unaided
-
-// Rates
 #define DG_CTRL_HZ        200.0f
 #define DG_CTRL_DT        (1.0f / DG_CTRL_HZ)
 #define DG_PLAN_HZ        10.0f
+
+// The Master reports "GUIDANCE" when the Navigation MCU says the ignition
+// command has gone out. If it cannot hear the Navigation MCU it falls back
+// on this altitude, so the Position MCU still stops trusting the barometer
+// before the plume reaches it.
+#define DG_H_HANDOVER_FALLBACK 60.0f
+
+// ---------------------------------------------------------------------
+//  Tunable parameters. Every one has the simulation's value as its default
+//  (dg_params_default) and every one can be changed from the diagnostic
+//  GUI before flight; see ariadna_params.h for names, units and limits.
+// ---------------------------------------------------------------------
+typedef struct {
+    // vehicle
+    float mass_gross;        // kg with propellant
+    float mass_prop;         // kg
+    // attitude loop, motor lit (nozzle)
+    float wn_tvc, zeta_tvc, sched_tvc;
+    float att_ki;            // 1/s, integral, nozzle only
+    float att_i_lim;         // rad*s
+    // attitude loop, motor unlit (fins)
+    float wn_fin, zeta_fin, sched_fin;
+    float roll_gain;         // rad/s
+    float roll_max_deg;      // travel the roll channel may spend
+    // guidance law
+    float tilt_min_deg, tilt_slope, tilt_cap_deg;
+    float alt_pad;           // m assumed LOWER than read until the lidar acquires
+    float h_ign_bias;        // m added to the table's ignition altitude
+    float h_ign_override;    // > 0: ignite at this altitude instead of the table
+    // clamp planner
+    float plan_target;       // m/s, touchdown speed aimed for (negative)
+    float plan_margin;       // fraction of estimated thrust not counted on
+    float plan_hold;         // s
+    // thrust onset detection
+    float onset_bump;        // m/s^2 rise of axial specific force = "motor lit"
+    float onset_timeout;     // s after the command before onset is assumed
+    float onset_assumed;     // s, the delay assumed in that case
+    // fins
+    float fin_enable;        // 0 = fins parked at zero for the whole flight
+    float fin_max_deg;
+    float fin_brake;         // 0 = no airbrake splay
+    float fin_min_airspeed;  // m/s below which fins are not used for control
+    float fin_drift_gain;    // deg of tilt per m/s of drift in free fall (0 = hold vertical)
+    float fin_drift_max_deg;
+    float fin_ctrl_lead;     // m above ignition where the fins hand over to the ZEV law
+    float fin_ascent_mode;   // 0 parked, 1 roll damper, 2 roll + hold vertical
+    float fin_adapt;         // 0 = fixed model, 1 = adapt effectiveness and trim
+    float fin_gain0;         // initial effectiveness (1 = the CFD model)
+} dg_params_t;
+
+void dg_params_default(dg_params_t *p);
 
 // ---------------------------------------------------------------------
 //  Interfaces
 // ---------------------------------------------------------------------
 typedef enum {
-    DG_PHASE_IDLE = 0,     // disarmed
-    DG_PHASE_COAST,        // armed, falling, motor off — NO control authority
-    DG_PHASE_BURN,         // motor lit, closed loop
-    DG_PHASE_DONE          // touchdown or burnout with the vehicle down
+    DG_PHASE_IDLE = 0,     // on the ground / not flying
+    DG_PHASE_ASCENT,       // going up: fins per fin_ascent_mode, nothing else
+    DG_PHASE_DESCENT,      // falling: fins fly the airframe, ignition is armed
+    DG_PHASE_IGNITING,     // igniter commanded, waiting for thrust
+    DG_PHASE_BURN,         // thrust detected: closed loop on the nozzle
+    DG_PHASE_DONE          // down
 } dg_phase_t;
 
-// Navigation solution, supplied by the fusion processor.
-// Frame: WORLD, z up, x and y horizontal, origin at the pad.
-// vz is NEGATIVE while descending.
-//
-// Attitude is TWO body-fixed UNIT VECTORS in the world frame, never Euler angles:
-//
-//   b   the thrust axis -- the direction thrust pushes the vehicle, i.e. the
-//       tail-to-nose axis reversed, pointing roughly up during the descent
-//   g   a transverse reference axis, nominally perpendicular to b, marking the
-//       airframe's roll orientation. It is what tells the guidance where the two
-//       servo axes have got to as the vehicle rolls.
-//
-// A fusion filter carrying a quaternion produces both in one rotation each:
-//     b = R(q) * BODY_THRUST_AXIS        (e.g. body -z)
-//     g = R(q) * BODY_SERVO1_AXIS        (the axis servo 1 deflects the nozzle in)
-//
-// g need not be exactly perpendicular to b -- the guidance orthogonalises it -- but
-// it must be body-fixed and it must be the SAME axis servo 1 acts in, or the two
-// channels are mixed by a constant angle for the whole flight.
-//
-// w is the angular velocity in the same world frame, from the gyro, rotated out of
-// body coordinates by the same R(q). Its component along b is the roll rate: send it,
-// the guidance projects it out of the rate loop and uses it for the gyroscopic
-// feedforward.
 typedef struct {
-    float h;            // m above the pad
-    float vx, vy;       // m/s, world horizontal
-    float vz;           // m/s, negative descending
-    float bx, by, bz;   // thrust-axis unit vector, world frame
-    float gx, gy, gz;   // body-fixed transverse reference axis, world frame
-    float wx, wy, wz;   // rad/s, world frame (use the GYRO, not a differenced angle)
-    float t;            // s, monotonic since power-up
-    bool  valid;        // false blocks ignition and freezes the servos at zero
+    float h;            // m above the pad, as the navigation filter believes it
+    float vx, vy, vz;   // m/s, world, vz negative descending
+    float bx, by, bz;   // thrust-axis unit vector, world
+    float gx, gy, gz;   // body-fixed transverse reference axis, world
+    float wx, wy, wz;   // rad/s, world, STRAIGHT FROM THE GYRO
+    float a_axial;      // m/s^2, specific force along b (what an accelerometer
+                        // on the thrust axis reads: ~0 in vacuum free fall,
+                        // drag/m while falling, thrust/m while burning)
+    bool  lidar_ok;     // the altitude is lidar-referenced: drop the altitude pad
+    bool  valid;        // false blocks ignition and parks the actuators
 } dg_nav_t;
 
 typedef struct {
-    // Two servos, both BODY-FIXED. Axis 1 deflects the nozzle in the plane
-    // containing the reference axis g, axis 2 in the perpendicular one. They turn
-    // with the airframe as it rolls; that is what g is for.
-    float servo1_deg;   // TVC servo, g channel, clamped to +/-DG_SERVO_MAX_DEG
+    float servo1_deg;   // TVC servo, g channel, +/-DG_SERVO_MAX_DEG
     float servo2_deg;   // TVC servo, b x g channel
-    float clamp;        // axial thrust fraction command, DG_CLAMP_MIN..MAX
-    bool  ignite;       // rising edge: fire the igniter
-    // telemetry
-    float tilt_cmd;     // rad, commanded tilt from vertical
-    float tilt_err;     // rad, total angle between commanded and actual body axis
-    float roll_rate;    // rad/s about the body axis: uncontrolled, reported only
-    float thrust_est;   // N
-    float p_plan;       // current throttle-plan parameter, 0..4
+    float clamp;        // thrust clamp command, DG_CLAMP_MIN..MAX
+    float fin_deg[4];   // fin deflections, see FRAMES
+    bool  fins_live;    // false: the Master leaves the fin outputs parked
+    bool  ignite;       // level: true from the ignition command on
+    bool  thrust_on;    // level: thrust onset has been DETECTED (not assumed)
     dg_phase_t phase;
+    // countdowns, both < 0 while unknown
+    float t_to_ignition;    // s until the ignition command (DESCENT only)
+    float t_to_touchdown;   // s until the planned touchdown
+    // telemetry
+    float h_cmd;        // m, commanded ignition altitude
+    float tilt_cmd;     // rad, commanded tilt from vertical
+    float tilt_err;     // rad, angle between commanded and actual axis
+    float roll_rate;    // rad/s about b
+    float thrust_est;   // N, estimated real post-clamp thrust
+    float t_scale;      // estimated thrust / tabulated thrust
+    float k_plan;       // planned clamp level
+    float plan_resid;   // m/s, < 0 when the plan cannot reach its target
+    float fin_gain;     // estimated fin effectiveness, 1 = the model
+    float fin_trim[3];  // deg, estimated trim offsets: axis 1, axis 2, roll
+    float t_burn;       // s since thrust onset, < 0 before
 } dg_out_t;
 
 // ---------------------------------------------------------------------
 //  API
 //
-//  Threading model on the RP2350:
-//    core 0 : dg_step_attitude() at 200 Hz — never blocks, bounded work
-//    core 1 : dg_step_planner()  as often as it likes — does ONE solver
-//             iteration per call, so the load is amortised instead of
-//             arriving as a multi-millisecond spike every 100 ms
-//  The two share dg_state through a seqlock; no mutex in the 200 Hz path.
+//    core 0 : dg_step_control() at 200 Hz — bounded work, never blocks
+//    core 1 : dg_step_planner() — call it as often as you like; it solves
+//             the clamp plan at most DG_PLAN_HZ times a second
 // ---------------------------------------------------------------------
 void dg_init(void);
+void dg_set_params(const dg_params_t *p);
+const dg_params_t *dg_get_params(void);
 
-// Latch the entry condition. Call once, when the vehicle first passes
-// DG_H_START on the way down. Selects the ignition altitude from a table.
-void dg_arm(float vx0, float vz0);
+// Flight phase transitions the caller reports (it owns the mission state).
+void dg_begin_ascent(void);                           // launch detected
+void dg_begin_descent(float h_apogee, float vh_apogee);  // apogee passed
 
-// 200 Hz. Attitude control, ignition decision, actuator commands.
-void dg_step_attitude(const dg_nav_t *nav, dg_out_t *out);
-
-// Amortised planner. Safe to call at any rate >= DG_PLAN_HZ.
+void dg_step_control(const dg_nav_t *nav, dg_out_t *out);
 void dg_step_planner(const dg_nav_t *nav);
 
-// Introspection, for the host test and for telemetry.
-//
-// NOTE ON THE `vx` ARGUMENTS BELOW. The guidance law and the whole trajectory
-// projection are PLANAR even though the vehicle flies in 3-D, and `vx` is the
-// horizontal SPEED. This is exact, not a simplification: every horizontal
-// acceleration these functions apply (the -v/t_go term and drag) is anti-parallel
-// to the horizontal velocity, so its direction never changes and the problem lives
-// in the vertical plane containing it. The 3-D command is that planar solution
-// rotated into the velocity's azimuth -- which dg_guidance_dir does, and which
-// costs one square root. The expensive part, the planner, is untouched by the
-// second axis.
-float dg_h_ignite(void);          // commanded ignition altitude, m
-float dg_thrust_ref(float tau);   // un-clamped thrust at burn fraction tau, N
-float dg_guidance_tilt(float h, float vx, float vz, float mass,
-                       float *sin_th, float *cos_th);   // planar; returns t_go
+// ---- introspection: the host test and the self test ---------------------
+float dg_thrust_ref(float t_burn);                 // tabulated thrust, N
+float dg_burned(float t_burn);                     // propellant burned, kg
+float dg_h_cmd_lookup(float h_apogee, float vh);   // table only, no bias
+float dg_h_ignite(void);                           // what this flight will use
 float dg_guidance_dir(float h, float vx, float vy, float vz, float mass,
-                      float *ux, float *uy, float *uz); // 3-D; returns t_go
-float dg_project_miss(float h, float vx, float vz, float tau,
-                      float mass, float clamp_now, float p);
-float dg_solve_p_full(float h, float vx, float vz, float tau,
-                      float mass, float clamp_now);     // non-amortised, for test
-
-// Orthonormal basis of the plane perpendicular to b: the two gimbal axes, obtained
-// by orthogonalising the body-fixed reference axis g against b. Because g is
-// body-fixed, these rotate with the airframe -- which is the point.
+                      float *ux, float *uy, float *uz);   // returns t_go
 void  dg_gimbal_basis(float bx, float by, float bz,
                       float gx, float gy, float gz,
                       float *u1x, float *u1y, float *u1z,
                       float *u2x, float *u2y, float *u2z);
+bool  dg_terminal_active(float h, float vz, float thrust_avail, float mass);
+float dg_terminal_throttle(float h, float vz, float mass, float thrust_avail);
+// Projected touchdown speed under clamp level k; *t_td = time to the ground.
+float dg_project_vz(float h, float vz, float t_burn, float k, float t_scale,
+                    float *t_td);
+// The clamp level that reaches the plan target; *resid < 0 if none does.
+float dg_solve_plan(float h, float vz, float t_burn, float t_scale,
+                    float *resid, float *t_td);
+
+/**
+ * The fin mixer on its own, for the host test and the bench.
+ *
+ * tau[3]   torque demanded of the fins, world axes, N.m
+ * tau_roll torque demanded about b, N.m
+ * brake    requested splay, deg (0 = stowed)
+ * kappa, trim[3]  effectiveness and trim estimates (1, {0,0,0} = the model)
+ */
+void dg_fin_mix(const float b[3], const float u1[3], const float u2[3],
+                const float v[3], const float tau[3], float tau_roll,
+                float brake, float kappa, const float trim[3],
+                bool control, float out_deg[4]);
 
 #endif // DAIDALOS_GUIDANCE_H
