@@ -1061,6 +1061,9 @@ class DiagWindow(ag.MainWindow):
                     problems.append((BAD if i == 0 else WARN, f"Bez kontinuity: {nm}."))
             if not nfl & 4:
                 problems.append((WARN, "Navigation MCU nedostává navigační stav."))
+            if G.get("apo", 0) > 190.0:
+                problems.append((WARN, f"Apogeum {G['apo']:.0f} m je nad obálkou tabulky zážehu (190 m): "
+                                       "přistávací motor tam přistání neuzavře, zážeh je jen nejlepší pokus."))
         else:
             for n in kv.v:
                 kv.set(n, "—", DIM)

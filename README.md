@@ -1,5 +1,21 @@
 # Daidalos — propulsive landing guidance for the RP2350
 
+> ## Start here
+>
+> * **[`USER_MANUAL.md`](USER_MANUAL.md)** — uživatelský manuál (česky): jak funguje
+>   odhad polohy, navedení, křidélka a jejich adaptace, sekvence aerokrytu, roznětů a
+>   nohou, bezpečnostní pojistky, obě GUI, všechny parametry, předletové testy.
+> * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position and
+>   Navigation MCU, firmware 3.00, flying the
+>   [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
+>   (`Ariadna_V2/common/guidance.cpp`).
+> * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`
+> * **Flight display** (LoRa ground station): `python Ariadna_V2/Ground_Visualizer/ground_visualizer.py`
+> * **Tests:** `cd test && make check`
+>
+> The rest of this file describes `Daidalos_Landing_Guidance/`, the single-board V1
+> computer and its original guidance module, kept for reference.
+
 Flight code for a TVC model rocket that lands itself on a solid motor. It answers
 two questions, two hundred times a second:
 

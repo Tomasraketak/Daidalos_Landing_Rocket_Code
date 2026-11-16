@@ -60,6 +60,7 @@ for this board.
 | GP26 / ADC0 | analog in | ACS712 current sensor | `PIN_I_SENSE` |
 | GP27 / ADC1 | analog in | 2S battery voltage through a 3:1 divider | `PIN_V_BAT` |
 | GP28 / ADC2 | analog / digital in | RBF pin, arming interlock | `PIN_RBF` |
+| USB | USB CDC | **diagnostic console** (`Diagnostics/daidalos_diag.py`) — silent unless a host has the port open | `Serial` |
 
 ### PCA9685 servo channels
 
@@ -71,7 +72,17 @@ the pinout in every sense that matters on a launch day.
 | 0 | TVC servo, body axis 1 | `CH_TVC_X` |
 | 1 | TVC servo, body axis 2 | `CH_TVC_Y` |
 | 2 | thrust clamp | `CH_CLAMP` |
-| 3–15 | unused | — |
+| 3 | fin 1 — on body axis 1 (the TVC X side) | `CH_FIN_0` |
+| 4 | fin 2 — 90° on, body −Y | `CH_FIN_1` |
+| 5 | fin 3 — opposite fin 1 | `CH_FIN_2` |
+| 6 | fin 4 — opposite fin 2 | `CH_FIN_3` |
+| 7 | **aerocover latch** — unlatched 0.6 s before the ignition command | `CH_COVER` |
+| 8–15 | unused (TEST mode can drive them) | — |
+
+Servo calibration (trims, µs per degree, signs, clamp and cover end points) is NOT in
+the sketch any more: it is the `srv.*` group of the parameter table
+(`common/ariadna_params.h`), edited from the diagnostic console and kept in the
+Master's EEPROM.
 
 > **Digital servos only.** The PWM frequency is global across all sixteen channels
 > and is set to 339 Hz to keep servo transport lag inside the 200 Hz control loop's
@@ -90,7 +101,7 @@ wins, and the firmware follows the third column.
 |---|---|---|---|
 | D0–D2 | — | free (the DWM1000 footprint is no longer fitted) | — |
 | D3 (A3) | digital out | Voltino TriSense Pro CS (ICM42688P) | `PIN_TRISENSE_CS` |
-| D4 (A4) | I2C SDA (PSDA), 400 kHz | BMP580, AK09918C, TF Luna lidar, **UWB tag 0x2A** (I2CP) | `PIN_I2C_SDA` |
+| D4 (A4) | I2C SDA (PSDA), 400 kHz | BMP580, AK09918C, **TF Luna lidar 0x10**, **UWB tag 0x2A** (I2CP) | `PIN_I2C_SDA` |
 | D5 (A5) | I2C SCL | same bus | `PIN_I2C_SCL` |
 | D6 (A6) | UART TX | Control MCU link, 921600 baud | `PIN_MASTER_TX` |
 | D7 (A7) | UART RX | Control MCU link | `PIN_MASTER_RX` |
@@ -134,8 +145,8 @@ wins, and the firmware follows the third column.
 | D5 (A5) | I2C SCL | broken out, unused | — |
 | D6 (A6) | UART TX | Control MCU link, 921600 baud | `PIN_MASTER_TX` |
 | D7 (A7) | UART RX | Control MCU link | `PIN_MASTER_RX` |
-| D8 (A8) | digital out | **pyro channel 2 — backup igniter, same motor** | `PIN_PYRO_2` |
-| D9 (A9) | digital out | **pyro channel 3 — reserve, never auto-fired** | `PIN_PYRO_3` |
+| D8 (A8) | digital out | **pyro channel 2 — backup igniter, same motor**: fired only if no acceleration bump within 150 ms of the command | `PIN_PYRO_2` |
+| D9 (A9) | digital out | **pyro channel 3 — landing-leg release (burn wire)**, 1.7 s before touchdown, ≥ 0.5 s | `PIN_PYRO_3` |
 | D10 (A10) | — | reserved for future use | — |
 | on-board | PIO | WS2812 pyro/guidance annunciator | `ARIADNA_RGB_PIN` |
 

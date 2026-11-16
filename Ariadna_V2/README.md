@@ -4,10 +4,28 @@ Three microcontrollers, one ground station, one laptop. This directory is the
 structural foundation: it compiles, it is tested where it can be tested, and it is
 written to be finished rather than admired.
 
-The guidance algorithm it flies is not new — it is the verified module in
-[`../Daidalos_Landing_Guidance`](../Daidalos_Landing_Guidance), unchanged. What is new
-is everything around it: three boards, a wire protocol, sensor fusion, a mission state
-machine, and the ground segment.
+> **Firmware 3.00 (November 2026).** The vehicle now flies the algorithm of
+> [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) — `common/guidance.cpp`,
+> with fin control, on-line fin adaptation, a flight-event sequencer (aerocover, main and
+> backup igniter, leg release), a parameter table editable from a USB diagnostic console,
+> a TF-Luna lidar, TriSenseINSLIB attitude, and telemetry v4. **Start with
+> [`../USER_MANUAL.md`](../USER_MANUAL.md)** (Czech): it describes every algorithm, the
+> GUIs, the parameters and the pre-flight tests. The sections below describe the board
+> architecture, which is unchanged; where they disagree with the manual about guidance,
+> pyros or telemetry, the manual is current.
+>
+> | new | where |
+> |---|---|
+> | guidance v2 (LandSim_Light port), tables generated from the sim | `common/guidance.*`, `common/guidance_tables.h`, `../tools/gen_guidance_tables.py`, `make guid` |
+> | flight events: cover −0.6 s, PYRO1, PYRO2 backup (no bump in 150 ms), PYRO3 legs −1.7 s ≥ 0.5 s | `common/ariadna_seq.h`, `make seq` |
+> | parameter table, EEPROM on the Master, streamed to the boards on the ground | `common/ariadna_params.h` |
+> | USB diagnostic console (non-blocking), TEST mode with the Actuator Console built in | `Master_MCU.ino` §13, `Diagnostics/daidalos_diag.py` |
+> | TF-Luna lidar, INSLIB attitude, GPS latency compensation (50 ms) | `Position_MCU.ino` §3, §7b |
+> | telemetry v4: quaternion, countdown, events; 3-D rocket view | `Ground_Visualizer/`, `Diagnostics/daidalos_widgets.py` |
+
+The original V1 guidance module in
+[`../Daidalos_Landing_Guidance`](../Daidalos_Landing_Guidance) is kept and still tested,
+but no V2 board flies it any more.
 
 ---
 
@@ -975,8 +993,8 @@ time on its own, more than the rest of the chain put together.
 |---|---|
 | 0 / 1 | TVC X / Y |
 | 2 | thrust clamp |
-| 3–6 | aerodynamic fins *(future)* |
-| 7 | spare |
+| 3–6 | aerodynamic fins 1–4 |
+| 7 | aerocover latch |
 
 ---
 
@@ -988,7 +1006,7 @@ Three channels on the Navigation MCU, with continuity sense on each.
 |---|---|
 | 1 | landing motor igniter |
 | 2 | landing motor igniter, **backup** |
-| 3 | reserve — wired and monitored, never fired automatically |
+| 3 | landing-leg release (burn wire): 1.7 s before the planned touchdown, ≥ 0.5 s |
 
 Channel 1 fires on the guidance module's ignition decision. Then the vehicle either
 accelerates or it does not: if axial acceleration has not risen above 2 g **250 ms** later,
