@@ -57,6 +57,13 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings
 import pyqtgraph as pg
 from haversine import haversine
 
+# The 3-D rocket and the tilt bull's-eye are shared with the diagnostic
+# console and live next to it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "Diagnostics"))
+from daidalos_widgets import (RocketView, TiltBubble, attitude_summary,
+                              quat_from_smallest_three)
+
 # ==============================================================================
 #  Configuration
 # ==============================================================================
@@ -71,17 +78,18 @@ PAD_LON = 16.6912772
 SYNC0 = 0xA5
 SYNC1 = 0x1D
 PKT_TELEMETRY = 0x40
-TLM_VERSION = 3
+TLM_VERSION = 4
 
 # Downlink rate the vehicle is configured for. Must match ARIADNA_TLM_HZ in
 # ariadna_link.h — it is what the link-quality percentage is measured
 # against, so a stale value here reads as a permanently bad link.
 TLM_HZ = 10
 
-#            t_ms lat lon | 11 x int16                | 13 x uint8      | rssi snr
-GS_FORMAT = "<Iii" + "h" * 11 + "B" * 13 + "bb"
+#            t_ms lat lon | 11 x int16 | 13 x uint8 | t_flight px py | rssi snr
+GS_FORMAT = "<Iii" + "h" * 11 + "B" * 13 + "Bbb" + "bb"
 GS_SIZE = struct.calcsize(GS_FORMAT)
-assert GS_SIZE == 49, f"packet layout drift: {GS_SIZE} != 49"
+assert GS_SIZE == 52, f"packet layout drift: {GS_SIZE} != 52"
+T_UNKNOWN = -32768          # ARIADNA_TLM_T_UNKNOWN
 
 # ariadna_tlm_t.uwb, one byte of UWB constellation health. See the
 # ARIADNA_TUWB_* block in ariadna_link.h for why it is worth the airtime.
@@ -93,7 +101,14 @@ STATE_NAMES = {
 }
 
 # dg_phase_t from guidance.h.
-PHASE_NAMES = {0: "IDLE", 1: "COAST", 2: "BURN", 3: "DONE"}
+PHASE_NAMES = {0: "IDLE", 1: "ASCENT", 2: "DESCENT", 3: "IGNITING", 4: "BURN", 5: "DONE"}
+PHASE_BURN = 4
+
+# ariadna_tlm_t.events: what the flight sequencer has done (ariadna_seq.h).
+EVENT_BITS = [
+    (0, "APOGEE"), (1, "COVER"), (2, "IGN 1"), (3, "THRUST"),
+    (4, "IGN 2"),  (5, "LEGS"),  (6, "LIDAR"), (7, "DOWN"),
+]
 
 # ariadna_tlm_t.health bits.
 HEALTH_BITS = [
@@ -103,7 +118,7 @@ HEALTH_BITS = [
 
 ERROR_NAMES = {
     0: "none", 1: "POST fail", 2: "position link", 3: "navigation link",
-    4: "flash", 5: "servo bus", 6: "battery low", 7: "unknown",
+    4: "flash", 5: "servo bus", 6: "battery low", 7: "params not synced",
 }
 
 # Google satellite tiles, cached for offline use at the field. Radius in km
@@ -419,10 +434,11 @@ class SerialWorker(QtCore.QThread):
     def _emit(self, payload):
         u = struct.unpack(GS_FORMAT, payload)
         (t_ms, lat, lon,
-         alt_dm, vz_dms, vh_dms, acc_cg, roll_d, pitch_d, yaw_d, temp_d,
-         tvc_x_cd, tvc_y_cd, thrust_n,
+         alt_dm, vz_dms, vh_dms, acc_cg, qx, qy, qz,
+         tvc_x_cdeg, tvc_y_cdeg, thrust_n, t_event_ds,
          version, state, nav_phase, clamp_pct, vbat_cv, curr_da,
-         hdop_x10, sats, pyro, health, flags, exp, uwb,
+         hdop_x10, sats, pyro, health, flags, events, uwb,
+         t_flight_s, px_m, py_m,
          rssi, snr) = u
 
         if version != TLM_VERSION:
@@ -437,20 +453,22 @@ class SerialWorker(QtCore.QThread):
             "HVEL": vh_dms / 10.0,
             "TOTVEL": math.hypot(vz_dms / 10.0, vh_dms / 10.0),
             "ACCEL": acc_cg / 100.0,
-            "ROLL": roll_d / 10.0, "PITCH": pitch_d / 10.0, "YAW": yaw_d / 10.0,
-            "TEMP": temp_d / 10.0,
-            "TVC_X": tvc_x_cd / 100.0, "TVC_Y": tvc_y_cd / 100.0,
+            "QUAT": quat_from_smallest_three(qx, qy, qz),
+            "T_EVENT": None if t_event_ds == T_UNKNOWN else t_event_ds / 10.0,
+            "T_FLIGHT": t_flight_s,
+            "PX": px_m, "PY": py_m,
+            "EVENTS": events,
+            "TVC_X": tvc_x_cdeg / 100.0, "TVC_Y": tvc_y_cdeg / 100.0,
             "THRUST": float(thrust_n),
             "STATE": state, "PHASE": nav_phase,
             "CLAMP": clamp_pct,
-            "BATTERY": (vbat_cv / 100.0) + 2.5,
+            "BATTERY": (vbat_cv / 50.0) + 5.0,
             "CURRENT": curr_da / 10.0,
             "HDOP": hdop_x10 / 10.0, "SATS": sats,
             "PYRO_CONT": pyro & 0x0F, "PYRO_FIRED": (pyro >> 4) & 0x0F,
             "HEALTH": health,
             "FLAGS": flags,
             "ERROR": (flags >> 5) & 0x07,
-            "EXP": exp,
             "UWB_N": uwb & 0x0F,
             "UWB_MODE": (uwb >> 4) & 0x03,
             "UWB_AIDED": bool(uwb & 0x40),
@@ -617,7 +635,7 @@ class TVCWidget(QtWidgets.QWidget):
         frac = max(0.0, min(1.0, self.clamp / 100.0))
         fh = int((by1 - by0) * frac)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor("#ff8c00") if self.phase == 2 else QtGui.QColor("#555555"))
+        p.setBrush(QtGui.QColor("#ff8c00") if self.phase == 4 else QtGui.QColor("#555555"))
         p.drawRect(bx + 2, by1 - fh + 1, bar_w - 4, max(0, fh - 2))
 
         p.setPen(QtGui.QColor(200, 200, 200))
@@ -813,12 +831,12 @@ class AltimeterWidget(QtWidgets.QWidget):
     """
     Altitude tape, with the guidance handover altitude marked.
 
-    The 85 m line is not decoration: it is the altitude at which the
+    The ignition line is not decoration: it is the altitude at which the
     Navigation MCU takes authority, and watching the marker cross it is how
     you know the handover happened.
     """
 
-    GUIDANCE_ENTRY = 85.0
+    GUIDANCE_ENTRY = 56.0
 
     def __init__(self):
         super().__init__()
@@ -865,7 +883,7 @@ class AltimeterWidget(QtWidgets.QWidget):
         p.drawLine(x_axis, gy, rect.width(), gy)
         p.setPen(QtGui.QColor("#00ff88"))
         p.setFont(QtGui.QFont("Consolas", 7, QtGui.QFont.Weight.Bold))
-        p.drawText(x_axis + 6, gy - 3, "GUIDANCE 85")
+        p.drawText(x_axis + 6, gy - 3, "IGNITION ~56")
 
         y = top + height - int(max(0.0, self.altitude) / self.max_alt * height)
         p.setBrush(QtGui.QColor("#ff5500"))
@@ -987,6 +1005,25 @@ class GroundStation(QtWidgets.QMainWindow):
 
         bar.addStretch()
 
+        # Launch countdown. The vehicle does not know when it will be
+        # launched; the operator does. Set the seconds, press START, and
+        # the T-0 card counts down until the vehicle reports lift-off, at
+        # which point the flight time takes over from the telemetry.
+        self.t0_spin = QtWidgets.QSpinBox()
+        self.t0_spin.setRange(5, 3600)
+        self.t0_spin.setValue(60)
+        self.t0_spin.setSuffix(" s")
+        self.t0_spin.setStyleSheet("background-color: #1e1e1e; padding: 4px;")
+        bar.addWidget(self.t0_spin)
+        self.t0_btn = QtWidgets.QPushButton("START T-0")
+        self.t0_btn.setStyleSheet("background-color: #555555; color: white;")
+        self.t0_btn.clicked.connect(self.toggle_countdown)
+        bar.addWidget(self.t0_btn)
+        self.t0_deadline = None
+        self.t0_timer = QtCore.QTimer()
+        self.t0_timer.timeout.connect(self.update_countdown)
+        self.t0_timer.start(200)
+
         self.record_btn = QtWidgets.QPushButton("⏺ RECORD")
         self.record_btn.setStyleSheet("background-color: #555555; color: white;")
         self.record_btn.clicked.connect(self.toggle_recording)
@@ -1023,7 +1060,9 @@ class GroundStation(QtWidgets.QMainWindow):
             "ACCELERATION", "GUIDANCE PHASE",
             "THRUST EST", "THRUST CLAMP",
             "BATTERY", "CURRENT",
-            "TEMPERATURE", "SATELLITES",
+            "TILT", "SATELLITES",
+            "NEXT EVENT", "FLIGHT TIME",
+            "PAD OFFSET", "T-0 COUNTDOWN",
             "HDOP", "LORA SIGNAL",
             "LINK QUALITY", "ERROR",
             # The UWB constellation. Two cards rather than one because the
@@ -1045,8 +1084,21 @@ class GroundStation(QtWidgets.QMainWindow):
                                           "ARM", "RBF"])
         left.addWidget(self.pyro_strip)
 
+        self.event_strip = IndicatorStrip("FLIGHT EVENTS", [n for _, n in EVENT_BITS])
+        left.addWidget(self.event_strip)
+
+        # Attitude, three ways: the navball, a 3-D rocket in the pad frame,
+        # and the tilt bull's-eye (where the top of the vehicle leans).
+        att = QtWidgets.QHBoxLayout()
+        left.addLayout(att, stretch=1)
         self.navball = NavBallWidget()
-        left.addWidget(self.navball, stretch=1)
+        att.addWidget(self.navball, stretch=3)
+        att_r = QtWidgets.QVBoxLayout()
+        att.addLayout(att_r, stretch=2)
+        self.rocket_view = RocketView()
+        att_r.addWidget(self.rocket_view, stretch=3)
+        self.tilt_bubble = TiltBubble()
+        att_r.addWidget(self.tilt_bubble, stretch=2)
 
         # ---- centre: graphs, TVC, map ----
         centre = QtWidgets.QVBoxLayout()
@@ -1095,6 +1147,33 @@ class GroundStation(QtWidgets.QMainWindow):
         self.status.showMessage("DISCONNECTED")
 
     # ------------------------------------------------------------ recording
+    def toggle_countdown(self):
+        if self.t0_deadline is None:
+            self.t0_deadline = time.time() + self.t0_spin.value()
+            self.t0_btn.setText("STOP T-0")
+            self.t0_btn.setStyleSheet("background-color: #ff5500; color: white;")
+        else:
+            self.t0_deadline = None
+            self.t0_btn.setText("START T-0")
+            self.t0_btn.setStyleSheet("background-color: #555555; color: white;")
+        self.update_countdown()
+
+    def update_countdown(self):
+        card = self.cards["T-0 COUNTDOWN"]
+        flying = self.last_state is not None and 3 <= self.last_state <= 8
+        if flying:
+            card.set_value("LIFT-OFF")
+            card.set_status("#00ff88")
+        elif self.t0_deadline is None:
+            card.set_value("--")
+            card.set_status("#444444")
+        else:
+            left = self.t0_deadline - time.time()
+            sign = "-" if left >= 0 else "+"
+            left = abs(left)
+            card.set_value(f"T{sign}{int(left // 60):02d}:{left % 60:04.1f}")
+            card.set_status("#ffaa00" if sign == "-" and left > 10 else "#ff2222")
+
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key.Key_R:
             self.toggle_recording()
@@ -1108,7 +1187,8 @@ class GroundStation(QtWidgets.QMainWindow):
             if os.stat(filename).st_size == 0:
                 self.csv_writer.writerow([
                     "sys_time", "t_ms", "state", "phase", "lat", "lon", "alt",
-                    "vz", "hvel", "accel", "roll", "pitch", "yaw", "temp",
+                    "vz", "hvel", "accel", "qw", "qx", "qy", "qz", "tilt",
+                    "t_event", "t_flight", "px", "py", "events",
                     "tvc_x", "tvc_y", "clamp", "thrust", "battery", "current",
                     "hdop", "sats", "pyro_cont", "pyro_fired", "health",
                     "flags", "error", "rssi", "snr",
@@ -1214,22 +1294,37 @@ class GroundStation(QtWidgets.QMainWindow):
         t = self.test_t
         cyc = t % 40.0
 
+        t_event, events = None, 0
         if cyc < 4:
             state, phase, alt, vz = 2, 0, 0.0, 0.0
-        elif cyc < 12:
-            state, phase, alt, vz = 3, 0, (cyc - 4) * 60.0, 60.0
+        elif cyc < 9:
+            state, phase, alt, vz = 3, 1, (cyc - 4) * 32.0, 32.0
+        elif cyc < 10:
+            state, phase, alt, vz = 4, 1, 160.0, 0.0
         elif cyc < 14:
-            state, phase, alt, vz = 4, 0, 480.0, 0.0
-        elif cyc < 26:
-            state, phase, alt, vz = 5, 1, 480.0 - (cyc - 14) * 33.0, -33.0
-        elif cyc < 28:
-            state, phase, alt, vz = 6, 1, 84.0 - (cyc - 26) * 30.0, -30.0
-        elif cyc < 30:
-            state, phase, alt, vz = 6, 2, 24.0 - (cyc - 28) * 12.0, -6.0
-        elif cyc < 34:
-            state, phase, alt, vz = 7, 3, 0.0, 0.0
+            state, phase, alt, vz = 5, 2, 160.0 - (cyc - 10) * 26.0, -26.0
+            t_event = 14 - cyc
+            events = 0x01 | (0x02 if t_event < 0.6 else 0)
+        elif cyc < 16.6:
+            state, phase = 6, 4
+            alt = 56.0 * (1 - (cyc - 14) / 2.6)
+            vz = -30.0 * (1 - (cyc - 14) / 2.7)
+            t_event = 16.6 - cyc
+            events = 0x0F | (0x20 if t_event < 1.7 else 0) | (0x40 if alt < 7 else 0)
+        elif cyc < 24:
+            state, phase, alt, vz, events = 7, 5, 0.0, 0.0, 0xEF
         else:
-            state, phase, alt, vz = 8, 3, 0.0, 0.0
+            state, phase, alt, vz, events = 8, 5, 0.0, 0.0, 0xEF
+
+        # attitude: nose up before the apogee, nose down after, a few
+        # degrees of wobble either way
+        tilt = math.radians(5 + 4 * math.sin(t * 0.9))
+        az = t * 0.6
+        ang = math.pi - tilt if phase >= 2 else tilt
+        quat = (math.cos(ang / 2), math.sin(ang / 2) * math.cos(az),
+                math.sin(ang / 2) * math.sin(az), 0.0)
+        if quat[0] < 0:
+            quat = tuple(-c for c in quat)
 
         h_speed = 4.0 + math.sin(t) * 3.0
         azim = (t * 20) % 360
@@ -1241,30 +1336,30 @@ class GroundStation(QtWidgets.QMainWindow):
         if haversine((self.sim_lat, self.sim_lon), (PAD_LAT, PAD_LON)) * 1000 > 300:
             self.sim_lat, self.sim_lon = PAD_LAT, PAD_LON
 
-        burn = (phase == 2)
+        burn = (phase == PHASE_BURN)
         self.process_telemetry({
             "timeMs": int(t * 1000),
             "LAT": self.sim_lat, "LON": self.sim_lon,
             "ALT": max(0.0, alt), "VZ": vz, "HVEL": h_speed,
             "TOTVEL": math.hypot(vz, h_speed),
             "ACCEL": 4.5 if burn else 1.0,
-            "ROLL": self.tri(t, -40, 40, 6),
-            "PITCH": self.tri(t, -25, 25, 7),
-            "YAW": azim,
-            "TEMP": self.tri(t, -5, 35, 20),
+            "QUAT": quat,
+            "T_EVENT": t_event, "T_FLIGHT": int(max(0.0, cyc - 4)),
+            "PX": int(math.sin(t * 0.3) * 6), "PY": int(math.cos(t * 0.2) * 4),
+            "EVENTS": events,
             "TVC_X": math.sin(t * 6) * 3.5 if burn else 0.0,
             "TVC_Y": math.cos(t * 5) * 2.5 if burn else 0.0,
-            "THRUST": 190 + math.sin(t * 4) * 35 if burn else 0.0,
+            "THRUST": 95 + math.sin(t * 4) * 20 if burn else 0.0,
             "STATE": state, "PHASE": phase,
-            "CLAMP": int(55 + math.sin(t * 3) * 40) if burn else 60,
+            "CLAMP": int(55 + math.sin(t * 3) * 40) if burn else 100,
             "BATTERY": self.tri(t, 6.8, 8.3, 60),
             "CURRENT": 5.5 if burn else 1.2,
             "HDOP": self.tri(t, 0.6, 2.5, 12), "SATS": 13,
-            "PYRO_CONT": 0x00 if phase >= 2 else 0x03,
-            "PYRO_FIRED": 0x01 if phase >= 2 else 0x00,
+            "PYRO_CONT": 0x00 if phase >= 4 else 0x07,
+            "PYRO_FIRED": (0x05 if events & 0x20 else 0x01) if phase >= 4 else 0x00,
             "HEALTH": 0xFF,
             "FLAGS": 0x0B if state >= 2 else 0x08,
-            "ERROR": 0, "EXP": int(t / 5) % 8,
+            "ERROR": 0,
             "UWB_N": 4 if int(t) % 20 < 15 else 3,
             "UWB_MODE": 3 if alt > 5 else 2,
             "UWB_AIDED": True, "UWB_ALIVE": True,
@@ -1284,7 +1379,8 @@ class GroundStation(QtWidgets.QMainWindow):
                 self.csv_writer.writerow([
                     d["sys_time"], d["timeMs"], d["STATE"], d["PHASE"],
                     d["LAT"], d["LON"], d["ALT"], d["VZ"], d["HVEL"], d["ACCEL"],
-                    d["ROLL"], d["PITCH"], d["YAW"], d["TEMP"],
+                    *d["QUAT"], attitude_summary(*d["QUAT"])["tilt"],
+                    d["T_EVENT"], d["T_FLIGHT"], d["PX"], d["PY"], d["EVENTS"],
                     d["TVC_X"], d["TVC_Y"], d["CLAMP"], d["THRUST"],
                     d["BATTERY"], d["CURRENT"], d["HDOP"], d["SATS"],
                     d["PYRO_CONT"], d["PYRO_FIRED"], d["HEALTH"],
@@ -1334,7 +1430,23 @@ class GroundStation(QtWidgets.QMainWindow):
         c["THRUST CLAMP"].set_value(f"{d['CLAMP']} %")
         c["BATTERY"].set_value(f"{d['BATTERY']:.2f} V")
         c["CURRENT"].set_value(f"{d['CURRENT']:.1f} A")
-        c["TEMPERATURE"].set_value(f"{d['TEMP']:.1f} °C")
+        att = attitude_summary(*d["QUAT"])
+        c["TILT"].set_value(f"{att['tilt']:.1f}°  {'▲' if att['nose_up'] else '▼'}")
+        c["TILT"].set_status("#00ff88" if att["tilt"] < 4 else
+                             "#ffaa00" if att["tilt"] < 10 else "#ff2222")
+        # The countdown the vehicle itself computes: to the ignition command
+        # while it descends, to the planned touchdown once the command is out.
+        if d["T_EVENT"] is None:
+            c["NEXT EVENT"].set_value("--")
+            c["NEXT EVENT"].set_status("#444444")
+        elif d["PHASE"] == 2:
+            c["NEXT EVENT"].set_value(f"IGNITION {d['T_EVENT']:.1f} s")
+            c["NEXT EVENT"].set_status("#ffaa00")
+        else:
+            c["NEXT EVENT"].set_value(f"LANDING {d['T_EVENT']:.1f} s")
+            c["NEXT EVENT"].set_status("#ff8c00")
+        c["FLIGHT TIME"].set_value(f"T+{d['T_FLIGHT']} s" if d["STATE"] >= 3 else "--")
+        c["PAD OFFSET"].set_value(f"E {d['PX']:+d}  N {d['PY']:+d} m")
         c["SATELLITES"].set_value(f"{d['SATS']}")
         c["HDOP"].set_value(f"{d['HDOP']:.1f}")
         c["ERROR"].set_value(ERROR_NAMES.get(d["ERROR"], "?"))
@@ -1370,7 +1482,8 @@ class GroundStation(QtWidgets.QMainWindow):
                                 else "#ffaa00" if d["UWB_ALIVE"] else "#444444")
         c["LORA SIGNAL"].set_status("#00ff88" if d["RSSI"] > -90
                                     else "#ffaa00" if d["RSSI"] > -110 else "#ff2222")
-        c["GUIDANCE PHASE"].set_status("#ff8c00" if d["PHASE"] == 2 else "#444444")
+        c["GUIDANCE PHASE"].set_status("#ff8c00" if d["PHASE"] in (3, 4) else
+                                       "#00aacc" if d["PHASE"] == 2 else "#444444")
         c["ACCELERATION"].set_status("#ffaa00" if d["ACCEL"] > 8 else "#444444")
 
         # state banner
@@ -1396,7 +1509,16 @@ class GroundStation(QtWidgets.QMainWindow):
         self.pyro_strip.set("ARM", bool(d["FLAGS"] & 0x01))
         self.pyro_strip.set("RBF", bool(d["FLAGS"] & 0x02))
 
-        self.navball.update_attitude(d["PITCH"], d["ROLL"], d["YAW"], d["TOTVEL"])
+        for bit, label in EVENT_BITS:
+            self.event_strip.set(label, bool(d["EVENTS"] & (1 << bit)))
+
+        # The navball shows the NOSE: +90 pitch on the pad, -90 falling
+        # nose-first. The 3-D view and the bull's-eye need no convention.
+        self.navball.update_attitude(att["pitch"], 0.0, att["heading"], d["TOTVEL"])
+        self.rocket_view.set_quaternion(*d["QUAT"])
+        self.rocket_view.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]),
+                                       burning=(d["PHASE"] == PHASE_BURN))
+        self.tilt_bubble.set_tilt(att["tilt"], att["tilt_az"])
         self.altimeter.update_altitude(d["ALT"])
         self.tvc_widget.update_tvc(d["TVC_X"], d["TVC_Y"], d["CLAMP"], d["PHASE"])
 

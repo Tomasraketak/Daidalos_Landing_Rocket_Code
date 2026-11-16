@@ -260,7 +260,7 @@ static void display_flight(const DisplaySnapshot *d)
 
     // --- line 4: TVC and clamp, live only during the burn ----------------
     display.setCursor(0, 40);
-    if (pkt.nav_phase == 2) {          // DG_PHASE_BURN
+    if (pkt.nav_phase == 3 || pkt.nav_phase == 4) {   // IGNITING / BURN
         display.print("TVC");
         display.print(pkt.tvc_x_cdeg / 100.0f, 1);
         display.print("/");
@@ -269,11 +269,17 @@ static void display_flight(const DisplaySnapshot *d)
         display.print(pkt.clamp_pct);
     } else {
         display.print("B:");
-        display.print((pkt.vbat_cv / 100.0f) + 2.5f, 2);
+        display.print((pkt.vbat_cv / 50.0f) + 5.0f, 2);
         display.print("V ");
-        display.print(pkt.curr_da / 10.0f, 1);
-        display.print("A S:");
-        display.print(pkt.sats);
+        if (pkt.nav_phase == 2 && pkt.t_event_ds != ARIADNA_TLM_T_UNKNOWN) {
+            // descending: the countdown to the ignition command
+            display.print("IGN-");
+            display.print(pkt.t_event_ds / 10.0f, 1);
+        } else {
+            display.print(pkt.curr_da / 10.0f, 1);
+            display.print("A S:");
+            display.print(pkt.sats);
+        }
     }
 
     // --- line 5: go/no-go ------------------------------------------------
@@ -322,14 +328,18 @@ static void generate_test_packet(void)
     // A crude but continuous flight profile: up, over, down, burn, land.
     float h, vz;
     uint8_t state, phase;
+    // dg_phase_t: 0 idle, 1 ascent, 2 descent, 3 igniting, 4 burn, 5 done
+    float t_event = -1.0f;
+    uint8_t events = 0;
     if (cyc < 4.0f)        { state = ARIADNA_STATE_ARMED;    h = 0.0f;   vz = 0.0f;   phase = 0; }
-    else if (cyc < 12.0f)  { state = ARIADNA_STATE_ASCENT;   h = (cyc - 4.0f) * 60.0f;  vz = 60.0f;  phase = 0; }
-    else if (cyc < 14.0f)  { state = ARIADNA_STATE_APOGEE;   h = 480.0f; vz = 0.0f;   phase = 0; }
-    else if (cyc < 26.0f)  { state = ARIADNA_STATE_DESCENT;  h = 480.0f - (cyc - 14.0f) * 33.0f; vz = -33.0f; phase = 1; }
-    else if (cyc < 28.0f)  { state = ARIADNA_STATE_GUIDANCE; h = 84.0f - (cyc - 26.0f) * 30.0f;  vz = -30.0f; phase = 1; }
-    else if (cyc < 30.0f)  { state = ARIADNA_STATE_GUIDANCE; h = 24.0f - (cyc - 28.0f) * 12.0f;  vz = -6.0f;  phase = 2; }
-    else if (cyc < 34.0f)  { state = ARIADNA_STATE_LANDED;   h = 0.0f;   vz = 0.0f;   phase = 3; }
-    else                   { state = ARIADNA_STATE_RECOVERY; h = 0.0f;   vz = 0.0f;   phase = 3; }
+    else if (cyc < 9.0f)   { state = ARIADNA_STATE_ASCENT;   h = (cyc - 4.0f) * 32.0f;  vz = 32.0f;  phase = 1; }
+    else if (cyc < 10.0f)  { state = ARIADNA_STATE_APOGEE;   h = 160.0f; vz = 0.0f;   phase = 1; }
+    else if (cyc < 14.0f)  { state = ARIADNA_STATE_DESCENT;  h = 160.0f - (cyc - 10.0f) * 26.0f; vz = -26.0f; phase = 2;
+                             t_event = 14.0f - cyc; events = 0x01 | (t_event < 0.6f ? 0x02 : 0); }
+    else if (cyc < 16.6f)  { state = ARIADNA_STATE_GUIDANCE; h = 56.0f * (1.0f - (cyc - 14.0f) / 2.6f); vz = -30.0f * (1.0f - (cyc - 14.0f) / 2.7f); phase = 4;
+                             t_event = 16.6f - cyc; events = 0x0F | (t_event < 1.7f ? 0x20 : 0) | (h < 7.0f ? 0x40 : 0); }
+    else if (cyc < 22.0f)  { state = ARIADNA_STATE_LANDED;   h = 0.0f;   vz = 0.0f;   phase = 5; events = 0xEF; }
+    else                   { state = ARIADNA_STATE_RECOVERY; h = 0.0f;   vz = 0.0f;   phase = 5; events = 0xEF; }
 
     s_pkt.state     = state;
     s_pkt.nav_phase = phase;
@@ -340,32 +350,47 @@ static void generate_test_packet(void)
     s_pkt.alt_dm = (int16_t)(h * 10.0f);
     s_pkt.vz_dms = (int16_t)(vz * 10.0f);
     s_pkt.vh_dms = (int16_t)((4.0f + sinf(m) * 3.0f) * 10.0f);
-    s_pkt.acc_cg = (int16_t)((phase == 2 ? 4.5f : 1.0f) * 100.0f);
+    s_pkt.acc_cg = (int16_t)((phase == 4 ? 4.0f : 1.0f) * 100.0f);
 
-    s_pkt.roll_ddeg  = (int16_t)(sinf(m * 1.3f) * 25.0f * 10.0f);
-    s_pkt.pitch_ddeg = (int16_t)(cosf(m * 0.9f) * 12.0f * 10.0f);
-    s_pkt.yaw_ddeg   = (int16_t)(fmodf(m * 20.0f, 360.0f) * 10.0f);
-    s_pkt.temp_dc    = (int16_t)((21.0f + sinf(m * 0.05f) * 4.0f) * 10.0f);
+    // Attitude: nose up until the apogee, nose down after, with a few
+    // degrees of wobble. A rotation of `ang` about the horizontal axis
+    // (cos a, sin a, 0); nose-down is that rotation plus half a turn.
+    {
+        float tilt = (5.0f + 4.0f * sinf(m * 0.9f)) * 0.0174533f;
+        float az   = m * 0.6f;
+        float ang  = (phase >= 2) ? 3.14159265f - tilt : tilt;
+        float qw = cosf(0.5f * ang), sh = sinf(0.5f * ang);
+        float qx = sh * cosf(az), qy = sh * sinf(az), qz = 0.0f;
+        float sg = qw < 0.0f ? -32767.0f : 32767.0f;
+        s_pkt.qx = (int16_t)(qx * sg);
+        s_pkt.qy = (int16_t)(qy * sg);
+        s_pkt.qz = (int16_t)(qz * sg);
+    }
+    s_pkt.t_event_ds = t_event < 0.0f ? (int16_t)ARIADNA_TLM_T_UNKNOWN : (int16_t)(t_event * 10.0f);
+    s_pkt.events     = events;
+    s_pkt.t_flight_s = (uint8_t)(cyc > 4.0f ? cyc - 4.0f : 0.0f);
+    s_pkt.px_m       = (int8_t)(sinf(m * 0.3f) * 6.0f);
+    s_pkt.py_m       = (int8_t)(cosf(m * 0.2f) * 4.0f);
 
     // TVC only moves during the burn, which is what the real vehicle does.
-    if (phase == 2) {
+    if (phase == 4) {
         s_pkt.tvc_x_cdeg = (int16_t)(sinf(m * 6.0f) * 3.5f * 100.0f);
         s_pkt.tvc_y_cdeg = (int16_t)(cosf(m * 5.0f) * 2.5f * 100.0f);
         s_pkt.clamp_pct  = (uint8_t)(55 + (int)(sinf(m * 3.0f) * 40.0f));
-        s_pkt.thrust_n   = (int16_t)(190 + (int)(sinf(m * 4.0f) * 35.0f));
+        s_pkt.thrust_n   = (int16_t)(95 + (int)(sinf(m * 4.0f) * 20.0f));
     } else {
-        s_pkt.clamp_pct  = 60;
+        s_pkt.clamp_pct  = 100;
     }
 
-    s_pkt.vbat_cv  = (uint8_t)((8.10f - fmodf(m, 120.0f) * 0.004f - 2.5f) * 100.0f);
-    s_pkt.curr_da  = (uint8_t)(phase == 2 ? 55 : 12);
+    s_pkt.vbat_cv  = (uint8_t)((8.10f - fmodf(m, 120.0f) * 0.004f - 5.0f) * 50.0f);
+    s_pkt.curr_da  = (uint8_t)(phase == 4 ? 55 : 12);
     s_pkt.hdop_x10 = (uint8_t)(9 + (int)(fabsf(sinf(m * 0.5f)) * 8.0f));
     s_pkt.sats     = (uint8_t)(11 + (int)(sinf(m * 0.2f) * 3.0f));
 
     // Continuity on channels 1 and 2 until they fire, then the fired bits
     // come up in the high nibble.
-    uint8_t cont  = (phase >= 2) ? 0x00 : 0x03;
-    uint8_t fired = (phase >= 2) ? 0x01 : 0x00;
+    uint8_t cont  = (phase >= 4) ? 0x00 : 0x07;
+    uint8_t fired = (phase >= 4) ? ((events & 0x20) ? 0x05 : 0x01) : 0x00;
     s_pkt.pyro = (uint8_t)((cont & 0x0F) | ((fired & 0x0F) << 4));
 
     s_pkt.health = ARIADNA_HLT_POS_LINK | ARIADNA_HLT_NAV_LINK |
@@ -378,7 +403,6 @@ static void generate_test_packet(void)
     if (state >= ARIADNA_STATE_ARMED) s_pkt.flags |= ARIADNA_TF_ARMED | ARIADNA_TF_RBF_OUT;
     if (state >= ARIADNA_STATE_ASCENT) s_pkt.flags |= ARIADNA_TF_BREAKWIRE;
 
-    s_pkt.exp = (uint8_t)(((int)(m / 5.0f)) % 8);
 
     s_rssi = -65 + (int)(sinf(m * 5.0f) * 10.0f);
     s_snr  = 10 + (int)(cosf(m * 3.0f) * 3.0f);
