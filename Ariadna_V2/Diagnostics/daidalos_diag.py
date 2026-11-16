@@ -7,7 +7,8 @@ the state of the whole vehicle: all three flight computers, their firmware
 versions, every error the software can detect, attitude (3-D model, tilt
 bull's-eye, numbers), position relative to the pad, live graphs, and the
 complete parameter table — which can be edited and saved to the Master's
-EEPROM from here, including the timing of every flight event.
+flash (W25Q128) from here, including the timing of every flight event, and
+the ignition band recomputed in LandSim_Light for the vehicle you enter.
 
 It is built ON TOP OF the Actuator Console (Examples/Actuator_Console/gui):
 that window is the "Aktuátory a pyro" tab, unchanged, with every function it
@@ -51,6 +52,7 @@ import actuator_gui as ag                            # noqa: E402
 from actuator_gui import button, chip, label, set_chip, Card   # noqa: E402
 from daidalos_widgets import (RocketView, TiltBubble, StripChart, PadMap,   # noqa: E402
                               attitude_summary)
+from diag_ignition import IgnitionTab                # noqa: E402
 
 APP_NAME = "Daidalos · Diagnostika"
 
@@ -65,7 +67,8 @@ EVENT_BITS = [(0, "Apogeum"), (1, "Aerokryt"), (2, "Zážeh 1"), (3, "Tah cítit
 NAV_FLAGS = [(0, "VALID"), (1, "BARO"), (2, "IMU"), (3, "MAG"), (4, "GPS fix"), (5, "PAD ref"),
              (6, "UWB rádio"), (7, "LIDAR"), (8, "ACC sat"), (9, "DEADRECK"), (10, "Origin"),
              (11, "GPS aided"), (12, "ZUPT"), (13, "UWB aided")]
-SENS_BITS = [(0, "IMU"), (1, "BARO"), (2, "MAG"), (3, "GPS"), (4, "UWB"), (5, "LIDAR"), (6, "INS")]
+SENS_BITS = [(0, "IMU"), (1, "BARO"), (2, "MAG"), (3, "GPS"), (4, "UWB"), (5, "LIDAR"), (6, "INS"),
+             (7, "LIDAR povolen")]
 INS_MODES = {0: "žádný", 1: "jen orientace", 2: "bez GPS (coasting)", 3: "plný (GPS)", 255: "nezkompilováno"}
 UWB_MODES = {0: "—", 1: "1 kotva (LOS)", 2: "2-D", 3: "3-D"}
 HEALTH_ERR = {1: "POST selhal", 2: "spoj s Position MCU", 3: "spoj s Navigation MCU",
@@ -144,6 +147,16 @@ PARAM_HELP = {
     "pos.lidar_max_m": "Lidar se do výšky započítává jen pod touto vzdáleností.",
     "pos.att_gyro_only": "1 = za letu orientace jen z gyra (bez akcelerometru a magnetometru).",
     "pos.uwb_enable": "1 = UWB kotvy se používají.",
+    "pos.lidar_delay_ms": "Lidar je na vyklápěcí noze: do fúze se započítá až tolik ms po aktivaci nohou (PYRO3).",
+    "pos.lidar_tilt_x_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy X.",
+    "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Y.",
+    "g.cd_body": "Cd samotného trupu. Křidélka se přičítají z CFD. Za letu se odpor navíc měří.",
+    "g.thrust_scale": "Násobek katalogové tahové křivky přistávacího motoru (statický zážeh).",
+    "g.ign_delay_pad_s": "Na jak dlouhé zpoždění roznětu se výška zážehu jistí (nejhorší případ + ~0,1 s).",
+    "g.drag_adapt": "1 = odpor se ve volném pádu měří akcelerometrem a výpočet zážehu ho používá.",
+    "g.diameter_m": "Průměr trupu (referenční plocha odporu).",
+    "tbl.vz0": "Tabulka zážehu: první rychlost pádu. Počítá se v LandSim (záložka Zážeh a LandSim).",
+    "tbl.dvz": "Tabulka zážehu: krok rychlosti pádu.",
 }
 
 
@@ -155,6 +168,10 @@ def load_param_table(path: str = PARAMS_H) -> list[dict]:
         src = open(path, encoding="utf-8").read()
     except OSError:
         return out
+    # the ignition band table is generated into its own header
+    tbl = os.path.join(os.path.dirname(path), "ariadna_params_tbl.h")
+    if os.path.exists(tbl):
+        src += open(tbl, encoding="utf-8").read()
     rx = re.compile(r'X\(\s*(\d+),\s*(\w+),\s*"([^"]+)",\s*([-\d.eE]+)f?,\s*([-\d.eE]+)f?,'
                     r'\s*([-\d.eE]+)f?,\s*"([^"]*)",\s*\'(\w)\'\)')
     for m in rx.finditer(src):
@@ -194,10 +211,10 @@ class FlightSimBoard(ag.SimBoard):
 
     def crc(self) -> int:
         import struct
-        v = [0.0] * 86
+        v = [0.0] * 164
         for p in self.params:
             v[p["id"]] = p["val"]
-        return crc16(struct.pack("<86f", *v))
+        return crc16(struct.pack("<164f", *v))
 
     def _cmd(self, line: str) -> None:
         if not line:
@@ -293,7 +310,8 @@ class FlightSimBoard(ag.SimBoard):
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
-             "tvc": [0.0, 0.0], "cl": 1.0, "fin": [0.0, 0.0, 0.0, 0.0], "afl": 1}
+             "tvc": [0.0, 0.0], "cl": 1.0, "fin": [0.0, 0.0, 0.0, 0.0], "afl": 1,
+             "drag": 1.0, "blo": 0.0, "bhi": 0.0}
         return "G " + json.dumps(d, separators=(",", ":"))
 
 
@@ -429,6 +447,8 @@ class DiagWindow(ag.MainWindow):
         self.tabs.addTab(self._build_graphs(), "Grafy")
         self.tabs.addTab(act_scroll, "Aktuátory a pyro")
         self.tabs.addTab(self._build_params(), "Parametry a časování")
+        self.ign_tab = IgnitionTab(self)
+        self.tabs.addTab(self._scroll(self.ign_tab), "Zážeh a LandSim")
         outer.addWidget(self.tabs, 1)
         self.tabs.setStyleSheet(
             f"QTabBar::tab {{ padding: 8px 18px; color: {ag.C['muted']}; border: none; }}"
@@ -577,7 +597,8 @@ class DiagWindow(ag.MainWindow):
 
         # flight / guidance
         fl = Card("Let", "Navedení a sekvence")
-        self.flight_kv = KV(["Fáze navedení", "Apogeum", "Výška zážehu", "Do zážehu", "Do dosednutí",
+        self.flight_kv = KV(["Fáze navedení", "Apogeum", "Výška zážehu", "Pásmo zážehu",
+                             "Odpor měřený / model", "Do zážehu", "Do dosednutí",
                              "Odhad tahu", "Tah / tabulka", "Škrcení plán", "Plán rezerva",
                              "Účinnost křidélek", "Náklon příkaz / chyba"])
         fl.lay.addWidget(self.flight_kv)
@@ -686,9 +707,9 @@ class DiagWindow(ag.MainWindow):
         lay.setContentsMargins(20, 16, 20, 20)
         lay.setSpacing(10)
         note = label(
-            "Tabulka parametrů žije v EEPROM Masteru a ten ji na rampě posílá Position i Navigation MCU. "
+            "Tabulka parametrů žije ve flash W25Q128 Masteru a ten ji na rampě posílá Position i Navigation MCU. "
             "Měnit lze jen v IDLE nebo TEST. Postup: Načíst z desky → upravit hodnoty (žlutě) → "
-            "Odeslat změny → Uložit do EEPROM. Zastrčit lze jen, když obě desky drží stejnou tabulku "
+            "Odeslat změny → Uložit do flash. Tabulka zážehu má vlastní záložku. Zastrčit lze jen, když obě desky drží stejnou tabulku "
             "(CRC souhlasí). Najetím myši na řádek se zobrazí, co parametr dělá.", "muted")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -696,8 +717,8 @@ class DiagWindow(ag.MainWindow):
         for txt, kind, fn, tip in (
                 ("Načíst z desky", "primary", lambda: self._cmd("PARAM LIST"), "PARAM LIST"),
                 ("Odeslat změny", "primary", self.param_send, "PARAM SET pro každou žlutou hodnotu"),
-                ("Uložit do EEPROM", "", lambda: self._cmd("PARAM SAVE"), "PARAM SAVE: přežije restart"),
-                ("Načíst z EEPROM", "", lambda: self._cmd("PARAM LOAD"), "PARAM LOAD: zahodí neuložené změny"),
+                ("Uložit do flash", "", lambda: self._cmd("PARAM SAVE"), "PARAM SAVE: přežije restart (W25Q128)"),
+                ("Načíst z flash", "", lambda: self._cmd("PARAM LOAD"), "PARAM LOAD: zahodí neuložené změny"),
                 ("Výchozí hodnoty", "danger", self.param_defaults, "PARAM DEFAULTS (neuloží)"),
                 ("Export profilu…", "", self.param_export, "Uloží tabulku do JSON na počítači"),
                 ("Import profilu…", "", self.param_import, "Načte JSON a označí rozdíly k odeslání")):
@@ -741,6 +762,7 @@ class DiagWindow(ag.MainWindow):
         self.ptable.blockSignals(False)
         for c_ in range(8):
             self.ptable.resizeColumnToContents(c_)
+        self._param_filter()
 
     def _param_color(self, pid: int) -> None:
         r = self.param_rows.get(pid)
@@ -771,9 +793,12 @@ class DiagWindow(ag.MainWindow):
         self.ptable.blockSignals(False)
         self._param_color(p["id"])
 
-    def _param_filter(self, txt: str) -> None:
+    def _param_filter(self, txt: str = "") -> None:
+        txt = self.filter.text() if hasattr(self, "filter") else txt
         for r, p in enumerate(self.params):
-            self.ptable.setRowHidden(r, bool(txt) and txt.lower() not in p["key"].lower())
+            # the 64 band entries live on their own tab
+            hide = p["key"].startswith("tbl.hm") or (bool(txt) and txt.lower() not in p["key"].lower())
+            self.ptable.setRowHidden(r, hide)
 
     def param_send(self) -> None:
         if not self.link.is_open:
@@ -793,7 +818,7 @@ class DiagWindow(ag.MainWindow):
 
     def param_defaults(self) -> None:
         r = QtWidgets.QMessageBox.question(self, APP_NAME, "Vrátit všechny parametry na výchozí? "
-                                           "(do EEPROM se zapíše až tlačítkem Uložit)")
+                                           "(do flash se zapíše až tlačítkem Uložit)")
         if r == QtWidgets.QMessageBox.StandardButton.Yes:
             self._cmd("PARAM DEFAULTS")
             QtCore.QTimer.singleShot(300, lambda: self._cmd("PARAM LIST"))
@@ -856,6 +881,8 @@ class DiagWindow(ag.MainWindow):
             self.board_crc = int(parts[-1]) if parts[-1].isdigit() else None
             self.param_edits.clear()
             self._param_fill()
+            if hasattr(self, "ign_tab"):
+                self.ign_tab.load_from_params()
         elif line.startswith("OK PARAM ") and len(line.split()) >= 5 and line.split()[2].isdigit():
             _, _, pid, _key, val = line.split()[:5]
             pid = int(pid)
@@ -951,7 +978,7 @@ class DiagWindow(ag.MainWindow):
         if M:
             sync = bool(M.get("psync"))
             set_chip(self.chip_sync, f"Parametry: {'synchronní' if sync else 'NESOUHLASÍ'} · CRC {M.get('pcrc', 0):04X}"
-                     + ("" if M.get("peep") else " · výchozí (ne z EEPROM)"), "ok" if sync else "bad")
+                     + ("" if M.get("peep") else " · výchozí (nic ve flash)"), "ok" if sync else "bad")
             if not sync:
                 problems.append((BAD, "Position/Navigation nedrží stejnou tabulku parametrů jako Master – "
                                       "počkejte pár sekund; trvá-li to, restartujte desky. Bez shody NELZE zastrčit."))
@@ -1098,7 +1125,14 @@ class DiagWindow(ag.MainWindow):
         if G:
             fk.set("Fáze navedení", PHASE_NAMES.get(G.get("ph", 0), "?"))
             fk.set("Apogeum", fmt(G.get("apo"), 1, "m"))
-            fk.set("Výška zážehu", fmt(G.get("hign"), 1, "m") if G.get("hign") else "— (určí se v apogeu)")
+            fk.set("Výška zážehu", fmt(G.get("hign"), 1, "m") + "  (přepočet 10× za s)"
+                   if G.get("hign") else "— (určí se v apogeu)")
+            blo, bhi = G.get("blo", 0.0), G.get("bhi", 0.0)
+            fk.set("Pásmo zážehu", (f"{blo:.1f} – {bhi:.1f} m" if bhi > 0 else
+                                    (f"ŽÁDNÉ (nejlepší pokus {blo:.1f} m)" if blo else "—")),
+                   None if bhi > 0 or not blo else BAD)
+            dr = G.get("drag", 1.0)
+            fk.set("Odpor měřený / model", fmt(dr, 2), GOOD if 0.8 < dr < 1.25 else WARN)
             fk.set("Do zážehu", fmt(G.get("tign"), 2, "s") if G.get("tign", -1) >= 0 else "—")
             fk.set("Do dosednutí", fmt(G.get("ttd"), 2, "s") if G.get("ttd", -1) >= 0 else "—")
             fk.set("Odhad tahu", fmt(G.get("thr"), 1, "N"))

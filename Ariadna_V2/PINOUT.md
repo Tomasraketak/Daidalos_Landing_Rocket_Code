@@ -81,8 +81,10 @@ the pinout in every sense that matters on a launch day.
 
 Servo calibration (trims, µs per degree, signs, clamp and cover end points) is NOT in
 the sketch any more: it is the `srv.*` group of the parameter table
-(`common/ariadna_params.h`), edited from the diagnostic console and kept in the
-Master's EEPROM.
+(`common/ariadna_params.h`), edited from the diagnostic console and kept on the
+Master's **W25Q128 flash** (sectors 0 and 1, two A/B copies; the flight log starts at
+0x2000). The RP2350 has no EEPROM, and arduino-pico's emulation in program flash
+stalls both cores on every commit, so it is not used.
 
 > **Digital servos only.** The PWM frequency is global across all sixteen channels
 > and is set to 339 Hz to keep servo transport lag inside the 200 Hz control loop's

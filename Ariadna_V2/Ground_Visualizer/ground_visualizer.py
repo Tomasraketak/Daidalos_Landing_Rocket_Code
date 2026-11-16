@@ -1045,9 +1045,15 @@ class GroundStation(QtWidgets.QMainWindow):
         body = QtWidgets.QHBoxLayout()
         root.addLayout(body, stretch=1)
 
-        # ---- left: cards, indicators, navball ----
+        # ---- left: the graphs, stacked, each the full width of the column ----
+        # (they used to sit four abreast in the centre, too narrow to read a
+        # trend; the numbers moved to the centre in their place)
+        graphs = QtWidgets.QVBoxLayout()
+        body.addLayout(graphs, stretch=2)
+
+        # ---- centre: cards, indicators, attitude, map ----
         left = QtWidgets.QVBoxLayout()
-        body.addLayout(left, stretch=1)
+        body.addLayout(left, stretch=3)
 
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(5)
@@ -1074,23 +1080,27 @@ class GroundStation(QtWidgets.QMainWindow):
         for i, name in enumerate(card_names):
             card = TelemetryCard(name)
             self.cards[name] = card
-            grid.addWidget(card, i // 2, i % 2)
+            grid.addWidget(card, i // 4, i % 4)
 
+        strips = QtWidgets.QHBoxLayout()
+        left.addLayout(strips)
         self.health_strip = IndicatorStrip("SUBSYSTEMS", [n for _, n in HEALTH_BITS])
-        left.addWidget(self.health_strip)
+        strips.addWidget(self.health_strip)
 
         self.pyro_strip = IndicatorStrip("PYRO  (continuity / fired)",
                                          ["C1", "C2", "C3", "F1", "F2", "F3",
                                           "ARM", "RBF"])
-        left.addWidget(self.pyro_strip)
+        strips.addWidget(self.pyro_strip)
 
         self.event_strip = IndicatorStrip("FLIGHT EVENTS", [n for _, n in EVENT_BITS])
         left.addWidget(self.event_strip)
 
         # Attitude, three ways: the navball, a 3-D rocket in the pad frame,
         # and the tilt bull's-eye (where the top of the vehicle leans).
+        lower = QtWidgets.QHBoxLayout()
+        left.addLayout(lower, stretch=1)
         att = QtWidgets.QHBoxLayout()
-        left.addLayout(att, stretch=1)
+        lower.addLayout(att, stretch=3)
         self.navball = NavBallWidget()
         att.addWidget(self.navball, stretch=3)
         att_r = QtWidgets.QVBoxLayout()
@@ -1099,13 +1109,6 @@ class GroundStation(QtWidgets.QMainWindow):
         att_r.addWidget(self.rocket_view, stretch=3)
         self.tilt_bubble = TiltBubble()
         att_r.addWidget(self.tilt_bubble, stretch=2)
-
-        # ---- centre: graphs, TVC, map ----
-        centre = QtWidgets.QVBoxLayout()
-        body.addLayout(centre, stretch=3)
-
-        graphs = QtWidgets.QHBoxLayout()
-        centre.addLayout(graphs, stretch=1)
 
         pg.setConfigOption("background", "#1b1b1b")
         pg.setConfigOption("foreground", "w")
@@ -1129,9 +1132,6 @@ class GroundStation(QtWidgets.QMainWindow):
         # TVC very much can, so they keep a symmetric axis.
         self.alt_plot.getPlotItem().setLimits(yMin=0)
         self.accel_plot.getPlotItem().setLimits(yMin=0)
-
-        lower = QtWidgets.QHBoxLayout()
-        centre.addLayout(lower, stretch=2)
 
         self.map_widget = RocketMapWidget(PAD_LAT, PAD_LON)
         lower.addWidget(self.map_widget, stretch=3)

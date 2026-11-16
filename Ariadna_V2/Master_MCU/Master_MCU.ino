@@ -2101,6 +2101,7 @@ static void diag_emit(void)
             "\"hign\":%.1f,\"tc\":%.3f,\"te\":%.3f,\"roll\":%.2f,\"tign\":%.2f,\"ttd\":%.2f,"
             "\"ts\":%.3f,\"fg\":%.2f,\"apo\":%.1f,\"res\":%.2f,\"rx\":[%lu,%lu],\"plan\":%lu,"
             "\"loop\":%u,\"ovr\":%u,\"cont\":%u,\"fired\":%u,\"act\":%u,\"nfl\":%u,\"ev\":%u,"
+            "\"drag\":%.3f,\"blo\":%.2f,\"bhi\":%.2f,"
             "\"tvc\":[%.2f,%.2f],\"cl\":%.2f,\"fin\":[%.1f,%.1f,%.1f,%.1f],\"afl\":%u}\n",
             nav_status_fresh() ? 1 : 0, s_nav_status.fw_version, s_nav_status.param_crc,
             s_nav_status.params_seen, s_nav_status.phase, s_nav_status.k_plan,
@@ -2112,6 +2113,7 @@ static void diag_emit(void)
             (unsigned long)s_nav_status.plan_iters, s_nav_status.loop_max_us,
             s_nav_status.overruns, s_nav_status.pyro_cont, s_nav_status.pyro_fired,
             s_nav_status.pyro_active, s_nav_status.flags, s_nav_status.events,
+            s_nav_status.drag_scale, s_nav_status.band_lo, s_nav_status.band_hi,
             s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp, s_act.fin_deg[0], s_act.fin_deg[1],
             s_act.fin_deg[2], s_act.fin_deg[3], s_act.flags);
         break;

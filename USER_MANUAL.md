@@ -108,7 +108,7 @@ Stav mise vede Master (`ariadna_state_t`), fáze navedení vede Navigation MCU (
 |---|---|---|
 | start (ASCENT) | Master | přerušený breakwire, NEBO zrychlení > `mst.launch_g` (3 g), NEBO výška > 15 m |
 | apogeum (DESCENT) | Navigation MCU | klesá rychleji než 3 m/s a je 1,5 m pod maximem; maximum ≥ `seq.apogee_min_m` |
-| výška zážehu | Navigation MCU, jednou v apogeu | tabulka (apogeum × vodorovná rychlost), kap. 5.1 |
+| výška zážehu | Navigation MCU, v apogeu a pak **10× za s během pádu** | pásmo z LandSim + pád s **naměřeným odporem**, kap. 5.1 |
 | aerokryt | sekvencer | odpočet do zážehu ≤ `seq.cover_lead_s` (0,6 s) |
 | zážeh (IGNITING) | navedení | výška ≤ výška zážehu, padá > 3 m/s, osa tahu nahoru |
 | tah cítit (BURN) | navedení | osové zrychlení vzroste o ≥ `g.onset_bump` (4 m/s²) dva vzorky po sobě |
@@ -182,14 +182,31 @@ Každý režim dává stejný tvar: poloha + nejistota na osu. Filtr tedy nemá 
 přestane odpovídat, sama „zestárne“. Vzdálenosti se před řešením přepočítají na stejný
 okamžik (raketa se pohybuje), odražené signály chytí test reziduálu.
 
-### 4.4 Lidar TF-Luna
+### 4.4 Lidar TF-Luna (na vyklápěcí noze)
 
 Pod ~7 m je barometr v plamenu motoru a ukazuje až o metr vedle. Lidar vidí zem přímo.
+**Lidar je na noze**, takže dokud noha není vyklopená, míří kamkoli (do trupu, do boku).
 
-* Čte se 50× za s při pádu (5× za s jinak, jen aby bylo vidět, že žije).
-* Do výšky se započte, jen když: Master hlásí DESCENT/GUIDANCE, osa rakety je do 20° od
-  svislice, signál je v rozsahu, vzdálenost ≤ `pos.lidar_max_m` (7,5 m).
-* Výška = vzdálenost × cos(náklon) + `pos.lidar_offset_m`.
+* **Hradlo nohou.** Navigation MCU při přepálení gumičky (PYRO3) nastaví událost
+  `LEGS`; Master ji okamžitě přepošle Position MCU (`master_state.nav_events`). Lidar se
+  do fúze započítá až **`pos.lidar_delay_ms` (500 ms) po aktivaci nohou** — noha musí
+  stihnout dopadnout do dorazu. V diagnostice svítí příznak **LIDAR povolen**.
+* Čte se 50× za s po vyklopení nohou (5× za s jinak, jen aby bylo vidět, že žije).
+* **Vymaxovaná hodnota se ignoruje**: měření na stropu rozsahu senzoru (≥ 7,8 m), mimo
+  rozsah signálu nebo nad `pos.lidar_max_m` (7,5 m) se nezapočte — „max“ neznamená
+  „jsem 8 m nad zemí“, ale „nic nevidím“.
+* **Korekce náklonu.** Směr paprsku se počítá v tělesových osách ze **statické montážní
+  odchylky** lidaru `pos.lidar_tilt_x_deg` / `pos.lidar_tilt_y_deg` (±20°, nastavuje se
+  v diagnostice) a otočí se aktuální orientací rakety:
+  `d = R · (sin ty·cos tx, −sin tx, cos ty·cos tx)`.
+  Výška = vzdálenost × cos(úhel paprsku od svislice) + `pos.lidar_offset_m`. Paprsek
+  odkloněný od svislice o víc než 25° se nepoužije.
+* Další podmínky: Master hlásí DESCENT/GUIDANCE, `pos.lidar_enable = 1`.
+* **Jak změřit montážní odchylku:** raketa svisle (špička dolů nad zemí, nebo vodováhou),
+  nohu vyklopit, v záložce Poloha a senzory porovnat vzdálenost lidaru se známou výškou
+  při náklonu rakety o ±10° v obou osách. Odchylka je úhel, o který je paprsek odkloněný
+  od podélné osy rakety: kladná `tilt_x` = otočení kolem tělesové +X (paprsek k −Y),
+  kladná `tilt_y` = kolem +Y (paprsek k +X).
 * **Lidar má autoritu**: když filtr jeho měření 3× po sobě odmítne, výška se na lidar
   přenastaví skokem (simulace ukázala, že skok je lepší než pozvolné „dotažení“).
 * Jakmile lidar vidí zem, navedení zahodí bezpečnostní rezervu výšky `g.alt_pad_m`
@@ -206,24 +223,49 @@ README „The flight algorithm, step by step“). Kód: `Ariadna_V2/common/guida
 `tools/gen_guidance_tables.py` → `common/guidance_tables.h`, a test
 `test/guid_test.cpp` porovnává `guidance.cpp` s čísly, která spočítá sama simulace.
 
-### 5.1 Výška zážehu (počítá se na zemi, v letu se jen čte)
+### 5.1 Výška zážehu (pásmo z LandSim, výpočet v letu z naměřeného odporu)
 
-Pro každou kombinaci *výška apogea × vodorovná rychlost* simulace najde pásmo výšek, ze
-kterých jde ještě přistát (`h_min` … `h_max`), a k dolní hranici přičte rezervu na
-zpoždění roznětu (padá 0,4 s plnou rychlostí):
+Hmotnost, Cd ani tah nejsou předem přesně známé, proto výška zážehu **není pevná
+tabulka podle apogea**. Je rozdělená na dvě části:
+
+**a) Pásmo proveditelnosti — počítá LandSim na počítači.** Pro každou rychlost pádu `|vz|`
+(4, 6, 8 … 66 m/s) simulace najde pásmo výšek `h_min(|vz|) … h_max(|vz|)`, ze kterých
+přistávací motor ještě dovede raketu na zem (funkce `project_rh` z `tvc_sim.py`). Pásmo
+závisí na hmotnosti, motoru a odporu, **ne na apogeu**. Tabulka (2× 32 čísel) je
+v parametrech (`tbl.*`), takže se po změně rakety jen přepočítá v diagnostice a nahraje —
+bez přeprogramování (kap. 9, záložka *Zážeh a LandSim*).
+
+**b) Kde raketa do pásma vletí — počítá raketa 10× za sekundu.** Na druhém jádře
+Navigation MCU se z **aktuální** výšky, svislé a vodorovné rychlosti nasimuluje volný pád
+(2-D, s odporem, krok 5 ms) a hledá se bod, kde výška klesne pod
 
 ```
-h_cmd = min(h_min + pad, h_max)
+h_cmd = min(h_min(|vz|) + pad, h_max(|vz|))       pad = |vz| · g.ign_delay_pad_s (0,4 s)
 ```
 
 Zapálit **výš** se dá opravit přiškrcením, zapálit **níž** nejde opravit vůbec — proto se
-rezerva počítá na nejhorší zpoždění. Typicky ~55 m pro apogeum 150 m.
+rezerva počítá na nejhorší zpoždění roznětu. Typicky ~50 m pro apogeum 150 m.
 
-> ⚠️ **Obálka.** Tabulka pokrývá apogeum **80–190 m**. Nad ~190 m přistávací motor sám
-> (bez boosteru) přistání neuzavře a výpočet nemá proveditelné pásmo; software pak použije
-> poslední řádek tabulky jako „nejlepší pokus“. Hlavní motor volte tak, aby apogeum bylo
-> v obálce. Nastavení `g.h_ign_bias_m` posune výšku, `g.h_ign_override_m` ji přepíše
-> (jen pro zkoušky).
+**c) Odpor se měří za letu.** Během pádu (|v| > 15 m/s, osa rakety do 18° od směru
+proudění) se z osového zrychlení spočítá `K = a / v²` a porovná s modelem
+(`g.cd_body`, průměr `g.diameter_m`, brzda křidélek). Poměr (`drag_scale`, „Odpor měřený
+/ model“ v diagnostice) se filtruje s časovou konstantou 1 s a omezí na 0,4–2,5. Tím se
+opraví jak špatně odhadnuté Cd, tak hmotnost (`a = F/m` — těžší raketa vypadá jako menší
+odpor). Pád i plánovač hoření pak počítají s tímto naměřeným odporem (při hoření omezeno
+0,6–1,6). `g.drag_adapt = 0` adaptaci vypne.
+
+Výška zážehu i odpočet „ZÁŽEH za …“ se tak **přepočítávají průběžně** celý sestup; v
+diagnostice a telemetrii je vidět i aktuální pásmo (`Pásmo zážehu`). V testu (`make guid`)
+odpovídá výpočet rakety přímému hledání v simulaci (`find_ignition`) do 0,8 m a raketa
+s odporem o 30 % menším nebo o 40 % větším, než čeká model, ho za letu změří (0,71 / 1,36)
+a přistane.
+
+> ⚠️ **Obálka.** S výchozí raketou existuje pásmo do pádové rychlosti ~55 m/s, tj.
+> apogeum zhruba **80–190 m**. Nad tím přistávací motor sám přistání neuzavře; software
+> pak zapálí v „nejlepším pokusu“ (nejnižší dopadová rychlost), ale dosedne tvrdě (test:
+> apogeum 200 m → −8 m/s). Diagnostika (záložka *Zážeh a LandSim*) ukáže obálku pro
+> zadanou hmotnost. Nastavení `g.h_ign_bias_m` posune výšku, `g.h_ign_override_m` ji
+> přepíše (jen pro zkoušky).
 
 ### 5.2 Kam mířit — zákon navedení (200 Hz)
 
@@ -274,9 +316,15 @@ tahem. Zbytek tahu „zahodí“ (palivo hoří stejně, klapka jen odkloní pro
 
 ### 5.6 Odpočty
 
-Navedení počítá **čas do příkazu k zážehu** (z pádu s odporem) a **čas do dosednutí**
-(z plánovače; před zážehem jednou za sekundu odhadem, během hoření 10× za s přesně). Z nich
-sekvencer časuje aerokryt a nohy; oba jdou i do telemetrie.
+Navedení počítá **čas do příkazu k zážehu** (z pádu s naměřeným odporem, 10× za s) a **čas
+do dosednutí** (před zážehem jednou za sekundu odhadem; během hoření 10× za s simulací
+zbytku letu stejným plánovačem, jakým se řídí — včetně přeplánování každých 0,3 s a
+výškové rezervy). Z nich sekvencer časuje aerokryt a nohy; oba jdou i do telemetrie.
+
+Přesnost v testu (celá obálka, poruchy tahu, odporu, zpoždění roznětu): aerokryt
+0,6 ± 0,08 s před zážehem; nohy **1,5–2,2 s** před skutečným dosednutím (cíl 1,7 s, odchylka
+téměř vždy na bezpečnou stranu — dřív). Noha s lidarem má tedy vždy ≥ 1 s na vyklopení a
+500 ms hradlo lidaru.
 
 ---
 
@@ -409,7 +457,8 @@ do USB se předá jen tolik, kolik USB právě vezme — kód nikdy na počíta�
 | **Poloha a senzory** | poloha vůči rampě s nejistotou a stopou, rychlost, zrychlení, příznaky navigace; GPS, UWB (kotvy, režim, reziduál), baro trim, lidar, INSLIB režim |
 | **Grafy** | výška, rychlosti, náklon vs. příkaz, úhlové rychlosti, TVC + klapka, křidélka, napájení, doba smyčky Navigation MCU; okno 10–300 s, pauza |
 | **Aktuátory a pyro** | **celá původní Actuator Console**, beze změny funkcí: TVC pad, křidélka (i společně a test pohybu), klapka, aerokryt (zajistit/odjistit/uložit polohy), pyro (aktivace, podržení k odpálení), konfigurace serv, záznam a ruční příkazy |
-| **Parametry a časování** | celá tabulka parametrů s popisem; úprava, odeslání, uložení do EEPROM, výchozí hodnoty, export/import profilu |
+| **Parametry a časování** | celá tabulka parametrů s popisem; úprava, odeslání, uložení do flash, výchozí hodnoty, export/import profilu (včetně montážní odchylky lidaru `pos.lidar_tilt_*`) |
+| **Zážeh a LandSim** | parametry rakety (hmotnost, palivo, Cd, průměr, škála tahu, rezerva na zpoždění, brzda křidélek), výpočet pásma zážehu simulací LandSim_Light, graf pásma s křivkou pádu, náhled výšky zážehu pro apogea 80–240 m, odeslání do rakety a uložení do flash |
 
 Horní lišta: stav mise, verze firmwaru všech tří desek (žlutě, když nesouhlasí), shoda
 parametrů (CRC), počet chyb, tlačítka **TEST režim**, **Pad reference**, **Kalibrace
@@ -427,10 +476,48 @@ neutrální polohy. Konzole po vstupu do TEST sama pošle PWM, uspávání a mez
 1. **Načíst z desky** (dělá se i samo po připojení).
 2. Upravit hodnotu (žluté pozadí = neodesláno; modré = liší se od výchozí).
 3. **Odeslat změny** → Master je uloží do RAM a během pár sekund rozešle oběma deskám.
-4. **Uložit do EEPROM** (jinak se po restartu vrátí původní).
+4. **Uložit do flash** (jinak se po restartu vrátí původní).
 5. Zkontrolovat v horní liště „Parametry: synchronní“.
 
 Měnit jde jen v IDLE nebo TEST. Za letu Master tabulku neposílá a desky ji nepřijímají.
+
+**Kam se parametry ukládají.** RP2350 **nemá EEPROM**. Knihovna `EEPROM` v arduino-pico ji
+jen emuluje v programové flash a při zápisu zastaví obě jádra (i XIP) — proto se
+nepoužívá. Parametry jsou na **externím čipu W25Q128** (ten, kam se zapisuje i letový
+záznam):
+
+| sektor | adresa | obsah |
+|---|---|---|
+| 0 | 0x0000 | kopie A tabulky parametrů |
+| 1 | 0x1000 | kopie B tabulky parametrů |
+| 2–… | 0x2000+ | letový záznam (začíná za parametry) |
+
+Každá kopie nese značku `DAI2`, pořadové číslo, verzi rozložení a CRC. Uloží se vždy do
+**starší** kopie a hned se přečte zpět a ověří — výpadek napájení při zápisu tedy nikdy
+nezničí obě. Při startu se načte platná kopie s vyšším pořadovým číslem; když žádná není
+(nový čip, jiné rozložení parametrů), použijí se výchozí hodnoty. Zápis i čtení dělá
+druhé jádro Mastera (vlastní flash), konzole dostane `OK PARAM SAVE …` / `OK PARAM LOAD
+flash …`. Smazání letového záznamu (`ERASE`) parametry nesmaže.
+
+### Zážeh a LandSim — postup po změně rakety
+
+1. Do pole *LandSim_Light* zadat složku s klonem simulace (pamatuje se).
+2. Vyplnit **hmotnost** (vzletová, s přistávacím motorem), **hmotnost paliva**, **Cd
+   trupu**, **průměr**, **škálu tahu** (1,0 = katalog; podle statického zážehu), rezervu
+   na zpoždění roznětu, brzdu křidélek.
+3. **Spočítat v LandSim** — spustí `tools/gen_guidance_tables.py --vehicle … --table-json …`
+   (Python s numpy, pár sekund). Graf ukáže pásmo `h_min … h_max` podle rychlosti pádu,
+   tabulka pod ním výšku zážehu a dopadovou rychlost pro apogea 80–240 m (červeně mimo
+   obálku).
+4. **Odeslat vozidlo + tabulku do rakety** (Master musí být v IDLE nebo TEST) → pak
+   **Uložit do flash**.
+5. Po `PARAM LIST` záložka sama načte, co v raketě opravdu je, a graf překreslí.
+
+Cd stačí odhadnout — raketa si odpor za letu změří (kap. 5.1 c). Pásmo ale závisí na
+hmotnosti a motoru, takže **po každé změně hmotnosti přepočítat**. Zisky regulátorů se
+při změně hmotnosti nepřefitují (jen setrvačnost se škáluje poměrem hmotností); při
+změně o víc než ~20 % je potřeba přegenerovat celé tabulky (`make tables`). Křivka tahu
+motoru a geometrie křidélek jsou zatím v `guidance_tables.h` (generované z LandSim).
 
 ### Protokol (pro terminál nebo vlastní skripty, 115200, řádky)
 
@@ -487,8 +574,9 @@ python Ground_Visualizer\ground_visualizer.py
   signál, kvalita spoje, **chyba** (česky), UWB.
 * Lišty: zdraví subsystémů, pyro (kontinuita/odpáleno), **události letu** (apogeum,
   aerokryt, zážeh 1, tah, zážeh 2, nohy, lidar, dosed).
-* Grafy výšky, zrychlení, rychlosti, TVC; mapa (offline dlaždice); výškoměr; záznam CSV
-  (klávesa R).
+* **Rozložení:** vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC) přes celou
+  výšku okna, uprostřed karty v mřížce 4 × N s lištami a pod nimi orientace, mapa a TVC;
+  vpravo výškoměr. Záznam CSV (klávesa R).
 
 ---
 
@@ -500,11 +588,16 @@ python Ground_Visualizer\ground_visualizer.py
 | skupina | čte ji | obsah |
 |---|---|---|
 | `seq.*` | Navigation | **časování událostí**: předstih aerokrytu, okno záložního roznětu, předstih a délka nohou, délka pulzu roznětu, povolení, výškové meze |
-| `g.*` | Navigation | hmotnost, zisky smyček (fitované v simulaci), kužel náklonu, rezerva výšky, posun/přepis výšky zážehu, plánovač, detekce zážehu |
+| `g.*` | Navigation | hmotnost, palivo, **Cd trupu, průměr, škála tahu, rezerva na zpoždění roznětu, adaptace odporu**, zisky smyček (fitované v simulaci), kužel náklonu, rezerva výšky, posun/přepis výšky zážehu, plánovač, detekce zážehu |
+| `tbl.*` | Navigation | pásmo zážehu z LandSim (`tbl.vz0`, `tbl.dvz`, `tbl.hmin_00…31`, `tbl.hmax_00…31`); v záložce Parametry skryté, upravuje se v záložce *Zážeh a LandSim* |
 | `fin.*` | Navigation | křidélka: povolení, mez, brzda, režim při stoupání, drift, adaptace |
 | `srv.*` | Master | kalibrace serv: střed, µs/°, **znaménka**, klapka, aerokryt |
 | `mst.*` | Master | práh detekce startu, automatické zastrčení |
-| `pos.*` | Position | **zpoždění GPS**, lidar (povolení, offset, dosah), orientace jen z gyra, UWB |
+| `pos.*` | Position | **zpoždění GPS**, lidar (povolení, offset, dosah, **zpoždění po vyklopení nohou**, **montážní odchylka X/Y**), orientace jen z gyra, UWB |
+
+Tabulka se ukládá na flash čip W25Q128 (kap. 9); rozložení verze 2 (164 hodnot). Po
+nahrání firmwaru s jiným rozložením se načtou výchozí hodnoty — uložené profily
+(export z konzole) jde znovu importovat.
 
 Výchozí hodnoty v `ariadna_params.h` jsou **stejné jako v navedení** — test `make seq` to
 kontroluje, takže nemůže dojít k tomu, že by raketa letěla s jinými zisky, než jaké byly
@@ -552,10 +645,15 @@ Pořadí. Žádný krok nevynechávat.
    `srv.cover_unlock_us`).
 8. **UWB** — raketa na změřeném bodě, poloha souhlasí, reziduál < 20 cm; vytáhnout jednu,
    pak druhou kotvu — navigace musí zůstat platná.
-9. **Lidar** — držet nad zemí špičkou dolů: v záložce Senzory vzdálenost odpovídá.
-10. **Statický zážeh** s klapkou a zamčeným TVC — kalibrovat `srv.clamp_*_us` podle
-    změřeného tahu.
-11. **Dosah rádia** na skutečnou vzdálenost se skutečnými anténami.
+9. **Lidar** — noha vyklopená, držet nad zemí špičkou dolů: v záložce Senzory vzdálenost
+   odpovídá. Změřit a nastavit montážní odchylku `pos.lidar_tilt_x/y_deg` (kap. 4.4).
+   Ověřit, že se lidar do fúze **nezapočte**, dokud nohy nejsou aktivované (příznak
+   „LIDAR povolen“ zhasnutý).
+10. **Parametry rakety** — zvážit raketu, v záložce *Zážeh a LandSim* přepočítat pásmo,
+    odeslat, uložit do flash; po restartu zkontrolovat, že se načetlo z flash.
+11. **Statický zážeh** s klapkou a zamčeným TVC — kalibrovat `srv.clamp_*_us` podle
+    změřeného tahu; poměr k katalogu zadat jako `g.thrust_scale` a přepočítat pásmo.
+12. **Dosah rádia** na skutečnou vzdálenost se skutečnými anténami.
 
 ### Na rampě
 
@@ -609,9 +707,13 @@ náhradní hlavičky neověří vše.
 
 | | jak | výsledek |
 |---|---|---|
-| navedení = simulace | `make guid`, čísla přímo z `tvc_sim.py` | směr navedení do 1e-7, plánovač shodně, motor, koncový zákon, tabulka zážehu |
+| navedení = simulace | `make guid`, čísla přímo z `tvc_sim.py` | směr navedení do 1e-7, plánovač shodně, motor, koncový zákon, výška zážehu do 0,8 m od `find_ignition` |
+| odpor za letu | `make guid`: model s odporem ×0,7 a ×1,4 | odhad 0,71 / 1,36, obě přistanou |
+| odpočty | `make guid`, každý let obálky | aerokryt 0,6 ± 0,08 s; nohy 1,45–2,3 s před dosednutím |
+| hradlo lidaru | kód Position MCU (`legs_ms`, `LIDAR_CEILING_M`) | ⚠️ jen kontrola kódu, ne test na počítači |
+| uložení parametrů | kód Mastera (A/B sektory, zpětné čtení) | ⚠️ ověřit na desce: SAVE → restart → LOAD |
 | navedení v letu | 6-DOF model v `guid_test.cpp`: 140–180 m, drift, zpoždění roznětu 0–300 ms, tah ±8 %, rotace ±90 °/s, vítr, chybná osa tahu, ±1 m chyba výškoměru, slabá/silná/nesouosá křidélka, bez křidélek, mrtvý akcelerometr | všechny přistanou pod 4 m/s, vh < 0,5 m/s, náklon < 3° |
-| sekvencer | `make seq`: časy aerokrytu/roznětů/nohou, záloha, ztráta povolení, minimum 0,5 s | 354 kontrol |
+| sekvencer | `make seq`: časy aerokrytu/roznětů/nohou, záloha, ztráta povolení, minimum 0,5 s | 724 kontrol (spolu s parametry) |
 | parametry | výchozí = navedení, rozsahy, CRC | v `make seq` |
 | převod rámců INSLIB | self-test Position MCU při každém startu | — |
 | protokol, Kalman, UWB | `make link/est/uwb` | beze změny |
@@ -632,5 +734,9 @@ náhradní hlavičky neověří vše.
 | Position LED žlutě 3× | baro trim na mezi → špatně zaměřené UWB kotvy |
 | „Baro trim na mezi“ | přeměřit polohy kotev (`s_uwb_anchors[]`) |
 | lidar „neodpovídá“ | adresa 0x10, kabel, napájení; `pos.lidar_enable` |
+| lidar měří, ale výška se nepřebírá | nohy ještě nejsou aktivované / neuplynulo `pos.lidar_delay_ms`; hodnota na stropu (nic nevidí); paprsek > 25° od svislice — zkontrolovat `pos.lidar_tilt_*` |
+| po restartu výchozí parametry | flash bez platné kopie (nový čip, změna rozložení) — nahrát profil a Uložit do flash |
+| záložka Zážeh: „V … není tvc_sim.py“ | cesta ke klonu LandSim_Light; Python s numpy |
+| „Odpor měřený / model“ daleko od 1 | Cd nebo hmotnost v parametrech neodpovídá — opravit a přepočítat pásmo |
 | vizualizace hlásí „DROPPED“ | jiná verze paketu (stará pozemní stanice) — nahrát stejný firmware |
 | po letu: kde je záznam | flash na Masteru (50 Hz), případně CSV z vizualizace / diagnostiky |
