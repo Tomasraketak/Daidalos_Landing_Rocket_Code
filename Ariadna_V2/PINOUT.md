@@ -77,7 +77,7 @@ the pinout in every sense that matters on a launch day.
 | 5 | fin 3 — opposite fin 1 | `CH_FIN_2` |
 | 6 | fin 4 — opposite fin 2 | `CH_FIN_3` |
 | 7 | **aerocover latch** — unlatched 0.6 s before the ignition command | `CH_COVER` |
-| 8–15 | unused (TEST mode can drive them) | — |
+| 8–15 | unused in flight — "servos 9–16" counted from 1; driven only from the GUI's *Volné výstupy* card (TEST mode on the flight firmware) | — |
 
 Servo calibration (trims, µs per degree, signs, clamp and cover end points) is NOT in
 the sketch any more: it is the `srv.*` group of the parameter table

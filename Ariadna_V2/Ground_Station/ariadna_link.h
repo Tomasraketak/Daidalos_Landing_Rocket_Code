@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   326   // 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   327   // 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -487,8 +487,10 @@ typedef struct {
     uint8_t  src;             // 1 INSLIB epoch, 0 TriSense fusion
     uint8_t  mag_fresh;       // the magnetometer produced a sample since the last packet
     uint16_t imu_hz;          // attitude epochs per second
+    float    gyr_off_dps[3];  // gyro zero offset in force, deg/s, the SENSOR's own axes (fw 3.27):
+                              // what the GUI saves to imu.gyr_off_* after "Kalibrovat gyro"
 } ariadna_raw_imu_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 76, "raw_imu layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 88, "raw_imu layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed

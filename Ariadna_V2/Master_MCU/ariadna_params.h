@@ -43,6 +43,8 @@
 #include <stddef.h>
 
 #define ARIADNA_PARAM_LAYOUT   4     // stored with the flash image (4: 200 ids - calibration, pad, servo check)
+// Ids 186..188 (gyro offset, fw 3.27) were added INSIDE layout 4: an image saved
+// by fw 3.25/3.26 holds 0 there, which is exactly their default.
 // Layout 3 images (164 ids) are still read: the ids they hold keep their
 // stored values, the new ones start at their defaults. See the Master.
 #define ARIADNA_PARAM_ID_MAX_V3 164
@@ -173,7 +175,14 @@
     X(183, POS_PAD_LON,     "pos.pad_lon_deg",    0.0f, -180.0f, 180.0f, "deg", 'P') \
     /* ---- servo connection check (Master) ---- */ \
     X(184, MST_SRV_CHECK_ARM, "mst.servo_check_on_rbf", 1.0f, 0.0f, 1.0f, "0/1", 'M') \
-    X(185, MST_SRV_CHECK_MA,  "mst.servo_check_ma",    60.0f, 10.0f, 1000.0f, "mA", 'M')
+    X(185, MST_SRV_CHECK_MA,  "mst.servo_check_ma",    60.0f, 10.0f, 1000.0f, "mA", 'M') \
+    /* ---- gyro zero offset, deg/s, the TriSense's own axes (fw 3.27). Saved by */ \
+    /*      the GUI's "Kalibrovat gyro"; 0/0/0 = never saved. The Position MCU   */ \
+    /*      still calibrates at every boot and falls back to these only when the */ \
+    /*      boot result is far from them (the vehicle moved while it booted).    */ \
+    X(186, IMU_GYR_OFF_X,   "imu.gyr_off_x",      0.0f, -10.0f,  10.0f, "deg/s", 'P') \
+    X(187, IMU_GYR_OFF_Y,   "imu.gyr_off_y",      0.0f, -10.0f,  10.0f, "deg/s", 'P') \
+    X(188, IMU_GYR_OFF_Z,   "imu.gyr_off_z",      0.0f, -10.0f,  10.0f, "deg/s", 'P')
 
 // ---- ids --------------------------------------------------------------
 enum {

@@ -278,6 +278,13 @@ class ServoCfg:
         return -d if self.reverse else d
 
 
+# PCA9685 outputs 8..15 have no job in flight (PINOUT.md). Counted from 1
+# like the board's connectors, they are servos 9..16. Until fw 3.27 the GUI
+# had no control for them at all, so nothing ever sent them a pulse.
+AUX_CHANNELS = range(8, 16)
+AUX_KEYS = tuple(f"aux{ch + 1}" for ch in AUX_CHANNELS)
+
+
 def default_servos() -> list[ServoCfg]:
     # Channels and the clamp's end points follow Master_MCU.ino. TVC: the
     # flight code moves the servo +-10 deg at 10 us/deg, so +-100 us here.
@@ -290,7 +297,7 @@ def default_servos() -> list[ServoCfg]:
         ServoCfg("fin3", "Křidélko 3", 5, 1200, 1500, 1800),
         ServoCfg("fin4", "Křidélko 4", 6, 1200, 1500, 1800),
         ServoCfg("cover", "Aerokryt", 7, 1000, 1500, 2000, lock_us=1200, unlock_us=1800),
-    ]
+    ] + [ServoCfg(f"aux{ch + 1}", f"Servo {ch + 1}", ch, 1000, 1500, 2000) for ch in AUX_CHANNELS]
 
 
 @dataclass
@@ -938,6 +945,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right.addWidget(self._build_cover())
         right.addWidget(self._build_log(), 1)
         grid.addLayout(right, 1, 2)
+        grid.addWidget(self._build_aux(), 2, 0, 1, 3)
         for i in range(3):
             grid.setColumnStretch(i, 1)
         grid.setRowStretch(1, 1)
@@ -1251,6 +1259,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clamp_to(self, which: str) -> None:
         s = self.cfg.servo("clamp")
         self.axes["clamp"].set_us({"min": s.min_us, "center": s.center_us, "max": s.max_us}[which], emit=True)
+
+    # ------------------------------------------------------- spare outputs
+    def _build_aux(self) -> QtWidgets.QWidget:
+        card = Card("Volné výstupy", "Serva 9–16 (kanály 8–15)")
+        b = button("Vše střed", "primary")
+        b.clicked.connect(lambda: [self.axes[k].set_us(self.cfg.servo(k).center_us, emit=True) for k in AUX_KEYS])
+        card.head.addWidget(b)
+        b = button("Vypnout", tip="Zastaví pulz na kanálech 8–15")
+        b.clicked.connect(self._aux_off)
+        card.head.addWidget(b)
+        note = label("Letový software tyto kanály nepoužívá; ovládají se jen odsud (u letového firmwaru v TEST "
+                     "režimu). Servo 9 = kanál 8 … Servo 16 = kanál 15 PCA9685. Limity a přejmenování v tabulce "
+                     "Nastavení. „Vše na střed“ nahoře je nechává být, aby se nic nečekaně nepohnulo.", "subtle")
+        note.setWordWrap(True)
+        card.lay.addWidget(note)
+        g = QtWidgets.QGridLayout()
+        g.setHorizontalSpacing(28)
+        g.setVerticalSpacing(12)
+        for i, key in enumerate(AUX_KEYS):
+            ax = AxisControl(self.cfg.servo(key))
+            ax.changed.connect(self.on_axis)
+            self.axes[key] = ax
+            g.addWidget(ax, i // 4, i % 4)
+        for c_ in range(4):
+            g.setColumnStretch(c_, 1)
+        card.lay.addLayout(g)
+        return card
+
+    def _aux_off(self) -> None:
+        if not self.link.is_open:
+            return
+        for key in AUX_KEYS:
+            self.pending.pop(self.cfg.servo(key).ch, None)
+            self.link.send(f"OFF {self.cfg.servo(key).ch}")
+        self.log("> OFF kanály 8–15")
 
     # ------------------------------------------------------------ aerocover
     def _build_cover(self) -> QtWidgets.QWidget:
@@ -1691,6 +1734,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def all_center(self) -> None:
         for s in self.cfg.servos:
+            if s.key in AUX_KEYS:          # spare outputs move only from their own card
+                continue
             self.axes[s.key].set_us(s.center_us)
             self.pending[s.ch] = s.center_us
         self._sync_tvc_pad()

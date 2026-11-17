@@ -52,7 +52,7 @@ každým letem, **Z** = zkontrolovat po letu.
 
 | hodnota | druh | kde | čím se měří | kap. | kdy |
 |---|---|---|---|---|---|
-| bias gyra | — | automaticky při startu, tlačítko *Kalibrace gyra* | raketa v klidu 2 s | 3.1 | L |
+| bias gyra | `imu.gyr_off_x/y/z` (záloha) | automaticky při startu, tlačítko *Kalibrovat gyro* (uloží se samo) | raketa v klidu 2 s | 3.1 | L |
 | offset a měřítko akcelerometru `imu.acc_off_*`, `imu.acc_scale_*` | P | Position | diagnostika → Kalibrace (6+ poloh) | 3.2 | 1× |
 | magnetometr `imu.mag_hi_*`, `imu.mag_si_*` | P | Position | diagnostika → Kalibrace (otáčení) | 3.3 | R |
 | deklinace `MAG_DECLINATION_DEG` | K | `Position_MCU.ino` §2 | NOAA kalkulačka pro místo startu | 3.4 | podle místa |
@@ -120,11 +120,18 @@ letový firmware.
 
 ## 3. Senzory Position MCU
 
-### 3.1 Gyroskop — nic se nezapisuje
+### 3.1 Gyroskop — měří se při startu, uložený slouží jako záloha (fw 3.27)
 
 Bias gyra se měří **při každém startu** (raketa musí 2 s stát v klidu) a znovu tlačítkem
-**Kalibrace gyra** v diagnostice (příkaz `CAL GYRO`, jen v IDLE/TEST). Za letu se dál
-dolaďuje (INSLIB odhaduje bias gyra jako stav filtru).
+**Kalibrovat gyro** v záložce *Kalibrace* (příkaz `CAL GYRO`, jen v IDLE/TEST). Za letu se
+dál dolaďuje (INSLIB odhaduje bias gyra jako stav filtru).
+
+Od fw 3.27 GUI po *Kalibrovat gyro* přečte offset, který deska právě používá, a **sám ho
+uloží** do flash jako `imu.gyr_off_x/y/z` (°/s, osy desky; `PARAM SET` + `PARAM SAVE`, stejně
+jako akcelerometr a magnetometr). Kalibrace při zapnutí má dál přednost — offset gyra se
+mezi zapnutími a s teplotou trochu mění. Uložený se použije, jen když se výsledek při
+zapnutí od něj liší na některé ose o víc než **1 °/s** (raketou se při zapnutí hýbalo);
+Position MCU to vypíše na svůj USB. 0 / 0 / 0 = nikdy neuloženo = žádná záloha.
 
 **Kdy:** na rampě, po usazení rakety a před zastrčením. Raketou se během kalibrace nesmí
 hýbat — ani větrem. Kontrola: v záložce *Poloha a senzory* úhlové rychlosti v klidu

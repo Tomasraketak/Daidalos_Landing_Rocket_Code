@@ -179,6 +179,51 @@ PARAM_HELP = {
 }
 
 
+PARAM_HELP["imu.gyr_off_x"] = ("Nulový offset gyra (osa X desky), °/s. Uloží se sám po „Kalibrovat gyro“. "
+                               "Použije se jen, když se kalibrace při zapnutí liší o víc než 1 °/s.")
+PARAM_HELP["imu.gyr_off_y"] = "Nulový offset gyra (osa Y desky), °/s."
+PARAM_HELP["imu.gyr_off_z"] = "Nulový offset gyra (osa Z desky), °/s."
+for _i in range(3):
+    for _j in range(3):
+        PARAM_HELP.setdefault(f"imu.mag_si_{_i}{_j}", f"Soft iron magnetometru, prvek matice [{_i}][{_j}]. "
+                                                      "Z kalibrace v záložce Kalibrace.")
+
+# The parameter editor's groups, in the order they are shown. A parameter
+# goes to the FIRST group whose rule matches its key: an exact key, or a
+# prefix ending in "." or "_". Anything new lands in "Ostatní" until it is
+# given a home here.
+PARAM_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
+    ("Sekvence letu a pyro", "aerokryt, záložní roznět, nohy, apogeum (Navigation MCU)",
+     ("seq.",)),
+    ("Raketa a motor", "hmotnost, průměr, odpor, tah",
+     ("g.mass_", "g.diameter_m", "g.cd_body", "g.fin_dcd_", "g.drag_adapt", "g.thrust_scale")),
+    ("Zážeh a dosednutí", "kdy zapálit, plánovač klapky, detekce zážehu",
+     ("g.h_ign_", "g.ign_delay_pad_s", "g.alt_pad_m", "g.plan_", "g.onset_", "tbl.")),
+    ("Náklon a tryska (TVC)", "smyčka náklonu na trysce, povolený kužel náklonu",
+     ("g.wn_tvc", "g.zeta_tvc", "g.sched_tvc", "g.att_", "g.tilt_")),
+    ("Křidélka", "smyčka na křidélkách, brzda, drift, rotace",
+     ("g.wn_fin", "g.zeta_fin", "g.sched_fin", "g.roll_", "fin.")),
+    ("Serva – kalibrace", "trimy, µs/°, znaménka, klapka a aerokryt (Master)",
+     ("srv.",)),
+    ("Master – start a kontroly", "detekce startu, zastrčení, kontrola serv",
+     ("mst.",)),
+    ("Kalibrace senzorů a rampa", "akcelerometr, gyro, magnetometr, poloha rampy (z záložky Kalibrace)",
+     ("imu.", "pos.pad_")),
+    ("Poloha a senzory", "GPS, lidar, UWB, orientace za letu (Position MCU)",
+     ("pos.",)),
+]
+PARAM_OTHER = ("Ostatní", "parametry bez skupiny", ())
+
+
+def param_group(key: str) -> int:
+    """Index into PARAM_GROUPS (len(PARAM_GROUPS) = "Ostatní")."""
+    for i, (_, _, rules) in enumerate(PARAM_GROUPS):
+        for r in rules:
+            if (key.startswith(r) if r.endswith((".", "_")) else key == r):
+                return i
+    return len(PARAM_GROUPS)
+
+
 def load_param_table(path: str = PARAMS_H) -> list[dict]:
     """The parameter table straight from ariadna_params.h (the same file the
     firmware compiles), so the editor works offline and the demo is honest."""
@@ -224,6 +269,7 @@ class FlightSimBoard(ag.SimBoard):
         self.test = False
         self.state = 1
         self.params = load_param_table()
+        self.goff = [0.412, -0.287, 0.153]                 # deg/s, the "boot calibration"
         self.next_diag = 0.0
         self.which = 0
         self.list_queue: list[str] = []
@@ -246,7 +292,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 326 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 327 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -291,6 +337,8 @@ class FlightSimBoard(ag.SimBoard):
             self.q.put(f"OK RAW {1 if self.raw else 0}")
             return
         if c in ("PADREF", "CAL", "FLIGHTARM"):
+            if c == "CAL":     # a fresh gyro offset, a little off the last one
+                self.goff = [round(v + random.gauss(0.0, 0.02), 3) for v in self.goff]
             self.q.put(f"OK {line.upper()}")
             return
         if c in ("SET", "OFF", "IDLE", "LIM", "PWM", "ARM", "FIRE") and not self.test:
@@ -407,7 +455,8 @@ class FlightSimBoard(ag.SimBoard):
              "gyr": [n(0.05), n(0.05), n(0.05)], "mag": [round(21.0 + n(0.3), 2), round(-38.5 + n(0.3), 2),
                                                         round(12.2 + n(0.3), 2)],
              "magc": [round(18.0 + n(0.3), 2), round(-41.0 + n(0.3), 2), round(9.5 + n(0.3), 2)],
-             "p": round(97234.0 + n(2.0), 1), "temp": 24.6, "src": 1, "mf": 1, "hz": 238}
+             "p": round(97234.0 + n(2.0), 1), "temp": 24.6, "src": 1, "mf": 1, "hz": 238,
+             "goff": self.goff}
         return "R " + json.dumps(d, separators=(",", ":"))
 
     def _diag(self, which: int, t: float) -> str:
@@ -420,7 +469,7 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 326, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 327, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -435,14 +484,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 326, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 327, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 326, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 327, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -897,6 +946,9 @@ class DiagWindow(ag.MainWindow):
             c_.update()
 
     # ------------------------------------------------------------ params
+    # Columns of the parameter tree.
+    PC_KEY, PC_VAL, PC_UNIT, PC_DEF, PC_RANGE, PC_OWNER, PC_HELP = range(7)
+
     def _build_params(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
@@ -904,9 +956,9 @@ class DiagWindow(ag.MainWindow):
         lay.setSpacing(10)
         note = label(
             "Tabulka parametrů žije ve flash W25Q128 Masteru a ten ji na rampě posílá Position i Navigation MCU. "
-            "Měnit lze jen v IDLE nebo TEST. Postup: Načíst z desky → upravit hodnoty (žlutě) → "
-            "Odeslat změny → Uložit do flash. Tabulka zážehu má vlastní záložku. Zastrčit lze jen, když obě desky drží stejnou tabulku "
-            "(CRC souhlasí). Najetím myši na řádek se zobrazí, co parametr dělá.", "muted")
+            "Měnit lze jen v IDLE nebo TEST. Postup: Načíst z desky → klepnout na hodnotu a upravit (žlutě) → "
+            "Odeslat změny → Uložit do flash. Modře = jiná než výchozí. Tabulka zážehu má vlastní záložku. "
+            "Zastrčit lze jen, když obě desky drží stejnou tabulku (CRC souhlasí).", "muted")
         note.setWordWrap(True)
         lay.addWidget(note)
         row = QtWidgets.QHBoxLayout()
@@ -922,79 +974,192 @@ class DiagWindow(ag.MainWindow):
             b.clicked.connect(fn)
             row.addWidget(b)
         row.addStretch(1)
-        self.filter = QtWidgets.QLineEdit()
-        self.filter.setPlaceholderText("filtr (např. seq. nebo fin)")
-        self.filter.textChanged.connect(self._param_filter)
-        row.addWidget(self.filter)
         lay.addLayout(row)
-        self.ptable = QtWidgets.QTableWidget(0, 9)
-        self.ptable.setHorizontalHeaderLabels(["id", "parametr", "hodnota", "výchozí", "min", "max",
-                                               "jednotka", "deska", "co dělá"])
-        self.ptable.verticalHeader().setVisible(False)
-        self.ptable.horizontalHeader().setStretchLastSection(True)
-        self.ptable.setWordWrap(False)
-        self.ptable.itemChanged.connect(self._param_item_changed)
-        lay.addWidget(self.ptable, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        self.filter = QtWidgets.QLineEdit()
+        self.filter.setPlaceholderText("hledat: název nebo popis (např. aerokryt, fin., lidar)")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self._param_filter)
+        row.addWidget(self.filter, 1)
+        self.param_changed_only = QtWidgets.QCheckBox("Jen změněné")
+        self.param_changed_only.setToolTip("Jen hodnoty jiné než výchozí a neodeslané úpravy")
+        self.param_changed_only.toggled.connect(self._param_filter)
+        row.addWidget(self.param_changed_only)
+        for txt, fn in (("Rozbalit vše", lambda: self.ptree.expandAll()),
+                        ("Sbalit vše", lambda: self.ptree.collapseAll())):
+            b = button(txt)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        t = QtWidgets.QTreeWidget()
+        t.setColumnCount(7)
+        t.setHeaderLabels(["parametr", "hodnota", "jednotka", "výchozí", "rozsah", "deska", "co dělá"])
+        t.setRootIsDecorated(True)
+        t.setUniformRowHeights(True)
+        t.setAlternatingRowColors(False)
+        t.setWordWrap(False)
+        t.setIndentation(14)
+        t.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)  # value column only, below
+        t.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        t.setStyleSheet(
+            f"QTreeWidget {{ background: {ag.C['bg_raised']}; border: 1px solid {ag.C['line']}; "
+            f"border-radius: 10px; }}"
+            f"QTreeWidget::item {{ padding: 3px 2px; }}"
+            f"QTreeWidget::item:selected {{ background: {ag.C['accent_tint']}; color: {ag.C['text']}; }}")
+        hdr = t.header()
+        hdr.setStretchLastSection(True)
+        hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        t.itemChanged.connect(self._param_item_changed)
+        t.itemClicked.connect(self._param_item_clicked)
+        t.itemDoubleClicked.connect(self._param_item_clicked)
+        self.ptree = t
+        self.param_items: dict[int, QtWidgets.QTreeWidgetItem] = {}
+        self.param_group_items: list[QtWidgets.QTreeWidgetItem] = []
+        lay.addWidget(t, 1)
         self._param_fill()
         return w
 
+    @staticmethod
+    def _num(v: float) -> str:
+        return f"{v:.6g}"
+
     def _param_fill(self) -> None:
-        self.ptable.blockSignals(True)
-        self.ptable.setRowCount(len(self.params))
-        self.param_rows.clear()
+        t = self.ptree
+        expanded = {g.text(0) for g in self.param_group_items if g.isExpanded()} if self.param_group_items else None
+        t.blockSignals(True)
+        t.clear()
+        self.param_items.clear()
+        self.param_rows = {p["id"]: i for i, p in enumerate(self.params)}
         owners = {"N": "Navigation", "M": "Master", "P": "Position"}
-        for r, p in enumerate(self.params):
-            self.param_rows[p["id"]] = r
-            vals = [str(p["id"]), p["key"], f"{p['val']:.6g}", f"{p['def']:.6g}", f"{p['lo']:.6g}",
-                    f"{p['hi']:.6g}", p["unit"], owners.get(p["owner"], p["owner"]),
-                    PARAM_HELP.get(p["key"], "")]
-            for c_, v in enumerate(vals):
-                it = QtWidgets.QTableWidgetItem(v)
-                if c_ != 2:
-                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                it.setToolTip(PARAM_HELP.get(p["key"], p["key"]))
-                self.ptable.setItem(r, c_, it)
-            self._param_color(p["id"])
-        self.ptable.blockSignals(False)
-        for c_ in range(8):
-            self.ptable.resizeColumnToContents(c_)
+        groups = PARAM_GROUPS + [PARAM_OTHER]
+        heads: list[QtWidgets.QTreeWidgetItem] = []
+        bold = QtGui.QFont(t.font())
+        bold.setBold(True)
+        for name, sub, _ in groups:
+            g = QtWidgets.QTreeWidgetItem([name, "", "", "", "", "", sub])
+            g.setData(self.PC_HELP, Qt.ItemDataRole.UserRole, sub)
+            g.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            g.setFont(0, bold)
+            g.setForeground(0, QtGui.QColor(ag.C["accent"]))
+            g.setForeground(self.PC_HELP, QtGui.QColor(ag.C["subtle"]))
+            heads.append(g)
+        for p in sorted(self.params, key=lambda q: q["id"]):
+            if p["key"].startswith("tbl.hm"):        # the 64 band entries live on their own tab
+                continue
+            help_ = PARAM_HELP.get(p["key"], "")
+            it = QtWidgets.QTreeWidgetItem([
+                p["key"], self._num(self.param_edits.get(p["id"], p["val"])), p["unit"],
+                self._num(p["def"]), f"{self._num(p['lo'])} … {self._num(p['hi'])}",
+                owners.get(p["owner"], p["owner"]), help_])
+            it.setData(0, Qt.ItemDataRole.UserRole, p["id"])
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+            tip = f"{p['key']} (id {p['id']})" + (f"\n{help_}" if help_ else "")
+            for c_ in range(7):
+                it.setToolTip(c_, tip)
+            for c_ in (self.PC_UNIT, self.PC_DEF, self.PC_RANGE, self.PC_OWNER, self.PC_HELP):
+                it.setForeground(c_, QtGui.QColor(ag.C["muted"] if c_ == self.PC_HELP else ag.C["subtle"]))
+            it.setTextAlignment(self.PC_VAL, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            heads[param_group(p["key"])].addChild(it)
+            self.param_items[p["id"]] = it
+        self.param_group_items = [g for g in heads if g.childCount()]
+        for g in self.param_group_items:
+            t.addTopLevelItem(g)
+            g.setFirstColumnSpanned(False)
+            g.setExpanded(expanded is None or g.text(0) in expanded)
+        for pid in self.param_items:
+            self._param_color(pid)
+        t.blockSignals(False)
+        for c_ in range(self.PC_HELP):
+            t.resizeColumnToContents(c_)
+        t.setColumnWidth(self.PC_VAL, max(t.columnWidth(self.PC_VAL), 90))
         self._param_filter()
 
+    def _param_show(self, pid: int, v: float) -> None:
+        it = self.param_items.get(pid)
+        if it is None:
+            return
+        self.ptree.blockSignals(True)
+        it.setText(self.PC_VAL, self._num(v))
+        self.ptree.blockSignals(False)
+        self._param_color(pid)
+
     def _param_color(self, pid: int) -> None:
+        it = self.param_items.get(pid)
         r = self.param_rows.get(pid)
-        if r is None:
+        if it is None or r is None:
             return
         p = self.params[r]
-        it = self.ptable.item(r, 2)
+        self.ptree.blockSignals(True)
         if pid in self.param_edits:
-            it.setBackground(QtGui.QColor(245, 165, 28, 70))
+            it.setBackground(self.PC_VAL, QtGui.QColor(245, 165, 28, 70))
+            it.setForeground(self.PC_VAL, QtGui.QColor(ag.C["accent_soft"]))
         elif abs(p["val"] - p["def"]) > 1e-6 * (1 + abs(p["def"])):
-            it.setBackground(QtGui.QColor(74, 163, 255, 45))      # differs from default
+            it.setBackground(self.PC_VAL, QtGui.QColor(74, 163, 255, 45))      # differs from default
+            it.setForeground(self.PC_VAL, QtGui.QColor(ag.C["text"]))
         else:
-            it.setBackground(QtGui.QBrush())
+            it.setBackground(self.PC_VAL, QtGui.QBrush())
+            it.setForeground(self.PC_VAL, QtGui.QColor(ag.C["text"]))
+        self.ptree.blockSignals(False)
+        self._param_group_counts()
 
-    def _param_item_changed(self, it: QtWidgets.QTableWidgetItem) -> None:
-        if it.column() != 2:
+    def _param_changed(self, p: dict) -> bool:
+        return p["id"] in self.param_edits or abs(p["val"] - p["def"]) > 1e-6 * (1 + abs(p["def"]))
+
+    def _param_group_counts(self) -> None:
+        """'10 param. · 2 změněné · 1 k odeslání' in each group header."""
+        if not getattr(self, "param_group_items", None):
             return
-        p = self.params[it.row()]
+        self.ptree.blockSignals(True)
+        for g in self.param_group_items:
+            n = g.childCount()
+            ch = sum(1 for i in range(n)
+                     if self._param_changed(self.params[self.param_rows[g.child(i).data(0, Qt.ItemDataRole.UserRole)]]))
+            ed = sum(1 for i in range(n) if g.child(i).data(0, Qt.ItemDataRole.UserRole) in self.param_edits)
+            txt = f"{n} param." + (f" · {ch} jiné než výchozí" if ch else "") + (f" · {ed} k odeslání" if ed else "")
+            g.setText(self.PC_HELP, txt + "  —  " + (g.data(self.PC_HELP, Qt.ItemDataRole.UserRole) or ""))
+            g.setForeground(self.PC_HELP, QtGui.QColor(ag.C["accent_soft"] if ed else ag.C["subtle"]))
+        self.ptree.blockSignals(False)
+
+    def _param_item_clicked(self, it: QtWidgets.QTreeWidgetItem, col: int) -> None:
+        if it.data(0, Qt.ItemDataRole.UserRole) is not None and col == self.PC_VAL:
+            self.ptree.editItem(it, self.PC_VAL)
+
+    def _param_item_changed(self, it: QtWidgets.QTreeWidgetItem, col: int) -> None:
+        pid = it.data(0, Qt.ItemDataRole.UserRole)
+        if col != self.PC_VAL or pid is None or pid not in self.param_rows:
+            return
+        p = self.params[self.param_rows[pid]]
         try:
-            v = float(it.text().replace(",", "."))
+            v = float(it.text(self.PC_VAL).replace(",", ".").strip())
         except ValueError:
-            it.setText(f"{p['val']:.6g}")
+            self._param_show(pid, self.param_edits.get(pid, p["val"]))
             return
         v = max(p["lo"], min(p["hi"], v))
-        self.param_edits[p["id"]] = v
-        self.ptable.blockSignals(True)
-        it.setText(f"{v:.6g}")
-        self.ptable.blockSignals(False)
-        self._param_color(p["id"])
+        if abs(v - p["val"]) <= 1e-9 * (1 + abs(v)):
+            self.param_edits.pop(pid, None)                 # typed back to the board's value
+        else:
+            self.param_edits[pid] = v
+        self._param_show(pid, v)
 
-    def _param_filter(self, txt: str = "") -> None:
-        txt = self.filter.text() if hasattr(self, "filter") else txt
-        for r, p in enumerate(self.params):
-            # the 64 band entries live on their own tab
-            hide = p["key"].startswith("tbl.hm") or (bool(txt) and txt.lower() not in p["key"].lower())
-            self.ptable.setRowHidden(r, hide)
+    def _param_filter(self, *_args) -> None:
+        if not hasattr(self, "ptree"):
+            return
+        txt = self.filter.text().strip().lower()
+        only = self.param_changed_only.isChecked()
+        for g in self.param_group_items:
+            shown = 0
+            for i in range(g.childCount()):
+                it = g.child(i)
+                p = self.params[self.param_rows[it.data(0, Qt.ItemDataRole.UserRole)]]
+                hit = (not txt or txt in p["key"].lower() or txt in PARAM_HELP.get(p["key"], "").lower())
+                hide = not hit or (only and not self._param_changed(p))
+                it.setHidden(hide)
+                shown += not hide
+            g.setHidden(shown == 0)
+            if (txt or only) and shown:
+                g.setExpanded(True)
 
     def param_send(self) -> None:
         if not self.link.is_open:
@@ -1035,8 +1200,6 @@ class DiagWindow(ag.MainWindow):
             if p["key"] in d and abs(float(d[p["key"]]) - p["val"]) > 1e-9:
                 self.param_edits[p["id"]] = max(p["lo"], min(p["hi"], float(d[p["key"]])))
         self._param_fill()
-        for pid, v in self.param_edits.items():
-            self.ptable.item(self.param_rows[pid], 2).setText(f"{v:.6g}")
         self.log(f"# import: {len(self.param_edits)} rozdílů, odešlete tlačítkem „Odeslat změny“")
 
     # ------------------------------------------------------------ lines
@@ -1101,10 +1264,7 @@ class DiagWindow(ag.MainWindow):
             if pid in self.param_rows:
                 self.params[self.param_rows[pid]]["val"] = float(val)
                 self.param_edits.pop(pid, None)
-                self.ptable.blockSignals(True)
-                self.ptable.item(self.param_rows[pid], 2).setText(val)
-                self.ptable.blockSignals(False)
-                self._param_color(pid)
+                self._param_show(pid, float(val))
         elif line.startswith("OK TEST 1"):
             self.test_on = True
             # The console's PWM / IDLE / LIM are accepted only in TEST: send them now.

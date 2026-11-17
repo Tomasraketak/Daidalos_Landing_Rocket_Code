@@ -2430,12 +2430,12 @@ static void diag_emit(void)
         n = snprintf(b, sizeof(b),
             "R {\"t\":%lu,\"acc\":[%.4f,%.4f,%.4f],\"accr\":[%.5f,%.5f,%.5f],\"gyr\":[%.3f,%.3f,%.3f],"
             "\"mag\":[%.2f,%.2f,%.2f],\"magc\":[%.2f,%.2f,%.2f],\"p\":%.1f,\"temp\":%.2f,"
-            "\"src\":%u,\"mf\":%u,\"hz\":%u}\n",
+            "\"src\":%u,\"mf\":%u,\"hz\":%u,\"goff\":[%.3f,%.3f,%.3f]}\n",
             (unsigned long)r.t_ms, r.acc_g[0], r.acc_g[1], r.acc_g[2],
             r.acc_raw_g[0], r.acc_raw_g[1], r.acc_raw_g[2],
             r.gyr_dps[0], r.gyr_dps[1], r.gyr_dps[2], r.mag_ut[0], r.mag_ut[1], r.mag_ut[2],
             r.mag_cal_ut[0], r.mag_cal_ut[1], r.mag_cal_ut[2], r.pressure_pa, r.temp_c,
-            r.src, r.mag_fresh, r.imu_hz);
+            r.src, r.mag_fresh, r.imu_hz, r.gyr_off_dps[0], r.gyr_off_dps[1], r.gyr_off_dps[2]);
         if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
         n = 0;
     }

@@ -2,8 +2,12 @@
 "Kalibrace" tab of the diagnostic console: TriSense calibration, the pad
 position and the servo connection check.
 
-  * GYRO          the Position MCU averages the gyro for 2 s with the vehicle
-                  still ("CAL GYRO"). Done at every boot as well.
+  * GYRO          the Position MCU averages the gyro for 1 s with the vehicle
+                  still ("CAL GYRO"). Done at every boot as well. After a
+                  "CAL GYRO" from here, the offset the board now uses (the
+                  "goff" of the R line, fw 3.27) is saved as imu.gyr_off_*;
+                  at boot the Position MCU falls back to it when its own
+                  boot calibration is far from it (moved while booting).
   * ACCELEROMETER six or more STILL orientations, any directions (ideally
                   each axis once up and once down). An axis-aligned ellipsoid
                   is fitted to the averaged readings:
@@ -55,6 +59,8 @@ SERVO_NAMES = ["TVC X", "TVC Y", "Klapka (škrcení)", "Křidélko 1", "Křidél
 class CalibTab(QtWidgets.QWidget):
     ACC_SAMPLES = 50          # 2 s of R lines at 25 Hz
     PAD_SECONDS = 10.0
+    GYRO_SETTLE_S = 2.5       # CAL GYRO: 1 s average + filter restart, then read "goff"
+    GYRO_GIVE_UP_S = 8.0
 
     def __init__(self, win):
         super().__init__()
@@ -67,6 +73,8 @@ class CalibTab(QtWidgets.QWidget):
         self.mag_fit: dict | None = None
         self.pad_buf: list[tuple] | None = None
         self.pad_t0 = 0.0
+        self.gyro_t0: float | None = None                # CAL GYRO sent, offset not saved yet
+        self.gyro_msg_until = 0.0                        # keep the result line this long
 
         g = QtWidgets.QGridLayout(self)
         g.setContentsMargins(20, 16, 20, 20)
@@ -83,18 +91,23 @@ class CalibTab(QtWidgets.QWidget):
 
         # ---------------------------------------------------------- gyro
         gy = Card("Gyroskop", "Nulová odchylka")
-        t = label("Raketou (deskou) 2 s nehýbat. Dělá se i při každém zapnutí; INSLIB pak odchylku "
-                  "dál dolaďuje za běhu. |ω| v klidu po kalibraci má být < 0,2 °/s.", "muted")
+        t = label("Raketou (deskou) 2 s nehýbat. Výsledek se sám uloží do flash (imu.gyr_off_*). "
+                  "Kalibruje se i při každém zapnutí; když se ale raketa při zapnutí hýbala "
+                  "(výsledek se liší od uloženého o víc než 1 °/s), použije se uložený. INSLIB pak "
+                  "odchylku dál dolaďuje za běhu. |ω| v klidu po kalibraci má být < 0,2 °/s.", "muted")
         t.setWordWrap(True)
         gy.lay.addWidget(t)
         row = QtWidgets.QHBoxLayout()
-        b = button("Kalibrovat gyro", "primary")
-        b.clicked.connect(lambda: self.win._cmd("CAL GYRO"))
-        row.addWidget(b)
+        self.gyro_btn = button("Kalibrovat gyro", "primary")
+        self.gyro_btn.clicked.connect(self.gyro_start)
+        row.addWidget(self.gyro_btn)
         self.gyro_lbl = label("|ω| = —", "muted")
         row.addWidget(self.gyro_lbl)
         row.addStretch(1)
         gy.lay.addLayout(row)
+        self.gyro_off_lbl = label("Offset: —", "muted")
+        self.gyro_off_lbl.setWordWrap(True)
+        gy.lay.addWidget(self.gyro_off_lbl)
         g.addWidget(gy, 2, 0)
 
         # ---------------------------------------------------------- pad
@@ -222,6 +235,15 @@ class CalibTab(QtWidgets.QWidget):
             self.win.raw_btn.setChecked(True)          # sends RAW 1
         return True
 
+    def _need_link_raw(self) -> bool:
+        """Like _need_raw(), for the steps that need no numpy."""
+        if not self.win.link.is_open:
+            QtWidgets.QMessageBox.warning(self, "Kalibrace", "Není připojena raketa.")
+            return False
+        if not self.win.raw_btn.isChecked():
+            self.win.raw_btn.setChecked(True)          # sends RAW 1
+        return True
+
     def _param_set(self, values: dict[str, float]) -> None:
         for k, v in values.items():
             self.win.link.send(f"PARAM SET {k} {v:.7g}")
@@ -233,6 +255,11 @@ class CalibTab(QtWidgets.QWidget):
         gyr = d.get("gyr") or [0, 0, 0]
         gm = math.sqrt(sum(c * c for c in gyr))
         self.gyro_lbl.setText(f"|ω| = {gm:.2f} °/s")
+        goff = d.get("goff")
+        if self.gyro_t0 is not None:
+            self._gyro_poll(goff)
+        elif goff is not None and time.monotonic() > self.gyro_msg_until:
+            self.gyro_off_lbl.setText("Offset v platnosti: " + self._fmt_goff(goff) + " °/s")
         if self.acc_buf is not None:
             self.acc_buf.append((d.get("accr") or d.get("acc") or [0, 0, 0], gm))
             n = len(self.acc_buf)
@@ -290,6 +317,41 @@ class CalibTab(QtWidgets.QWidget):
             bad = [SERVO_NAMES[i] for i, r in enumerate(res) if r == 2]
             self.srv_lbl.setText(("Nereaguje: " + ", ".join(bad)) if bad else
                                  ("Všechna serva reagují." if d.get("done") else "—"))
+
+    # ------------------------------------------------------------------ gyro
+    @staticmethod
+    def _fmt_goff(g) -> str:
+        return " / ".join(f"{v:+.3f}".replace(".", ",") for v in g)
+
+    def gyro_start(self) -> None:
+        if not self._need_link_raw():
+            return
+        self.win._cmd("CAL GYRO")
+        self.gyro_t0 = time.monotonic()
+        self.gyro_btn.setEnabled(False)
+        self.gyro_off_lbl.setText("Kalibruji… nehýbat.")
+        # also when the R lines never come (old firmware, raw stream off)
+        QtCore.QTimer.singleShot(int(self.GYRO_GIVE_UP_S * 1000) + 100, lambda: self._gyro_poll(None))
+
+    def _gyro_poll(self, goff) -> None:
+        if self.gyro_t0 is None:
+            return
+        dt = time.monotonic() - self.gyro_t0
+        if goff is not None and dt >= self.GYRO_SETTLE_S:
+            self.gyro_t0 = None
+            self.gyro_btn.setEnabled(True)
+            if all(abs(v) < 1e-6 for v in goff):
+                self.gyro_off_lbl.setText("Deska hlásí nulový offset - neuloženo (kalibrace neproběhla?).")
+                return
+            g = [max(-10.0, min(10.0, float(v))) for v in goff]
+            self._param_set({"imu.gyr_off_x": g[0], "imu.gyr_off_y": g[1], "imu.gyr_off_z": g[2]})
+            self.gyro_off_lbl.setText("Offset " + self._fmt_goff(g) + " °/s uložen do flash ✓")
+            self.gyro_msg_until = time.monotonic() + 15.0
+        elif dt >= self.GYRO_GIVE_UP_S:
+            self.gyro_t0 = None
+            self.gyro_btn.setEnabled(True)
+            self.gyro_off_lbl.setText("Kalibrace proběhla, ale deska offset nehlásí (firmware < 3.27?) - "
+                                      "NEuloženo, platí jen do vypnutí.")
 
     # ------------------------------------------------------------------ pad
     def pad_start(self) -> None:

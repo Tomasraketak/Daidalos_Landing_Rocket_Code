@@ -274,8 +274,9 @@ AdvancedTriFusion fusion(&sensor.imu, &sensor.mag);
 // what is in force; identity = uncalibrated. All in the SENSOR's own axes.
 //   accelerometer: accel_out = (raw - ACC_OFFSET) * ACC_SCALE   [g]
 //   magnetometer:  mag_out   = MAG_SOFT_IRON * (raw - MAG_HARD_IRON) [uT]
-// The gyro needs no constant: it is calibrated at every boot (vehicle still)
-// and again by the GUI's "Kalibrace gyra" button.
+// The gyro is calibrated at every boot (vehicle still) and again by the GUI's
+// "Kalibrovat gyro" button, which then saves the result as imu.gyr_off_*
+// (fw 3.27). The saved offset is a FALLBACK only: see gyro_saved_check().
 static float       ACC_OFFSET[3]       = { 0.0f, 0.0f, 0.0f };
 static float       ACC_SCALE[3]        = { 1.0f, 1.0f, 1.0f };
 static float       MAG_HARD_IRON[3]    = { 0.0f, 0.0f, 0.0f };
@@ -2391,6 +2392,56 @@ static void imu_cal_apply(void)
 #endif
 }
 
+/*
+ * GYRO OFFSET: BOOT CALIBRATION VS THE SAVED ONE (fw 3.27)
+ *
+ * The boot calibration is the better number when the vehicle stood still:
+ * a MEMS gyro's zero moves a little from one power-up to the next and with
+ * temperature. But it averages whatever the gyro saw for one second, so a
+ * vehicle carried, bumped or set down while it booted starts with a wrong
+ * offset. Once the saved imu.gyr_off_* have arrived from the Master (a few
+ * seconds after boot), they are compared ONCE with the boot result; if any
+ * axis differs by more than GYRO_SAVED_TOL_DPS, the saved offset is used.
+ * A "Kalibrovat gyro" from the GUI before that skips the check: that result
+ * is fresh and the GUI saves it itself. 0/0/0 = never saved = no fallback.
+ */
+static const float GYRO_SAVED_TOL_DPS = 1.0f;
+static bool        s_gyr_checked      = false;
+
+static bool gyro_saved_params_seen(void)
+{
+    for (uint8_t id = ARIADNA_P_IMU_GYR_OFF_X; id <= ARIADNA_P_IMU_GYR_OFF_Z; id++)
+        if (!(s_param_seen[id >> 3] & (uint8_t)(1u << (id & 7)))) return false;
+    return true;
+}
+
+/** Core 0, on the ground. Returns true when it replaced the boot offset. */
+static bool gyro_saved_check(void)
+{
+    const float sv[3] = { PRM(IMU_GYR_OFF_X), PRM(IMU_GYR_OFF_Y), PRM(IMU_GYR_OFF_Z) };
+    if (sv[0] == 0.0f && sv[1] == 0.0f && sv[2] == 0.0f) return false;   // never saved
+    float bt[3];
+    sensor.imu.getGyroOffset(bt[0], bt[1], bt[2]);
+    bool off = false;
+    for (uint8_t i = 0; i < 3; i++) off = off || fabsf(bt[i] - sv[i]) > GYRO_SAVED_TOL_DPS;
+    if (!off) {
+        POS_PRINT("# gyro: boot calibration %.2f %.2f %.2f deg/s agrees with the saved one\n",
+                  (double)bt[0], (double)bt[1], (double)bt[2]);
+        return false;
+    }
+    sensor.imu.setGyroOffset(sv[0], sv[1], sv[2]);
+#if ARIADNA_USE_INSLIB
+    ins.reset();                       // restart the filter on the corrected rates
+#else
+    fusion.initOrientation(200);
+#endif
+    POS_PRINT("# gyro: boot calibration %.2f %.2f %.2f deg/s is > %.1f deg/s from the saved "
+              "%.2f %.2f %.2f (moved while booting?) - using the saved one\n",
+              (double)bt[0], (double)bt[1], (double)bt[2], (double)GYRO_SAVED_TOL_DPS,
+              (double)sv[0], (double)sv[1], (double)sv[2]);
+    return true;
+}
+
 static void attitude_recalibrate(void)
 {
 #if ARIADNA_USE_INSLIB
@@ -3328,6 +3379,12 @@ void loop()
         s_req_cal_gyro = false;
         attitude_recalibrate();
         s_cal_state = 2;
+        s_gyr_checked = true;          // fresh on purpose: no fallback to the saved one
+    }
+    // Parameters only arrive on the ground (param_receive), so this never runs in flight.
+    if (!s_gyr_checked && gyro_saved_params_seen()) {
+        s_gyr_checked = true;
+        (void)gyro_saved_check();
     }
 
     // ---- attitude: updated in the idle path above, read here ---------------
@@ -3806,6 +3863,7 @@ void loop()
             r.pressure_pa = last_p_pa;
             r.temp_c      = sensor.readTemperature();
             r.imu_hz      = (uint16_t)(s_att.hz > 0.0f ? s_att.hz : 0.0f);
+            sensor.imu.getGyroOffset(r.gyr_off_dps[0], r.gyr_off_dps[1], r.gyr_off_dps[2]);
             link_send(ARIADNA_PKT_RAW_IMU, &r, sizeof(r));
         }
     }
