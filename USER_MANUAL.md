@@ -701,13 +701,15 @@ Arduino IDE 2, deska **arduino-pico** (earlephilhower).
 | sketch | deska | knihovny |
 |---|---|---|
 | `Master_MCU` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.6, [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), Adafruit_NeoPixel |
+| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.6, [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
 | `Navigation_MCU` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Ground_Station` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
 
-Lidar TF-Luna nepotřebuje knihovnu — registrový protokol z
-[TF-Luna-I2C-Library](https://github.com/Tomasraketak/TF-Luna-I2C-Library) je přímo
-v `Position_MCU.ino` (knihovna by přenastavila globální `Wire` na jiné piny).
+Lidar TF-Luna jede přes knihovnu
+[TF-Luna-I2C-Library](https://github.com/Tomasraketak/TF-Luna-I2C-Library) **≥ 1.1.0**
+(ta bere sběrnici jako `TwoWire&`, takže běží na senzorové sběrnici `Wire1` bez
+přenastavení pinů; 1.0.0 měla špatný registr frame rate a nepřeloží se). Firmware při
+startu nastaví 250 Hz a měření fúzuje jen při novém snímku (podle časové značky senzoru).
 
 Každá složka sketche nese kopie hlaviček z `common/` (Arduino jinak nevidí mimo složku).
 Upravujte **originály v `common/`** a pak `cd test && make sync-fix`.

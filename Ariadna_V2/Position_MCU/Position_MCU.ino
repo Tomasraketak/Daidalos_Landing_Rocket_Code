@@ -111,6 +111,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <TriSense.h>
+#include <TFLuna.h>        // TFLuna_I2C >= 1.1.0: github.com/Tomasraketak/TF-Luna-I2C-Library
 
 // ---------------------------------------------------------------------
 //  WHERE THE ATTITUDE COMES FROM
@@ -338,54 +339,43 @@ struct RangeFix {
  * TF Luna lidar, I2C, on the sensor bus with the barometer, the
  * magnetometer and the UWB tag.
  *
- * Follows https://github.com/Tomasraketak/TF-Luna-I2C-Library (TFLuna):
- * the same frame read (register 0x00: distance cm, signal strength, chip
- * temperature in 0.01 degC) and the same configuration calls - frame rate,
- * save, I2C address. The library itself is not instantiated, because it
- * is hard-wired to the global `Wire` and its begin() re-maps that bus's
- * pins, while on this board the sensor bus is Wire1 (D4/D5), already
- * running at 400 kHz with three other devices. Everything else it does is
- * here, plus two things it does not do yet:
+ * Driven through https://github.com/Tomasraketak/TF-Luna-I2C-Library
+ * (TFLuna_I2C >= 1.1.0, Arduino library manager / ZIP). Since 1.1.0 the
+ * library takes the bus as a TwoWire&, so it runs on this board's sensor
+ * bus (Wire1 on D4/D5) without touching its pins or its 400 kHz clock:
+ * begin(TwoWire&) only calls wire.begin(), which arduino-pico ignores on a
+ * bus that is already running. 1.1.0 also has the frame-rate register at
+ * 0x26/0x27 (1.0.0 wrote 0x03 and had no effect), and begin() checks the
+ * "LUNA" signature, so another device answering at 0x10 is not taken for
+ * a lidar.
  *
- *   * FRESH-FRAME DETECTION from the sensor's own timestamp (0x06/0x07).
- *     The TF-Luna answers every read with its LAST frame, so before fw
- *     3.21 a 50 Hz poll of a 100 Hz sensor was fine but any faster poll,
- *     or a sensor that had stopped measuring, re-fused the same range as
- *     new evidence - the over-confidence the barometer's baro_fresh flag
- *     exists to prevent. poll() now returns true only on a new frame.
- *   * FRAME RATE set at start-up to 250 Hz (FPS registers 0x26/0x27, not
- *     saved to the sensor's flash), so the frame read at each 20 ms poll
- *     is at most 4 ms old instead of 10 ms.
+ * What this wrapper adds on top of the library:
  *
- * NOTE ON THE LIBRARY: its setFrameRate() writes register 0x03 and its
- * factoryReset() 0x3C. In the TF-Luna map those are the read-only signal
- * high byte and nothing; the frame rate lives at 0x26/0x27 and the
- * factory reset at 0x29 (Benewake manual; budryerson/TFLuna-I2C agrees).
+ *   * FRESH-FRAME DETECTION from the sensor's timestamp (getTimestamp()).
+ *     The TF-Luna answers every read with its LAST frame; re-fusing one
+ *     range as new evidence would make the filter over-confident, the
+ *     same mistake the barometer's baro_fresh flag exists to prevent.
+ *     poll() returns true only on a new frame.
+ *   * FRAME RATE 250 Hz at start-up (not saved to the sensor's flash), so
+ *     the frame read at each 20 ms poll is at most 4 ms old.
+ *   * The vehicle's own gates: plausible range, and a failure counter that
+ *     probes a dead sensor once a second instead of fifty times.
  *
  * WHAT IT IS FOR. Near the ground the lidar sees the ground directly, and
  * the guidance drops its altitude margin the moment it does
  * (ARIADNA_NAV_LIDAR_OK).
- *
- * A reading is used only when it can be believed: a plausible range, a
- * signal neither too weak nor saturated, and a vehicle upright enough
- * that the beam is hitting the ground under it and not the horizon.
  */
 class LidarTFLuna {
 public:
-    static const uint8_t  REG_DIST   = 0x00;   // dist, flux, temp, tick: 8 bytes
-    static const uint8_t  REG_SAVE   = 0x20;
-    static const uint8_t  REG_ADDR   = 0x22;
-    static const uint8_t  REG_FPS_LO = 0x26;
-    static const uint16_t FPS        = 250;
+    static const uint16_t FPS = 250;
 
-    bool begin(TwoWire &wire, uint8_t i2c_addr = 0x10)
+    bool begin(TwoWire &wire, uint8_t i2c_addr = TFLUNA_DEFAULT_ADDRESS)
     {
-        _wire = &wire;
-        _addr = i2c_addr;
+        _luna = TFLuna(i2c_addr);
         _fails = 0;
         _have_tick = false;
-        _ok = read_frame();
-        if (_ok) _fps_set = set_frame_rate(FPS);
+        _ok = _luna.begin(wire);                 // signature check
+        if (_ok) _fps_set = configure();
         return _ok;
     }
 
@@ -396,12 +386,10 @@ public:
         if (_fails >= 10 && (uint32_t)(now_ms - _last_try_ms) < 1000u) return false;
         _last_try_ms = now_ms;
 
-        const uint16_t prev_tick = _tick;
+        const uint16_t prev_tick = _luna.getTimestamp();
         const bool had_tick = _have_tick;
-        if (!read_frame()) { fail(); return false; }
-        if (!_ok) {                        // came back: configure it again
-            _fps_set = set_frame_rate(FPS);
-        }
+        if (!_luna.read()) { fail(); return false; }
+        if (!_ok) _fps_set = configure();        // came back: set it up again
         _fails = 0;
         _ok    = true;
         _have_tick = true;
@@ -409,17 +397,16 @@ public:
         // The same timestamp means the same frame: nothing new to fuse.
         // (A sensor whose clock stopped looks exactly like this too, and
         // is correctly treated as giving no information.)
-        if (had_tick && _tick == prev_tick) {
+        if (had_tick && _luna.getTimestamp() == prev_tick) {
             if (++_stale >= 25) _fix.valid = false;   // ~0.5 s of nothing
             return false;
         }
         _stale = 0;
 
-        // TF Luna: 0.2..8 m; below 100 the return is too weak to trust and
-        // 65535 means the receiver saturated.
-        const bool good = _dist_cm >= 20 && _dist_cm <= 800 &&
-                          _strength >= 100 && _strength != 65535;
-        _fix.range_m = (float)_dist_cm * 0.01f;
+        // TF Luna: 0.2..8 m; isValid() = strength >= 100 and not saturated.
+        const uint16_t d = _luna.getDistance();
+        const bool good = d >= 20 && d <= 800 && _luna.isValid();
+        _fix.range_m = (float)d * 0.01f;
         // 2 cm repeatability near, about 1 % of range far, and a floor that
         // also covers grass and the pad not being a mirror.
         _fix.sigma_m = 0.05f + 0.01f * _fix.range_m;
@@ -428,48 +415,21 @@ public:
         return true;
     }
 
-    /** Frame rate, 1..250 Hz. Volatile unless save() follows. */
-    bool set_frame_rate(uint16_t fps)
-    {
-        if (fps < 1) fps = 1;
-        if (fps > 250) fps = 250;
-        _wire->beginTransmission(_addr);
-        _wire->write(REG_FPS_LO);
-        _wire->write((uint8_t)(fps & 0xFF));
-        _wire->write((uint8_t)(fps >> 8));
-        return _wire->endTransmission() == 0;
-    }
-
-    /** Persist the current settings in the sensor's own flash. */
-    bool save(void)
-    {
-        _wire->beginTransmission(_addr);
-        _wire->write(REG_SAVE);
-        _wire->write((uint8_t)0x01);
-        return _wire->endTransmission() == 0;
-    }
-
     const RangeFix &fix(void) const { return _fix; }
     bool     healthy(void)  const { return _ok && _fails < 10; }
-    uint16_t strength(void) const { return _strength; }
-    float    range_m(void)  const { return (float)_dist_cm * 0.01f; }
-    float    temp_c(void)   const { return (float)_temp_cdeg * 0.01f; }
+    uint16_t strength(void)       { return _luna.getSignalStrength(); }
+    float    range_m(void)        { return (float)_luna.getDistance() * 0.01f; }
+    float    temp_c(void)         { return _luna.getTemperature(); }
     bool     fps_set(void)  const { return _fps_set; }
 
 private:
-    bool read_frame(void)
+    bool configure(void)
     {
-        _wire->beginTransmission(_addr);
-        _wire->write(REG_DIST);
-        if (_wire->endTransmission() != 0) return false;
-        if (_wire->requestFrom((int)_addr, 8) != 8) return false;
-        uint8_t b[8];
-        for (uint8_t i = 0; i < 8; i++) b[i] = (uint8_t)_wire->read();
-        _dist_cm   = (uint16_t)(b[0] | (b[1] << 8));
-        _strength  = (uint16_t)(b[2] | (b[3] << 8));
-        _temp_cdeg = (int16_t)(b[4] | (b[5] << 8));
-        _tick      = (uint16_t)(b[6] | (b[7] << 8));
-        return true;
+        // Continuous mode and measuring, whatever a previous bench session
+        // left in the sensor's RAM; then the frame rate, read back.
+        (void)_luna.setTriggerMode(false);
+        (void)_luna.enable();
+        return _luna.setFrameRate(FPS) && _luna.getFrameRate() == FPS;
     }
 
     void fail(void)
@@ -479,16 +439,13 @@ private:
         _fix.valid = false;
     }
 
-    TwoWire *_wire = nullptr;
-    uint8_t  _addr = 0x10;
+    TFLuna   _luna;
     bool     _ok   = false;
     bool     _fps_set = false;
     bool     _have_tick = false;
     uint8_t  _fails = 0;
     uint8_t  _stale = 0;
     uint32_t _last_try_ms = 0;
-    uint16_t _dist_cm = 0, _strength = 0, _tick = 0;
-    int16_t  _temp_cdeg = 0;
     RangeFix _fix  = { 0.0f, 0.0f, 0, false };
 };
 

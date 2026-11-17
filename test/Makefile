@@ -62,6 +62,7 @@ SIM ?= ../../LandSim_Light
 # Library checkouts, for the Position MCU syntax check (optional).
 TRISENSE ?= ../../Voltino_TriSense_Library
 INSLIB   ?= ../../TriSenseINSLIB
+TFLUNA   ?= ../../TF-Luna-I2C-Library
 # make tables SIM=../../LandSim_Light [VEHICLE=vehicle.json]  (VEHICLE in LandSim's format)
 tables:
 	python3 ../tools/gen_guidance_tables.py --sim $(SIM) $(if $(VEHICLE),--landsim-vehicle $(abspath $(VEHICLE)))
@@ -209,13 +210,13 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
 	$(CXX) $(CXXFLAGS) -DARDUINO=100 -Ifull_stub -I$(V2)/Master_MCU \
 	    -x c++ -fsyntax-only $(V2)/Master_MCU/Master_MCU.ino
-	@if [ -d "$(TRISENSE)/src" ] && [ -d "$(INSLIB)/src" ]; then \
+	@if [ -d "$(TRISENSE)/src" ] && [ -d "$(INSLIB)/src" ] && [ -d "$(TFLUNA)/src" ]; then \
 	  for ins in 1 0; do \
 	    $(CXX) -O2 -Wall -Wextra -std=c++17 -DARDUINO=100 -DARDUINO_ARCH_RP2350 -D__ARM_FP=4 \
-	      -DARIADNA_USE_INSLIB=$$ins -Ifull_stub -I$(TRISENSE)/src -I$(INSLIB)/src \
+	      -DARIADNA_USE_INSLIB=$$ins -Ifull_stub -I$(TRISENSE)/src -I$(INSLIB)/src -I$(TFLUNA)/src \
 	      -I$(V2)/Position_MCU -x c++ -fsyntax-only $(V2)/Position_MCU/Position_MCU.ino || exit 1; \
-	  done; echo "Position_MCU compiles against the TriSense and TriSenseINSLIB headers"; \
-	else echo "Position_MCU: skipped (set TRISENSE=... INSLIB=... to the library checkouts)"; fi
+	  done; echo "Position_MCU compiles against the TriSense, TriSenseINSLIB and TFLuna headers"; \
+	else echo "Position_MCU: skipped (set TRISENSE=... INSLIB=... TFLUNA=... to the library checkouts)"; fi
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Actuator_Console \
 	    -x c++ -fsyntax-only $(EX_DIR)/Actuator_Console/Actuator_Console.ino
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Pyro_Companion \
