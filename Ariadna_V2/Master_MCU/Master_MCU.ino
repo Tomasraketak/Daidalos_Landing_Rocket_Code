@@ -172,6 +172,7 @@ static const float VBAT_DIVIDER    = 3.00f;    // e.g. 20k over 10k
 static const float ACS712_ZERO_V   = 2.504f;   // output at 0 A, at the sensor
 static const float ACS712_V_PER_A  = 0.100f;   // 20 A part: 100 mV/A
 static const float ACS712_DIVIDER  = 0.50f;    // pin volts / sensor volts
+static const float ACS712_MIN_PIN_V = 0.10f;   // below this the sensor is unpowered
 
 // RBF: pin pulled to ground while the tag is fitted. Removing it lets the
 // pull-up take the pin high, which is the ARMED-permissive state. Fail
@@ -951,6 +952,10 @@ static void read_analogue(void)
 
     float i_adc = (float)analogRead(PIN_I_SENSE) * (ADC_VREF / ADC_FULL_SCALE);
     float amps  = ((i_adc / ACS712_DIVIDER) - ACS712_ZERO_V) / ACS712_V_PER_A;
+    // A powered ACS712 never goes below ~0.1 V at its output (0 A = Vcc/2,
+    // -20 A = Vcc/10). A pin near 0 V means the sensor has no 5 V (USB-only
+    // bench) or a broken wire: that is "no reading", not -25 A.
+    if (i_adc < ACS712_MIN_PIN_V) amps = 0.0f;
 
     vbat_f += 0.02f * (vbat - vbat_f);
     curr_f += 0.02f * (amps - curr_f);

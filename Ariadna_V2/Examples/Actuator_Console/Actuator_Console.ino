@@ -91,6 +91,7 @@ static const float VBAT_DIVIDER   = 3.00f;
 static const float ACS712_ZERO_V  = 2.504f;    // sensor output at 0 A
 static const float ACS712_V_PER_A = 0.100f;    // 20 A part: 100 mV/A
 static const float ACS712_DIVIDER = 0.50f;     // pin volts / sensor volts
+static const float ACS712_MIN_PIN_V = 0.10f;   // below this the sensor is unpowered
 
 // ---- PCA9685 -------------------------------------------------------------
 static const uint8_t  PCA_ADDR    = 0x40;
@@ -282,7 +283,10 @@ static void current_service(void)
     next_us = t + 1000;
 
     const float pin  = (float)analogRead(PIN_I_SENSE) * (ADC_VREF / ADC_FULL_SCALE);
-    const float amps = (pin / ACS712_DIVIDER - ACS712_ZERO_V) / ACS712_V_PER_A;
+    // Pin near 0 V = sensor has no 5 V (USB-only bench) or a broken wire:
+    // a powered ACS712 never goes below ~0.1 V. Report 0 A, not -25 A.
+    const float amps = (pin < ACS712_MIN_PIN_V) ? 0.0f
+                     : (pin / ACS712_DIVIDER - ACS712_ZERO_V) / ACS712_V_PER_A;
     filt += 0.25f * (amps - filt);                 // ~4 ms: keeps a stall, drops ADC noise
     acc  += amps;
     n++;
