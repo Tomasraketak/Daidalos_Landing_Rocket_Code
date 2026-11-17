@@ -308,6 +308,7 @@ static const uint32_t PARAM_MAGIC = 0x44414932;      // "DAI2"
 // build that only works inside one IDE cannot be checked on a workstation.
 static void params_load(void);
 static void params_request_poll(void);
+static inline uint16_t counts_to_us(uint16_t c);
 static void flash_param_service(void);
 static void log_dump_service(void);
 static bool log_service_busy(void);
@@ -390,6 +391,7 @@ static actcon_pyro_report_t s_pyro_rep;          // from the Navigation MCU, TES
 static uint32_t s_pyro_rep_ms = 0;
 static uint32_t s_pyro_seq    = 1;
 static float    s_amps_now    = 0.0f;            // 100 ms mean
+static float    s_amps_tick   = 0.0f;            // this tick's sample, unfiltered (servo check)
 static float    s_amps_max    = 0.0f;            // peak over 10 s
 static uint32_t s_nav_status_ms = 0, s_pos_status_ms = 0;
 
@@ -544,6 +546,127 @@ static void servos_apply(const ariadna_actuator_t *a)
                                                          : PRM(SRV_COVER_LOCK));
 
     s_servo_ok = pca_write_run(0, s_servo_counts, PCA_N_USED);
+}
+
+// =====================================================================
+//  3b. SERVO CONNECTION CHECK
+//
+//  Moves ONE servo at a time 5 deg away from its parked position and back,
+//  and watches the battery current (ACS712). A connected servo draws a
+//  burst of current to move; an unplugged one draws nothing. Started by the
+//  RBF tag coming out (mst.servo_check_on_rbf = 1) or by "SERVOCHECK" from
+//  the GUI, only in IDLE. Arming waits until it has finished. Nothing moves
+//  that could release anything: the cover latch is pushed further INTO its
+//  lock, the clamp further toward closed, TVC and fins about their trims.
+//
+//  Per channel: 300 ms baseline, 300 ms at +5 deg, 300 ms back, 400 ms gap.
+//  The current is read every 5 ms tick and averaged over 4 ticks (20 ms):
+//  one ADC count is ~16 mA, so a single sample is too noisy to test against
+//  mst.servo_check_ma, and a servo moving 5 deg draws for 50-150 ms.
+// =====================================================================
+enum { SC_IDLE = 0, SC_BASE, SC_MOVE, SC_BACK, SC_GAP };
+static const uint16_t SC_TICKS_BASE = 60, SC_TICKS_MOVE = 60, SC_TICKS_BACK = 60, SC_TICKS_GAP = 80;
+static uint8_t  s_sc_phase = SC_IDLE;
+static uint8_t  s_sc_ch    = 0;
+static uint16_t s_sc_tick  = 0;
+static float    s_sc_base  = 0.0f, s_sc_peak = 0.0f, s_sc_win[4] = { 0, 0, 0, 0 };
+static uint8_t  s_sc_res[PCA_N_USED];      // 0 untested, 1 connected, 2 NOT detected
+static float    s_sc_ma[PCA_N_USED];       // measured rise, mA
+static bool     s_sc_report = false;       // a result line is due on USB
+static bool     s_sc_ran    = false;       // at least one complete run since boot
+
+static inline bool srvchk_active(void) { return s_sc_phase != SC_IDLE; }
+
+/** Pulse offset for "5 deg" on this channel, signed so nothing is released. */
+static float srvchk_delta_us(uint8_t ch)
+{
+    switch (ch) {
+    case CH_TVC_X: case CH_TVC_Y: return 5.0f * TVC_US_PER_DEG;
+    case CH_CLAMP: {
+        const float d = 5.0f * 10.0f;                       // ~10 us/deg servo
+        return CLAMP_US_CLOSED < CLAMP_US_OPEN ? -d : d;   // toward closed
+    }
+    case CH_COVER: {
+        const float d = 5.0f * 10.0f;
+        return PRM(SRV_COVER_LOCK) < PRM(SRV_COVER_UNLOCK) ? -d : d;   // deeper into the lock
+    }
+    default:       return 5.0f * FIN_US_PER_DEG;           // fins
+    }
+}
+
+static void srvchk_start(void)
+{
+    if (srvchk_active()) return;
+    memset(s_sc_res, 0, sizeof(s_sc_res));
+    memset(s_sc_ma, 0, sizeof(s_sc_ma));
+    servos_park();
+    pca_write_run(0, s_servo_counts, PCA_N_USED);
+    s_sc_ch = 0; s_sc_tick = 0; s_sc_phase = SC_BASE;
+    s_sc_base = 0.0f; s_sc_peak = -1e9f;
+    s_sc_report = true;
+    MASTER_PRINT("# servo check: start\n");
+}
+
+/** One 5 ms tick. */
+static void srvchk_service(void)
+{
+    if (!srvchk_active()) return;
+    if (s_state != ARIADNA_STATE_IDLE) {             // TEST, ARMED, ERROR...: give up
+        s_sc_phase = SC_IDLE;
+        servos_park();
+        pca_write_run(0, s_servo_counts, PCA_N_USED);
+        s_sc_report = true;
+        return;
+    }
+    // 20 ms running mean of the current
+    s_sc_win[s_sc_tick & 3] = s_amps_tick;
+    const float a20 = 0.25f * (s_sc_win[0] + s_sc_win[1] + s_sc_win[2] + s_sc_win[3]);
+    const uint16_t t = ++s_sc_tick;
+    const uint16_t park = s_servo_counts[s_sc_ch];
+
+    switch (s_sc_phase) {
+    case SC_BASE:
+        if (t > 4) s_sc_base += s_amps_tick;              // skip the window warm-up
+        if (t >= SC_TICKS_BASE) {
+            s_sc_base /= (float)(SC_TICKS_BASE - 4);
+            uint16_t c = us_to_counts(counts_to_us(park) + srvchk_delta_us(s_sc_ch));
+            pca_write_run(s_sc_ch, &c, 1);
+            s_sc_phase = SC_MOVE; s_sc_tick = 0;
+        }
+        break;
+    case SC_MOVE:
+    case SC_BACK:
+        if (t > 3 && a20 > s_sc_peak) s_sc_peak = a20;
+        if (t >= (s_sc_phase == SC_MOVE ? SC_TICKS_MOVE : SC_TICKS_BACK)) {
+            if (s_sc_phase == SC_MOVE) {
+                pca_write_run(s_sc_ch, &park, 1);        // and back
+                s_sc_phase = SC_BACK;
+            } else {
+                const float rise_ma = (s_sc_peak - s_sc_base) * 1000.0f;
+                s_sc_ma[s_sc_ch]  = rise_ma;
+                s_sc_res[s_sc_ch] = rise_ma >= PRM(MST_SRV_CHECK_MA) ? 1 : 2;
+                s_sc_report = true;
+                s_sc_phase = SC_GAP;
+            }
+            s_sc_tick = 0;
+        }
+        break;
+    case SC_GAP:
+        if (t >= SC_TICKS_GAP) {
+            if (++s_sc_ch >= PCA_N_USED) {
+                s_sc_phase = SC_IDLE;
+                s_sc_ran = true;
+                s_sc_report = true;
+                MASTER_PRINT("# servo check: done\n");
+            } else {
+                s_sc_phase = SC_BASE;
+                s_sc_base = 0.0f; s_sc_peak = -1e9f;
+            }
+            s_sc_tick = 0;
+        }
+        break;
+    default: break;
+    }
 }
 
 // =====================================================================
@@ -934,8 +1057,9 @@ static void poll_navigation(void)
             if (ariadna_unpack(pl, len, &s_act, sizeof(s_act))) {
                 s_act_us   = micros();
                 s_have_act = true;
-                // In TEST the diagnostic GUI owns the servo outputs.
-                if (!s_test) servos_apply(&s_act);
+                // In TEST the diagnostic GUI owns the servo outputs, and
+                // during the servo connection check that check does.
+                if (!s_test && !srvchk_active()) servos_apply(&s_act);
             }
         } else if (type == ARIADNA_PKT_NAV_STATUS) {
             if (ariadna_unpack(pl, len, &s_nav_status, sizeof(s_nav_status))) {
@@ -969,6 +1093,7 @@ static void read_analogue(void)
     float i_adc = (float)analogRead(PIN_I_SENSE) * (ADC_VREF / ADC_FULL_SCALE);
     float amps  = ((i_adc / ACS712_DIVIDER) - ACS712_ZERO_V) / ACS712_V_PER_A;
 
+    s_amps_tick = amps;
     vbat_f += 0.02f * (vbat - vbat_f);
     curr_f += 0.02f * (amps - curr_f);
     s_vbat    = vbat_f;
@@ -1055,9 +1180,14 @@ static void state_machine(void)
             set_state(s_post_pass ? ARIADNA_STATE_IDLE : ARIADNA_STATE_ERROR);
         break;
 
-    case ARIADNA_STATE_IDLE:
+    case ARIADNA_STATE_IDLE: {
         s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_TEST);
         s_cover_open = false;                   // the latch re-engages on the ground
+        // Servo connection check when the RBF tag comes out (section 3b).
+        static bool rbf_was_out = true;          // no check for a tag already out at boot
+        if (s_rbf_out && !rbf_was_out && PRM(MST_SRV_CHECK_ARM) > 0.5f) srvchk_start();
+        rbf_was_out = s_rbf_out;
+        if (srvchk_active()) break;             // arming waits for the check
         // Arming needs the RBF tag out, a healthy navigation solution, and
         // the vehicle actually sitting still on the pad. Any one missing
         // and it stays safe.
@@ -1075,6 +1205,7 @@ static void state_machine(void)
             set_state(ARIADNA_STATE_ARMED);
         }
         break;
+    }
 
     case ARIADNA_STATE_ARMED:
         s_flags |= ARIADNA_MST_ARMED;
@@ -1435,12 +1566,21 @@ static void flash_wait_idle(uint32_t timeout_ms)
     while (flash_busy() && millis() - t0 < timeout_ms) tight_loop_contents();
 }
 
+/** How many ids an image of this layout holds (0 = unknown layout). */
+static uint16_t pimg_ids(const ParamImage *im)
+{
+    if (im->magic != PARAM_MAGIC) return 0;
+    if (im->layout == ARIADNA_PARAM_LAYOUT) return ARIADNA_PARAM_ID_MAX;
+    // Layout 3 (fw <= 3.24): 164 ids. Kept readable so that going to 200
+    // ids does not throw away a calibrated vehicle's servo trims.
+    if (im->layout == 3) return ARIADNA_PARAM_ID_MAX_V3;
+    return 0;
+}
+
 static bool pimg_valid(const ParamImage *im)
 {
-    if (im->magic != PARAM_MAGIC || im->layout != ARIADNA_PARAM_LAYOUT) return false;
-    ariadna_params_t t;
-    memcpy(t.v, im->v, sizeof(t.v));
-    return ariadna_params_crc(&t) == im->crc;
+    const uint16_t n = pimg_ids(im);
+    return n && ariadna_params_crc_n(im->v, n) == im->crc;
 }
 
 /** Read both copies into `out`, newest valid wins. Flash-bus owner only. */
@@ -1491,9 +1631,10 @@ static void params_apply_image(const ParamImage *im)
     // Through ariadna_param_set(), so a stored value outside today's range
     // is clamped rather than trusted, and an id the image does not know
     // keeps its default.
+    const uint16_t n = pimg_ids(im);
     for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++) {
         uint8_t id = ARIADNA_PARAM_INFO[i].id;
-        (void)ariadna_param_set(&s_params, id, im->v[id]);
+        if (id < n) (void)ariadna_param_set(&s_params, id, im->v[id]);
     }
     s_param_seq = im->seq;
 }
@@ -1824,7 +1965,7 @@ static void usb_service(void)
     if (s_list_idx < ARIADNA_PARAM_COUNT &&
         (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ / 2) {
         const ariadna_param_info_t *q = &ARIADNA_PARAM_INFO[s_list_idx++];
-        MASTER_PRINT("PRM %u %s %.6g %.6g %.6g %.6g %s %c\n", q->id, q->key,
+        MASTER_PRINT("PRM %u %s %.9g %.6g %.6g %.6g %s %c\n", q->id, q->key,
                      s_params.v[q->id], q->def, q->lo, q->hi, q->unit, q->owner);
         if (s_list_idx >= ARIADNA_PARAM_COUNT) {
             usb_printf("OK PARAM LIST %u %u\n", ARIADNA_PARAM_COUNT, s_param_crc);
@@ -2011,7 +2152,7 @@ static void console_param(char *a1, char *a2, char *a3)
             servos_park();
             pca_write_run(0, s_servo_counts, PCA_N_USED);
         }
-        MASTER_PRINT("OK PARAM %u %s %.6g\n", info->id, info->key, s_params.v[info->id]);
+        MASTER_PRINT("OK PARAM %u %s %.9g\n", info->id, info->key, s_params.v[info->id]);
         return;
     }
     if (!strcmp(a1, "SAVE")) {
@@ -2068,6 +2209,12 @@ static void console_line(char *line)
             test_leave();
             usb_printf("OK TEST 0\n");
         }
+        return;
+    }
+    if (!strcmp(cmd, "SERVOCHECK")) {
+        if (s_state != ARIADNA_STATE_IDLE) { usb_printf("ERR SERVOCHECK only in IDLE (leave TEST first)\n"); return; }
+        srvchk_start();
+        usb_printf("OK SERVOCHECK\n");
         return;
     }
     if (!strcmp(cmd, "RAW")) {
@@ -2263,15 +2410,29 @@ static void diag_emit(void)
     int n = 0;
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")
+    if (s_sc_report) {
+        // SRVCHK: the servo connection check. Sent on every change.
+        s_sc_report = false;
+        n = snprintf(b, sizeof(b),
+            "SRVCHK {\"run\":%d,\"done\":%d,\"ch\":%u,\"res\":[%u,%u,%u,%u,%u,%u,%u,%u],"
+            "\"ma\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f],\"thr\":%.0f}\n",
+            srvchk_active() ? 1 : 0, s_sc_ran ? 1 : 0, s_sc_ch,
+            s_sc_res[0], s_sc_res[1], s_sc_res[2], s_sc_res[3], s_sc_res[4], s_sc_res[5],
+            s_sc_res[6], s_sc_res[7], s_sc_ma[0], s_sc_ma[1], s_sc_ma[2], s_sc_ma[3],
+            s_sc_ma[4], s_sc_ma[5], s_sc_ma[6], s_sc_ma[7], PRM(MST_SRV_CHECK_MA));
+        if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
+        n = 0;
+    }
     if (s_raw_new && s_raw_on) {
         // R: raw TriSense data, board axes. Extra to the five rotating lines.
         s_raw_new = false;
         const ariadna_raw_imu_t &r = s_raw;
         n = snprintf(b, sizeof(b),
-            "R {\"t\":%lu,\"acc\":[%.4f,%.4f,%.4f],\"gyr\":[%.3f,%.3f,%.3f],"
+            "R {\"t\":%lu,\"acc\":[%.4f,%.4f,%.4f],\"accr\":[%.5f,%.5f,%.5f],\"gyr\":[%.3f,%.3f,%.3f],"
             "\"mag\":[%.2f,%.2f,%.2f],\"magc\":[%.2f,%.2f,%.2f],\"p\":%.1f,\"temp\":%.2f,"
             "\"src\":%u,\"mf\":%u,\"hz\":%u}\n",
             (unsigned long)r.t_ms, r.acc_g[0], r.acc_g[1], r.acc_g[2],
+            r.acc_raw_g[0], r.acc_raw_g[1], r.acc_raw_g[2],
             r.gyr_dps[0], r.gyr_dps[1], r.gyr_dps[2], r.mag_ut[0], r.mag_ut[1], r.mag_ut[2],
             r.mag_cal_ut[0], r.mag_cal_ut[1], r.mag_cal_ut[2], r.pressure_pa, r.temp_c,
             r.src, r.mag_fresh, r.imu_hz);
@@ -2512,6 +2673,7 @@ void loop()
 
     // ---- housekeeping ---------------------------------------------------
     read_analogue();
+    srvchk_service();     // servo connection check, when one is running (section 3b)
     state_machine();
     params_stream();
     usb_service();        // diagnostic GUI: a no-op unless a host has the port open

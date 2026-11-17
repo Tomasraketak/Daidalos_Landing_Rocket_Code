@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   324   // 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   325   // 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -477,7 +477,8 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 96, "pos_status layout cha
  */
 typedef struct {
     uint32_t t_ms;
-    float    acc_g[3];        // g
+    float    acc_g[3];        // g, calibrated (imu.acc_off_* / imu.acc_scale_* applied)
+    float    acc_raw_g[3];    // g, the same with that calibration undone - for the GUI's 6-position fit
     float    gyr_dps[3];      // deg/s
     float    mag_ut[3];       // uT, as read
     float    mag_cal_ut[3];   // uT, hard/soft iron applied
@@ -487,7 +488,7 @@ typedef struct {
     uint8_t  mag_fresh;       // the magnetometer produced a sample since the last packet
     uint16_t imu_hz;          // attitude epochs per second
 } ariadna_raw_imu_t;
-ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 64, "raw_imu layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 76, "raw_imu layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed

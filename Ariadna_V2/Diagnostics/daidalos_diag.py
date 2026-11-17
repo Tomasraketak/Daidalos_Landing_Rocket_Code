@@ -55,6 +55,7 @@ from daidalos_widgets import (RocketView, TiltBubble, StripChart, PadMap,   # no
                               attitude_summary, pad_quaternion)
 from diag_log import LogTab                            # noqa: E402
 from diag_ignition import IgnitionTab                # noqa: E402
+from diag_calib import CalibTab, parse_srvchk          # noqa: E402
 
 APP_NAME = "Daidalos · Diagnostika"
 
@@ -151,6 +152,19 @@ PARAM_HELP = {
     "pos.uwb_enable": "1 = UWB kotvy se používají.",
     "pos.lidar_delay_ms": "Lidar je na vyklápěcí noze: do fúze se započítá až tolik ms po aktivaci nohou (PYRO3).",
     "pos.lidar_tilt_x_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy X.",
+    "imu.acc_off_x": "Offset akcelerometru (osa X desky), g. Z kalibrace v záložce Kalibrace.",
+    "imu.acc_off_y": "Offset akcelerometru (osa Y desky), g.",
+    "imu.acc_off_z": "Offset akcelerometru (osa Z desky), g.",
+    "imu.acc_scale_x": "Škála akcelerometru (osa X): a = (raw − off) · scale.",
+    "imu.acc_scale_y": "Škála akcelerometru (osa Y).",
+    "imu.acc_scale_z": "Škála akcelerometru (osa Z).",
+    "imu.mag_hi_x": "Hard iron magnetometru X, µT. Z kalibrace v záložce Kalibrace.",
+    "imu.mag_hi_y": "Hard iron magnetometru Y, µT.",
+    "imu.mag_hi_z": "Hard iron magnetometru Z, µT.",
+    "pos.pad_lat_deg": "Zeměpisná šířka rampy (počátek navigace). 0 a 0 = nenastaveno: počátek = poloha při zastrčení. Nastavuje „Rampa = tady“.",
+    "pos.pad_lon_deg": "Zeměpisná délka rampy. Viz pos.pad_lat_deg.",
+    "mst.servo_check_on_rbf": "1 = po vytažení RBF Master zkontroluje připojení všech serv (pohyb 5° a proud), zastrčení počká; 0 = jen tlačítkem.",
+    "mst.servo_check_ma": "Minimální nárůst proudu, při kterém se servo považuje za připojené, mA (1 krok ADC ≈ 16 mA).",
     "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Z (osa rakety je Y).",
     "g.cd_body": "Cd samotného trupu. Křidélka se přičítají z CFD. Za letu se odpor navíc měří.",
     "g.thrust_scale": "Násobek katalogové tahové křivky přistávacího motoru (statický zážeh).",
@@ -215,13 +229,15 @@ class FlightSimBoard(ag.SimBoard):
         self.list_queue: list[str] = []
         self.raw = False
         self.next_raw = 0.0
+        self.srv_t0 = None
+        self.srv_last = -1
 
     def crc(self) -> int:
         import struct
-        v = [0.0] * 164
+        v = [0.0] * 200
         for p in self.params:
             v[p["id"]] = p["val"]
-        return crc16(struct.pack("<164f", *v))
+        return crc16(struct.pack("<200f", *v))
 
     def _cmd(self, line: str) -> None:
         if not line:
@@ -230,7 +246,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 324 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 325 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -265,6 +281,10 @@ class FlightSimBoard(ag.SimBoard):
             return
         if c == "LOG":
             self._log_cmd(p)
+            return
+        if c == "SERVOCHECK":
+            self.srv_t0, self.srv_last = time.monotonic(), -1
+            self.q.put("OK SERVOCHECK")
             return
         if c == "RAW":
             self.raw = len(p) > 1 and p[1] == "1"
@@ -347,6 +367,19 @@ class FlightSimBoard(ag.SimBoard):
         now = time.monotonic()
         if self.list_queue:
             return self.list_queue.pop(0)
+        if self.srv_t0 is not None:
+            k = int((now - self.srv_t0) / 1.1)          # one servo per 1.1 s, as on the Master
+            if k != self.srv_last:
+                self.srv_last = k
+                res = [1 if i < k else 0 for i in range(8)]
+                if k >= 8:
+                    res[6] = 2                           # demo: fin 4 "unplugged"
+                ma = [180 + 17 * i if r == 1 else (8 if r == 2 else 0) for i, r in enumerate(res)]
+                d = {"run": 0 if k >= 8 else 1, "done": 1 if k >= 8 else 0, "ch": min(k, 7),
+                     "res": res, "ma": ma, "thr": 60}
+                if k >= 8:
+                    self.srv_t0 = None
+                return "SRVCHK " + json.dumps(d, separators=(",", ":"))
         if self.raw and now >= self.next_raw:
             self.next_raw = now + 0.04
             return self._raw(now - self.t0)
@@ -367,8 +400,10 @@ class FlightSimBoard(ag.SimBoard):
         n = lambda s_: round(random.gauss(0.0, s_), 4)      # noqa: E731
         # specific force points UP (+1 g along the nose, board -Y), plus the lean
         ax, az_ = math.sin(tilt) * math.cos(az), math.sin(tilt) * math.sin(az)
-        d = {"t": int(t * 1000), "acc": [round(ax + n(0.003), 4), round(-math.cos(tilt) + n(0.003), 4),
-                                         round(az_ + n(0.003), 4)],
+        acc = [round(ax + n(0.003), 4), round(-math.cos(tilt) + n(0.003), 4), round(az_ + n(0.003), 4)]
+        d = {"t": int(t * 1000), "acc": acc,
+             "accr": [round(acc[0] / 0.995 + 0.012, 5), round(acc[1] / 1.004 - 0.008, 5),
+                      round(acc[2] / 0.998 + 0.020, 5)],
              "gyr": [n(0.05), n(0.05), n(0.05)], "mag": [round(21.0 + n(0.3), 2), round(-38.5 + n(0.3), 2),
                                                         round(12.2 + n(0.3), 2)],
              "magc": [round(18.0 + n(0.3), 2), round(-41.0 + n(0.3), 2), round(9.5 + n(0.3), 2)],
@@ -385,7 +420,7 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 324, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 325, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -400,14 +435,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 324, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 325, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 200, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 324, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 325, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -547,6 +582,8 @@ class DiagWindow(ag.MainWindow):
         self.tabs.addTab(self._scroll(self._build_nav_tab()), "Poloha a senzory")
         self.tabs.addTab(self._build_graphs(), "Grafy")
         self.tabs.addTab(self._scroll(self._build_raw_tab()), "Surová data IMU")
+        self.calib_tab = CalibTab(self)
+        self.tabs.addTab(self._scroll(self.calib_tab), "Kalibrace")
         self.tabs.addTab(act_scroll, "Aktuátory a pyro")
         self.tabs.addTab(self._build_params(), "Parametry a časování")
         self.ign_tab = IgnitionTab(self)
@@ -1037,6 +1074,11 @@ class DiagWindow(ag.MainWindow):
         if line.startswith("PRM "):
             self._prm(line)
             return
+        if line.startswith("SRVCHK "):
+            d = parse_srvchk(line)
+            if d is not None:
+                self.calib_tab.on_srvchk(d)
+            return
         if line.startswith(("LOGR ", "LOGF ", "OK LOG", "ERR LOG")):
             if hasattr(self, "log_tab"):
                 self.log_tab.on_line(line)
@@ -1103,6 +1145,8 @@ class DiagWindow(ag.MainWindow):
         return self.link.is_open and time.monotonic() - self.d_time[k] < 1.0
 
     def _feed_charts(self, k: str) -> None:
+        if k == "R" and self.d["R"] and self.pause_btn.isChecked():
+            self.calib_tab.on_raw(self.d["R"])        # calibration never pauses
         if self.pause_btn.isChecked():
             return
         t = time.monotonic() - self.t0
@@ -1123,6 +1167,7 @@ class DiagWindow(ag.MainWindow):
         elif k == "M" and d:
             self.ch_pwr.add(t, [d.get("vbat"), d.get("i")])
         elif k == "R" and d:
+            self.calib_tab.on_raw(d)
             self.ch_raw_acc.add(t, d.get("acc", [0, 0, 0]))
             self.ch_raw_gyr.add(t, d.get("gyr", [0, 0, 0]))
             self.ch_raw_mag.add(t, d.get("magc", [0, 0, 0]))
@@ -1142,6 +1187,7 @@ class DiagWindow(ag.MainWindow):
         P = self.d["P"] if self._fresh_d("P") else {}
         G = self.d["G"] if self._fresh_d("G") else {}
         problems: list[tuple[str, str]] = []
+        self.calib_tab.on_status(P)
 
         # ---- top bar
         if not self.link.is_open:

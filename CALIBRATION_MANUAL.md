@@ -53,8 +53,8 @@ každým letem, **Z** = zkontrolovat po letu.
 | hodnota | druh | kde | čím se měří | kap. | kdy |
 |---|---|---|---|---|---|
 | bias gyra | — | automaticky při startu, tlačítko *Kalibrace gyra* | raketa v klidu 2 s | 3.1 | L |
-| offset a měřítko akcelerometru `ACC_OFFSET`, `ACC_SCALE` | K | `Position_MCU.ino` §2 | příklad *IMUcalibration* (6 poloh) | 3.2 | 1× |
-| magnetometr `MAG_HARD_IRON`, `MAG_SOFT_IRON` | K | `Position_MCU.ino` §2 | příklad *MotionCal* + PJRC MotionCal | 3.3 | R |
+| offset a měřítko akcelerometru `imu.acc_off_*`, `imu.acc_scale_*` | P | Position | diagnostika → Kalibrace (6+ poloh) | 3.2 | 1× |
+| magnetometr `imu.mag_hi_*`, `imu.mag_si_*` | P | Position | diagnostika → Kalibrace (otáčení) | 3.3 | R |
 | deklinace `MAG_DECLINATION_DEG` | K | `Position_MCU.ino` §2 | NOAA kalkulačka pro místo startu | 3.4 | podle místa |
 | zpoždění GPS `pos.gps_latency_ms` | P | Position | datasheet modulu / měření | 3.5 | 1× |
 | montáž TriSense, osa serva 1 | K | `BODY_SERVO1_AXIS` (Navigation) | kontrola, ne měření | 3.6 | R |
@@ -135,21 +135,20 @@ hýbat — ani větrem. Kontrola: v záložce *Poloha a senzory* úhlové rychlo
 Akcelerometr má offset a chybu měřítka. Filtr si bias akcelerometru odhaduje sám, ale
 měřítko ne, a na rampě se z akcelerometru počítá počáteční náklon.
 
-1. Nahrajte na Position MCU příklad `Voltino_TriSense_Library/examples/IMUcalibration`.
-2. Sériový monitor 115200, pošlete `a`.
-3. Desku položte postupně šesti stranami nahoru (Z+, Z−, Y+, Y−, X+, X−), pokaždé na rovnou
-   podložku, v klidu, a pošlete `y`. Nejlépe přiložit k hraně vodováhy nebo krabičky.
-4. Program vypíše
-   ```
-   IMU.setAccelOffset(bx, by, bz);
-   IMU.setAccelScale(sx, sy, sz);
-   ```
-5. Hodnoty zapište do `Position_MCU.ino` (sekce 2):
-   ```cpp
-   static const float ACC_OFFSET[3] = { bx, by, bz };
-   static const float ACC_SCALE[3]  = { sx, sy, sz };
-   ```
-6. Nahrajte zpět letový firmware.
+Od fw 3.25 **v diagnostice, záložka Kalibrace** — nic se nepřepisuje do kódu:
+
+1. Deskou/raketou položte v klidu v nějaké poloze a stiskněte **Zachytit polohu** (2 s
+   průměr surových dat; při pohybu se zachycení odmítne).
+2. Opakujte pro další polohy. Stačí **6 libovolných, rozmanitých** poloh; nejlepší je 6 stran
+   (každá osa jednou nahoru a jednou dolů) a 7. a další poloha fit ověří (se 6 polohami vyjde
+   zbytková chyba vždy 0). Skoro stejné polohy (< 20°) GUI odmítne.
+3. GUI průběžně ukazuje offset, škálu a zbytkovou chybu |a| − 1 (má být < 3 mg).
+4. **Použít a uložit do flash** → parametry `imu.acc_off_x/y/z`, `imu.acc_scale_x/y/z`
+   (`a = (raw − off) · scale`, osy desky) se zapíšou do flash Masteru a Position MCU je
+   použije okamžitě.
+
+(Starý postup s příkladem `IMUcalibration` z knihovny Voltino_TriSense dává stejná čísla;
+zapisují se do stejných parametrů.)
 
 **Kontrola:** raketa svisle na rampě → v diagnostice |a| = 1,000 ± 0,005 g, náklon
 odpovídá vodováze ± 0,3°. Typické hodnoty: offset do ±0,05 g, měřítko 0,98–1,02.
@@ -160,19 +159,15 @@ Magnetometr určuje směr k severu na rampě (azimut), dokud GPS nedá rychlost.
 v raketě (baterie, serva, motor!) ho zkreslují, proto se kalibruje **v sestavené raketě**,
 s baterií na místě a vypnutými servy.
 
-1. Nahrajte příklad `examples/MotionCal` (Voltino_TriSense).
-2. Spusťte PJRC **MotionCal**, vyberte port.
-3. Otáčejte celou raketou (nebo co nejkompletnější sestavou) všemi směry, dokud koule bodů
-   nepokryje celý povrch a „Gaps“ neklesne pod 1 % a „Fit error“ pod ~3 %.
-4. Opište **Magnetic Offset** (µT, 3 čísla) a **Magnetic Mapping** (matice 3×3).
-5. Zapište do `Position_MCU.ino`:
-   ```cpp
-   static float MAG_HARD_IRON[3]    = { ox, oy, oz };
-   static float MAG_SOFT_IRON[3][3] = { { m11, m12, m13 },
-                                        { m21, m22, m23 },
-                                        { m31, m32, m33 } };
-   ```
-   Firmware je předá INSLIB (`ins.setMagCalibration`) i záložní fúzi.
+Od fw 3.25 **v diagnostice, záložka Kalibrace → Magnetometr**:
+
+1. **Start sběru** (samo zapne surová data).
+2. Otáčejte celou raketou pomalu všemi směry (osmičky, převracení přes všechny strany),
+   asi minutu, až **pokrytí směrů ≥ 85 %**.
+3. **Stop a spočítat**: GUI proloží obecný elipsoid surovými vzorky a ukáže hard iron (µT),
+   matici soft iron, sílu pole (u nás ~48 µT) a rozptyl |B| před/po (po má být < 2–3 %).
+4. **Použít a uložit do flash** → `imu.mag_hi_x/y/z` a `imu.mag_si_00…22`
+   (`m = SI · (raw − HI)`, konvence MotionCal, kterou používá INSLIB).
 
 **Kontrola:** raketa na rampě, otočit o 90° → azimut v diagnostice se změní o 90 ± 5°.
 Kalibraci opakujte po přesunu baterie, serv nebo kabeláže.

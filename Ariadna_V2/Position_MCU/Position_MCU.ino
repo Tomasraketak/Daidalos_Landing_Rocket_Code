@@ -268,14 +268,16 @@ TriSense          sensor;
 AdvancedTriFusion fusion(&sensor.imu, &sensor.mag);
 
 // ---- per-board sensor calibration (CALIBRATION_MANUAL.md, chapter 3) ----
-// Measured once per TriSense board with the library's own tools and pasted
-// here; identity values = uncalibrated. All in the SENSOR's own axes.
-//   accelerometer: examples/IMUcalibration, key 'a' (6-point sphere fit)
-//                  accel_out = (raw - ACC_OFFSET) * ACC_SCALE   [g]
-//   magnetometer:  examples/MotionCal + PJRC MotionCal         [uT]
-// The gyro needs no constant: it is calibrated at every boot (vehicle still).
-static const float ACC_OFFSET[3]       = { 0.0f, 0.0f, 0.0f };
-static const float ACC_SCALE[3]        = { 1.0f, 1.0f, 1.0f };
+// Since fw 3.25 these are PARAMETERS (imu.acc_*, imu.mag_*), measured in
+// the diagnostic GUI's "Kalibrace" tab, saved in the Master's flash and
+// applied by imu_cal_apply() whenever they change. The arrays below are
+// what is in force; identity = uncalibrated. All in the SENSOR's own axes.
+//   accelerometer: accel_out = (raw - ACC_OFFSET) * ACC_SCALE   [g]
+//   magnetometer:  mag_out   = MAG_SOFT_IRON * (raw - MAG_HARD_IRON) [uT]
+// The gyro needs no constant: it is calibrated at every boot (vehicle still)
+// and again by the GUI's "Kalibrace gyra" button.
+static float       ACC_OFFSET[3]       = { 0.0f, 0.0f, 0.0f };
+static float       ACC_SCALE[3]        = { 1.0f, 1.0f, 1.0f };
 static float       MAG_HARD_IRON[3]    = { 0.0f, 0.0f, 0.0f };
 static float       MAG_SOFT_IRON[3][3] = { { 1.0f, 0.0f, 0.0f },
                                            { 0.0f, 1.0f, 0.0f },
@@ -1392,12 +1394,26 @@ public:
         _have_pad_ref = true;
         reset_states();
 
-        if (fix && fix->valid && fix->fix >= 3 && fix->sats >= GPS_MIN_SATS)
+        if (!_origin_fixed && fix && fix->valid && fix->fix >= 3 && fix->sats >= GPS_MIN_SATS)
             set_origin(fix->lat_1e7, fix->lon_1e7);
     }
 
     bool  have_pad_reference(void) const { return _have_pad_ref; }
     bool  have_origin(void)       const { return _have_origin; }
+
+    /**
+     * The pad's surveyed position (pos.pad_lat_deg / _lon_deg, set from the
+     * GUI with "Rampa = tady"). While set it IS the origin - the GPS fix at
+     * arming no longer moves it, so the landing target and the UWB anchor
+     * survey stay where the pad is. `set` false hands the origin back to the
+     * old rule (fix at arming / first good fix).
+     */
+    void set_fixed_origin(bool set, int32_t lat_1e7, int32_t lon_1e7)
+    {
+        _origin_fixed = set;
+        if (set) set_origin(lat_1e7, lon_1e7);
+    }
+    bool origin_fixed(void) const { return _origin_fixed; }
     float pad_pressure(void)      const { return _pad_pressure; }
 
     /**
@@ -2078,6 +2094,7 @@ private:
     bool     _have_pad_ref = false;
 
     bool     _have_origin  = false;
+    bool     _origin_fixed = false;
     int32_t  _origin_lat   = 0;
     int32_t  _origin_lon   = 0;
     float    _m_per_rad_lat = 6367000.0f;
@@ -2349,6 +2366,28 @@ static void attitude_begin(void)
 #endif
 }
 
+/**
+ * Put the calibration parameters into force. Core 0 only. The ICM driver
+ * and INSLIB just store the numbers, so this costs no bus traffic and is
+ * safe between two filter epochs.
+ */
+static void imu_cal_apply(void)
+{
+    ACC_OFFSET[0] = PRM(IMU_ACC_OFF_X); ACC_OFFSET[1] = PRM(IMU_ACC_OFF_Y); ACC_OFFSET[2] = PRM(IMU_ACC_OFF_Z);
+    ACC_SCALE[0]  = PRM(IMU_ACC_SCL_X); ACC_SCALE[1]  = PRM(IMU_ACC_SCL_Y); ACC_SCALE[2]  = PRM(IMU_ACC_SCL_Z);
+    MAG_HARD_IRON[0] = PRM(IMU_MAG_HI_X); MAG_HARD_IRON[1] = PRM(IMU_MAG_HI_Y); MAG_HARD_IRON[2] = PRM(IMU_MAG_HI_Z);
+    for (uint8_t r = 0; r < 3; r++)
+        for (uint8_t c = 0; c < 3; c++)
+            MAG_SOFT_IRON[r][c] = s_params.v[ARIADNA_P_IMU_MAG_SI_00 + 3 * r + c];
+    sensor.imu.setAccelOffset(ACC_OFFSET[0], ACC_OFFSET[1], ACC_OFFSET[2]);
+    sensor.imu.setAccelScale(ACC_SCALE[0], ACC_SCALE[1], ACC_SCALE[2]);
+#if ARIADNA_USE_INSLIB
+    ins.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
+#else
+    fusion.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
+#endif
+}
+
 static void attitude_recalibrate(void)
 {
 #if ARIADNA_USE_INSLIB
@@ -2465,12 +2504,18 @@ static void handle_command(const ariadna_cmd_t *c)
 }
 
 /** One parameter from the Master. Ground only; never under a flight. */
+static volatile bool s_cal_dirty = false;    // an imu.* / pos.pad_* parameter changed
+
 static void param_receive(const ariadna_param_pkt_t *p)
 {
     if (s_have_master && s_master.state >= ARIADNA_STATE_ASCENT &&
         s_master.state <= ARIADNA_STATE_LANDED) return;
     if (p->count != ARIADNA_PARAM_COUNT || p->id >= ARIADNA_PARAM_ID_MAX) return;
+    const float before = s_params.v[p->id];
     if (!ariadna_param_set(&s_params, p->id, p->value)) return;
+    if (s_params.v[p->id] != before && p->id >= ARIADNA_P_IMU_ACC_OFF_X &&
+        p->id <= ARIADNA_P_POS_PAD_LON)
+        s_cal_dirty = true;       // applied by core 0, which owns the sensors
     const uint8_t bit = (uint8_t)(1u << (p->id & 7));
     if (!(s_param_seen[p->id >> 3] & bit)) {
         s_param_seen[p->id >> 3] |= bit;
@@ -3246,6 +3291,14 @@ void loop()
         POS_PRINT("# pad reference %.1f Pa, origin %s\n",
                   p, s_est.have_origin() ? "set" : "pending GPS");
     }
+    if (s_cal_dirty) {
+        s_cal_dirty = false;
+        imu_cal_apply();
+        const float plat = PRM(POS_PAD_LAT), plon = PRM(POS_PAD_LON);
+        const bool  pset = plat != 0.0f || plon != 0.0f;
+        s_est.set_fixed_origin(pset, (int32_t)llround((double)plat * 1e7), (int32_t)llround((double)plon * 1e7));
+        POS_PRINT("# calibration parameters applied; pad %s\n", pset ? "fixed from parameters" : "from the GPS fix at arming");
+    }
     if (s_req_cal_gyro) {
         s_req_cal_gyro = false;
         attitude_recalibrate();
@@ -3708,6 +3761,8 @@ void loop()
             r.gyr_dps[0] = (float)fusion.lastGx; r.gyr_dps[1] = (float)fusion.lastGy; r.gyr_dps[2] = (float)fusion.lastGz;
             r.src = 0;
 #endif
+            for (uint8_t i = 0; i < 3; i++)       // a = (raw - off) * scale, inverted
+                r.acc_raw_g[i] = r.acc_g[i] / (ACC_SCALE[i] != 0.0f ? ACC_SCALE[i] : 1.0f) + ACC_OFFSET[i];
             r.mag_ut[0] = sensor.mag.x; r.mag_ut[1] = sensor.mag.y; r.mag_ut[2] = sensor.mag.z;
             r.mag_fresh = (r.mag_ut[0] != mag_last[0] || r.mag_ut[1] != mag_last[1] ||
                            r.mag_ut[2] != mag_last[2]) ? 1 : 0;

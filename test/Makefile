@@ -13,6 +13,7 @@
 #   make bench    Ariadna V2 bench-test link (ping / pong / routing)
 #   make bench-sync  verify the bench sketches' copies of bench_common.h
 #   make actcon   Actuator Console pyro bridge: arming / firing safety rules
+#   make calib    calibration fits of the diagnostic console (accel, magnetometer)
 #   make check    all of the above
 #
 # -Wdouble-promotion is not cosmetic here: the RP2350 has a single-precision
@@ -228,6 +229,10 @@ syntax: $(INO) stub/Arduino.h
 # An example, but one that can fire an igniter, so its arming, heartbeat
 # and pulse rules are tested here like flight code.
 # ---------------------------------------------------------------------
+# Calibration fits of the diagnostic console (numpy; skipped without it).
+calib:
+	python3 -I check_calib.py
+
 actcon: actcon_test
 	./actcon_test
 
@@ -262,7 +267,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink link sync pyfmt syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink link sync pyfmt calib syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py

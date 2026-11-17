@@ -42,7 +42,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   3     // stored with the flash image (3: gains re-fitted on LandSim 2nd audit)
+#define ARIADNA_PARAM_LAYOUT   4     // stored with the flash image (4: 200 ids - calibration, pad, servo check)
+// Layout 3 images (164 ids) are still read: the ids they hold keep their
+// stored values, the new ones start at their defaults. See the Master.
+#define ARIADNA_PARAM_ID_MAX_V3 164
 
 // X(id, NAME, key, default, min, max, unit, owner)
 //   owner: 'N' Navigation MCU, 'M' Master, 'P' Position MCU
@@ -142,14 +145,42 @@
     /* ---- guidance: fin drag (LandSim band.json fin_cd_* minus g.cd_body) ---- */ \
     X(89, G_FIN_DCD_ZERO,   "g.fin_dcd_zero",     0.14306195f, 0.0f, 1.5f, "-",   'N') \
     X(90, G_FIN_DCD_BRAKE,  "g.fin_dcd_brake",    0.44720534f, 0.0f, 3.0f, "-",   'N') \
-    ARIADNA_PARAM_LIST_TBL(X)
+    ARIADNA_PARAM_LIST_TBL(X) \
+    /* ---- TriSense calibration (Position MCU), from the GUI's calibration tab ---- */ \
+    /* accelerometer: a = (raw - off) * scale, in g, board axes                     */ \
+    X(164, IMU_ACC_OFF_X,   "imu.acc_off_x",      0.0f, -0.5f,   0.5f, "g",   'P') \
+    X(165, IMU_ACC_OFF_Y,   "imu.acc_off_y",      0.0f, -0.5f,   0.5f, "g",   'P') \
+    X(166, IMU_ACC_OFF_Z,   "imu.acc_off_z",      0.0f, -0.5f,   0.5f, "g",   'P') \
+    X(167, IMU_ACC_SCL_X,   "imu.acc_scale_x",    1.0f,  0.8f,   1.2f, "-",   'P') \
+    X(168, IMU_ACC_SCL_Y,   "imu.acc_scale_y",    1.0f,  0.8f,   1.2f, "-",   'P') \
+    X(169, IMU_ACC_SCL_Z,   "imu.acc_scale_z",    1.0f,  0.8f,   1.2f, "-",   'P') \
+    /* magnetometer: m = SI * (raw - HI), uT, board axes (MotionCal convention)     */ \
+    X(170, IMU_MAG_HI_X,    "imu.mag_hi_x",       0.0f, -500.0f, 500.0f, "uT", 'P') \
+    X(171, IMU_MAG_HI_Y,    "imu.mag_hi_y",       0.0f, -500.0f, 500.0f, "uT", 'P') \
+    X(172, IMU_MAG_HI_Z,    "imu.mag_hi_z",       0.0f, -500.0f, 500.0f, "uT", 'P') \
+    X(173, IMU_MAG_SI_00,   "imu.mag_si_00",      1.0f, -3.0f,   3.0f, "-",   'P') \
+    X(174, IMU_MAG_SI_01,   "imu.mag_si_01",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(175, IMU_MAG_SI_02,   "imu.mag_si_02",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(176, IMU_MAG_SI_10,   "imu.mag_si_10",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(177, IMU_MAG_SI_11,   "imu.mag_si_11",      1.0f, -3.0f,   3.0f, "-",   'P') \
+    X(178, IMU_MAG_SI_12,   "imu.mag_si_12",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(179, IMU_MAG_SI_20,   "imu.mag_si_20",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(180, IMU_MAG_SI_21,   "imu.mag_si_21",      0.0f, -3.0f,   3.0f, "-",   'P') \
+    X(181, IMU_MAG_SI_22,   "imu.mag_si_22",      1.0f, -3.0f,   3.0f, "-",   'P') \
+    /* ---- the pad (Position MCU). 0 / 0 = not set: the origin is the GPS fix  */ \
+    /*      at arming, as before. Set from the GUI ("Rampa = tady").            */ \
+    X(182, POS_PAD_LAT,     "pos.pad_lat_deg",    0.0f, -90.0f,  90.0f, "deg", 'P') \
+    X(183, POS_PAD_LON,     "pos.pad_lon_deg",    0.0f, -180.0f, 180.0f, "deg", 'P') \
+    /* ---- servo connection check (Master) ---- */ \
+    X(184, MST_SRV_CHECK_ARM, "mst.servo_check_on_rbf", 1.0f, 0.0f, 1.0f, "0/1", 'M') \
+    X(185, MST_SRV_CHECK_MA,  "mst.servo_check_ma",    60.0f, 10.0f, 1000.0f, "mA", 'M')
 
 // ---- ids --------------------------------------------------------------
 enum {
 #define X(id, NAME, key, def, lo, hi, unit, owner) ARIADNA_P_##NAME = id,
     ARIADNA_PARAM_LIST(X)
 #undef X
-    ARIADNA_PARAM_ID_MAX = 164         // ids are 0 .. ARIADNA_PARAM_ID_MAX-1
+    ARIADNA_PARAM_ID_MAX = 200         // ids are 0 .. ARIADNA_PARAM_ID_MAX-1
 };
 
 typedef struct {
@@ -201,6 +232,19 @@ static inline int ariadna_param_set(ariadna_params_t *p, uint8_t id, float value
     if (value > info->hi) value = info->hi;
     p->v[id] = value;
     return 1;
+}
+
+/** CRC-16/CCITT-FALSE over the first n_ids values (a stored image's own size). */
+static inline uint16_t ariadna_params_crc_n(const float *v, size_t n_ids)
+{
+    const uint8_t *b = (const uint8_t *)v;
+    uint16_t crc = 0xFFFF;
+    for (size_t n = 0; n < n_ids * sizeof(float); n++) {
+        crc ^= (uint16_t)b[n] << 8;
+        for (uint8_t i = 0; i < 8; i++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
 }
 
 /** CRC-16/CCITT-FALSE over the table bytes: what the boards compare. */
