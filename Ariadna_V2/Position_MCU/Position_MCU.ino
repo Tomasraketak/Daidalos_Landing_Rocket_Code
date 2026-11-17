@@ -2346,7 +2346,10 @@ static void attitude_begin(void)
     s_att.q[0] = 1.0f;
 #if ARIADNA_USE_INSLIB
     TriSenseINSConfig cfg;
-    cfg.navRateHz     = 200;
+    // One epoch per nav_state: 240 Hz, the rate the estimator publishes at.
+    // update() is called on every pass of loop() (see there), so the epoch
+    // clock is met within a loop pass instead of aliasing against the tick.
+    cfg.navRateHz     = (uint16_t)ESTIMATOR_HZ;
     cfg.gnssLatencyMs = 50;            // refined per fix from pos.gps_latency_ms
     cfg.autoZupt      = true;          // switched off at launch, see the loop
     ins.setMounting(TriSenseINSMount::ComponentsUp);
@@ -2410,7 +2413,10 @@ static void attitude_update(bool in_flight)
     static bool was_in_flight = false;
 #if ARIADNA_USE_INSLIB
     if (in_flight != was_in_flight) ins.setAutoZupt(!in_flight);
+    was_in_flight = in_flight;
     s_att.fresh = ins.update();
+    // Called on every pass of loop(): only an epoch has anything new to read.
+    if (!s_att.fresh) return;
 
     float Rn[3][3];
     if (ins.getRotationMatrix(Rn)) {
@@ -2441,6 +2447,8 @@ static void attitude_update(bool in_flight)
         else                                         fusion.setMaxGains(0.1f, 0.05f);
     }
     s_att.fresh = fusion.update();
+    was_in_flight = in_flight;
+    if (!s_att.fresh) return;
     fusion.getOrientationDegrees(s_att.roll, s_att.pitch, s_att.heading);
     build_rotation(s_att.roll, s_att.pitch, s_att.heading, s_att.R);
     build_quaternion(s_att.roll, s_att.pitch, s_att.heading, s_att.q);
@@ -3263,6 +3271,23 @@ void loop()
     // MATTERS: the return below is what makes this the idle path, so
     // anything placed after it runs at 240 Hz instead.
     ariadna_rgb_service(&s_rgb);
+
+    // ---- attitude, on EVERY pass (fw 3.26) ------------------------------
+    // INSLIB runs an epoch when its own clock says one is due, and has to be
+    // asked often to notice. Asked only once per 240 Hz tick (4.17 ms) with
+    // a 200 Hz epoch clock (5 ms), every other ask was too early and the
+    // filter ran at 120 Hz. Here it is asked on every pass, which is also
+    // the only place the IMU FIFO is drained. `in_flight` comes from the
+    // Master: between leaving the pad and standing on the ground again the
+    // attitude source may neither level itself on the accelerometer nor
+    // assume the vehicle is still.
+    {
+        const bool in_flight_now = s_have_master &&
+                                   s_master.state >= ARIADNA_STATE_ASCENT &&
+                                   s_master.state <= ARIADNA_STATE_GUIDANCE;
+        attitude_update(in_flight_now);
+        if (s_att.fresh) s_sensor_ok |= ARIADNA_SENS_IMU;
+    }
     // The DMA ring is serviced on every pass, not once per tick. Serviced
     // only per tick, a nav_state queued behind the 20 Hz status frame
     // waited for the NEXT tick to start, and every later one inherited
@@ -3305,16 +3330,10 @@ void loop()
         s_cal_state = 2;
     }
 
-    // ---- attitude -------------------------------------------------------
-    // The only place the IMU FIFO is drained. `in_flight` comes from the
-    // Master: between leaving the pad and standing on the ground again the
-    // attitude source may neither level itself on the accelerometer nor
-    // assume the vehicle is still.
+    // ---- attitude: updated in the idle path above, read here ---------------
     const bool in_flight = s_have_master &&
                            s_master.state >= ARIADNA_STATE_ASCENT &&
                            s_master.state <= ARIADNA_STATE_GUIDANCE;
-    attitude_update(in_flight);
-    if (s_att.fresh) s_sensor_ok |= ARIADNA_SENS_IMU;
 #if ARIADNA_USE_INSLIB
     s_sensor_ok |= ARIADNA_SENS_INS;
 #endif

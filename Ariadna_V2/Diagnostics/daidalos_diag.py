@@ -246,7 +246,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 325 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 326 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -407,7 +407,7 @@ class FlightSimBoard(ag.SimBoard):
              "gyr": [n(0.05), n(0.05), n(0.05)], "mag": [round(21.0 + n(0.3), 2), round(-38.5 + n(0.3), 2),
                                                         round(12.2 + n(0.3), 2)],
              "magc": [round(18.0 + n(0.3), 2), round(-41.0 + n(0.3), 2), round(9.5 + n(0.3), 2)],
-             "p": round(97234.0 + n(2.0), 1), "temp": 24.6, "src": 1, "mf": 1, "hz": 200}
+             "p": round(97234.0 + n(2.0), 1), "temp": 24.6, "src": 1, "mf": 1, "hz": 238}
         return "R " + json.dumps(d, separators=(",", ":"))
 
     def _diag(self, which: int, t: float) -> str:
@@ -420,7 +420,7 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 325, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 326, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -435,14 +435,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 325, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 326, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
-                 "hz": 200, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
+                 "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 325, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 326, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -1272,7 +1272,7 @@ class DiagWindow(ag.MainWindow):
             kv.set("Senzory", " ".join(n for b, n in SENS_BITS if P.get("sens", 0) & (1 << b)) or "—")
             kv.set("Orientace", "INSLIB " + INS_MODES.get(P.get("ins", 255), "?") if P.get("att") else
                    "TriSense fúze")
-            kv.set("Fúze Hz", fmt(P.get("hz"), 0, "Hz"), GOOD if P.get("hz", 0) > 150 else WARN)
+            kv.set("Fúze Hz", fmt(P.get("hz"), 0, "Hz"), GOOD if P.get("hz", 0) > 200 else WARN)
             kv.set("IMU přetečení", str(P.get("ovf", 0)), WARN if P.get("ovf") else GOOD)
             kv.set("Kalibrace", {0: "nekalibrováno", 1: "gyro", 2: "gyro + znovu", 3: "plná"}.get(P.get("cal", 0), "?"))
             rx = P.get("rx", [0, 0])
