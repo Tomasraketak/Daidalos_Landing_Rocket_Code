@@ -49,8 +49,9 @@ from PyQt6 import QtCore, QtWidgets
 
 from actuator_gui import button, label, Card
 
-SERVO_NAMES = ["TVC X", "TVC Y", "Klapka (škrcení)", "Křidélko 1", "Křidélko 2",
-               "Křidélko 3", "Křidélko 4", "Aerokryt (zámek)"]
+# Order of the Master's SRVCHK res[] / ma[]: channel order 5..12 (fw 3.28).
+SERVO_NAMES = ["TVC X (k. 5)", "TVC Y (k. 6)", "Klapka (k. 7)", "Aerokryt (k. 8)",
+               "Křidélko 1 (k. 9)", "Křidélko 2 (k. 10)", "Křidélko 3 (k. 11)", "Křidélko 4 (k. 12)"]
 
 
 # ============================================================================

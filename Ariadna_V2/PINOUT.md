@@ -69,15 +69,23 @@ the pinout in every sense that matters on a launch day.
 
 | channel | actuator | constant |
 |---|---|---|
-| 0 | TVC servo, body axis 1 | `CH_TVC_X` |
-| 1 | TVC servo, body axis 2 | `CH_TVC_Y` |
-| 2 | thrust clamp | `CH_CLAMP` |
-| 3 | fin 1 — on body axis 1 (the TVC X side) | `CH_FIN_0` |
-| 4 | fin 2 — 90° on, body −Y | `CH_FIN_1` |
-| 5 | fin 3 — opposite fin 1 | `CH_FIN_2` |
-| 6 | fin 4 — opposite fin 2 | `CH_FIN_3` |
-| 7 | **aerocover latch** — unlatched 0.6 s before the ignition command | `CH_COVER` |
-| 8–15 | unused in flight — "servos 9–16" counted from 1; driven only from the GUI's *Volné výstupy* card (TEST mode on the flight firmware) | — |
+| 0–4 | unused in flight; driven only from the GUI's *Volné výstupy* card (TEST mode on the flight firmware) | — |
+| 5 | TVC servo, body axis 1 | `CH_TVC_X` |
+| 6 | TVC servo, body axis 2 | `CH_TVC_Y` |
+| 7 | thrust clamp | `CH_CLAMP` |
+| 8 | **aerocover latch** — unlatched 0.6 s before the ignition command | `CH_COVER` |
+| 9 | fin 1 — on body axis 1 (the TVC X side) | `CH_FIN_0` |
+| 10 | fin 2 — 90° on, body −Y | `CH_FIN_1` |
+| 11 | fin 3 — opposite fin 1 | `CH_FIN_2` |
+| 12 | fin 4 — opposite fin 2 | `CH_FIN_3` |
+| 13–15 | unused in flight, as 0–4 | — |
+
+This is the DEFAULT map (fw 3.28; until 3.27 it was 0–7). The channel of every flight servo
+is a parameter (`srv.ch_*`, ids 200–207), as are its hard pulse limits (`srv.*_min_us` /
+`*_max_us`, ids 208–223), set from the diagnostic console's servo table ("Zapsat do rakety")
+and kept in the Master's flash. Eight different channels 0–15, or the Master keeps the default
+map and reports a servo-bus fault. The 200 Hz actuator path writes the span from the lowest to
+the highest servo channel in one auto-increment I²C transaction: keep them next to each other.
 
 Servo calibration (trims, µs per degree, signs, clamp and cover end points) is NOT in
 the sketch any more: it is the `srv.*` group of the parameter table

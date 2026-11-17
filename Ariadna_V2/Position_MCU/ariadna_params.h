@@ -42,7 +42,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   4     // stored with the flash image (4: 200 ids - calibration, pad, servo check)
+#define ARIADNA_PARAM_LAYOUT   5     // stored with the flash image (5: 232 ids - servo map and limits; 4: 200 ids)
+// Layout 4 images (fw 3.25-3.27, 200 ids) are still read: ids >= 200 keep their defaults.
+#define ARIADNA_PARAM_ID_MAX_V4 200
 // Ids 186..188 (gyro offset, fw 3.27) were added INSIDE layout 4: an image saved
 // by fw 3.25/3.26 holds 0 there, which is exactly their default.
 // Layout 3 images (164 ids) are still read: the ids they hold keep their
@@ -182,14 +184,44 @@
     /*      boot result is far from them (the vehicle moved while it booted).    */ \
     X(186, IMU_GYR_OFF_X,   "imu.gyr_off_x",      0.0f, -10.0f,  10.0f, "deg/s", 'P') \
     X(187, IMU_GYR_OFF_Y,   "imu.gyr_off_y",      0.0f, -10.0f,  10.0f, "deg/s", 'P') \
-    X(188, IMU_GYR_OFF_Z,   "imu.gyr_off_z",      0.0f, -10.0f,  10.0f, "deg/s", 'P')
+    X(188, IMU_GYR_OFF_Z,   "imu.gyr_off_z",      0.0f, -10.0f,  10.0f, "deg/s", 'P') \
+    /* ---- servo wiring and travel limits (Master, fw 3.28, layout 5) ------ */ \
+    /*      PCA9685 channel of each flight servo. Must be eight DIFFERENT    */ \
+    /*      channels 0..15, else the Master keeps the default map and flags  */ \
+    /*      the servo bus (no arming).                                       */ \
+    X(200, SRV_CH_TVC_X,    "srv.ch_tvc_x",        5.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(201, SRV_CH_TVC_Y,    "srv.ch_tvc_y",        6.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(202, SRV_CH_CLAMP,    "srv.ch_clamp",        7.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(203, SRV_CH_COVER,    "srv.ch_cover",        8.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(204, SRV_CH_FIN1,     "srv.ch_fin1",         9.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(205, SRV_CH_FIN2,     "srv.ch_fin2",        10.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(206, SRV_CH_FIN3,     "srv.ch_fin3",        11.0f, 0.0f, 15.0f, "ch", 'M') \
+    X(207, SRV_CH_FIN4,     "srv.ch_fin4",        12.0f, 0.0f, 15.0f, "ch", 'M') \
+    /*      Hard pulse limits per servo: no command, trim or end point ever  */ \
+    /*      leaves [min, max]. min >= max = limit ignored (absolute guard).  */ \
+    X(208, SRV_TVC_X_MIN,   "srv.tvc_x_min_us",   900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(209, SRV_TVC_X_MAX,   "srv.tvc_x_max_us",  2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(210, SRV_TVC_Y_MIN,   "srv.tvc_y_min_us",   900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(211, SRV_TVC_Y_MAX,   "srv.tvc_y_max_us",  2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(212, SRV_CLAMP_MIN,   "srv.clamp_min_us",   900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(213, SRV_CLAMP_MAX,   "srv.clamp_max_us",  2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(214, SRV_COVER_MIN,   "srv.cover_min_us",   900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(215, SRV_COVER_MAX,   "srv.cover_max_us",  2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(216, SRV_FIN1_MIN,    "srv.fin1_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(217, SRV_FIN1_MAX,    "srv.fin1_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(218, SRV_FIN2_MIN,    "srv.fin2_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(219, SRV_FIN2_MAX,    "srv.fin2_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(220, SRV_FIN3_MIN,    "srv.fin3_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(221, SRV_FIN3_MAX,    "srv.fin3_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(222, SRV_FIN4_MIN,    "srv.fin4_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
+    X(223, SRV_FIN4_MAX,    "srv.fin4_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M')
 
 // ---- ids --------------------------------------------------------------
 enum {
 #define X(id, NAME, key, def, lo, hi, unit, owner) ARIADNA_P_##NAME = id,
     ARIADNA_PARAM_LIST(X)
 #undef X
-    ARIADNA_PARAM_ID_MAX = 200         // ids are 0 .. ARIADNA_PARAM_ID_MAX-1
+    ARIADNA_PARAM_ID_MAX = 232         // ids are 0 .. ARIADNA_PARAM_ID_MAX-1 (uint8_t on the link)
 };
 
 typedef struct {

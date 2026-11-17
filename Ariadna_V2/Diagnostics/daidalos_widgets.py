@@ -382,50 +382,105 @@ class StripChart(QtWidgets.QWidget):
             buf.clear()
         self.update()
 
+    @staticmethod
+    def nice_ticks(lo: float, hi: float, n: int = 5) -> tuple[float, list[float]]:
+        """Round tick values (1, 2, 2.5, 5 x 10^k) covering lo..hi, about n of them."""
+        span = hi - lo
+        if span <= 0:
+            return 1.0, [lo]
+        raw = span / max(1, n)
+        mag = 10.0 ** math.floor(math.log10(raw))
+        step = next((m * mag for m in (1.0, 2.0, 2.5, 5.0, 10.0) if m * mag >= raw), 10.0 * mag)
+        first = math.ceil(lo / step - 1e-9) * step
+        ticks, v = [], first
+        while v <= hi + 1e-9 * step and len(ticks) < 50:
+            ticks.append(0.0 if abs(v) < step * 1e-9 else v)
+            v += step
+        return step, ticks
+
+    @staticmethod
+    def fmt_tick(v: float, step: float) -> str:
+        nd = 0                                        # as many decimals as the step has
+        while nd < 6 and abs(step * 10 ** nd - round(step * 10 ** nd)) > 1e-6 * 10 ** nd:
+            nd += 1
+        txt = f"{v:.3g}" if abs(v) >= 10000 else f"{v:.{nd}f}"
+        return txt.replace("-", "−")
+
     def paintEvent(self, _):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QtGui.QColor("#101418"))
         w, h = self.width(), self.height()
-        left, top, right, bottom = 44, 20, 8, 16
-        pw, ph = w - left - right, h - top - bottom
         f = p.font()
         f.setPointSize(8)
         p.setFont(f)
+        fm = p.fontMetrics()
+        allv = [v for buf in self.data for _, v in buf]
+        lo = hi = 0.0
+        step, ticks = 1.0, []
+        if allv:
+            lo, hi = min(allv), max(allv)
+            if hi - lo < 1e-6:
+                lo, hi = lo - 1.0, hi + 1.0
+            pad = 0.08 * (hi - lo)
+            lo, hi = lo - pad, hi + pad
+            step, ticks = self.nice_ticks(lo, hi, max(2, int((h - 40) / 28)))
+        labels = [self.fmt_tick(v, step) for v in ticks]
+        left = max(34, 8 + max((fm.horizontalAdvance(t) for t in labels), default=0))
+        top, right, bottom = 20, 8, 18
+        pw, ph = w - left - right, h - top - bottom
+
+        # title, and a legend with the latest value of each series
         p.setPen(QtGui.QColor("#e8eef2"))
         p.drawText(QtCore.QRectF(left, 2, pw, 16), QtCore.Qt.AlignmentFlag.AlignLeft,
                    f"{self.title}" + (f" [{self.unit}]" if self.unit else ""))
-        # legend
         x = w - right
         for i in reversed(range(len(self.names))):
-            txt = self.names[i]
-            tw = p.fontMetrics().horizontalAdvance(txt) + 14
+            last = self.data[i][-1][1] if self.data[i] else None
+            txt = "■ " + self.names[i] + ("" if last is None else " " + self.fmt_tick(last, step / 10))
+            tw = fm.horizontalAdvance(txt) + 10
             x -= tw
             p.setPen(QtGui.QColor(self.COLORS[i % 4]))
-            p.drawText(QtCore.QRectF(x, 2, tw, 16), QtCore.Qt.AlignmentFlag.AlignLeft, "■ " + txt)
+            p.drawText(QtCore.QRectF(x, 2, tw, 16), QtCore.Qt.AlignmentFlag.AlignLeft, txt)
 
-        allv = [v for buf in self.data for _, v in buf]
-        p.setPen(QtGui.QPen(QtGui.QColor("#2a343c"), 1))
-        p.drawRect(QtCore.QRectF(left, top, pw, ph))
+        frame = QtCore.QRectF(left, top, pw, ph)
+        p.fillRect(frame, QtGui.QColor("#141a1f"))
+        grid = QtGui.QPen(QtGui.QColor(255, 255, 255, 28), 1)
+        axis_txt = QtGui.QColor("#9fb0bb")
+        # time axis: seconds before now, a light line at every round step
+        tstep, tticks = self.nice_ticks(-self.span, 0.0, max(2, int(pw / 70)))
+        for tv in tticks:
+            px = left + pw * (tv + self.span) / self.span
+            p.setPen(grid)
+            p.drawLine(QtCore.QPointF(px, top), QtCore.QPointF(px, top + ph))
+            p.setPen(axis_txt)
+            now = abs(tv) < 1e-9
+            p.drawText(QtCore.QRectF(px - (60 if now else 30), top + ph + 2, 60, 14),
+                       QtCore.Qt.AlignmentFlag.AlignRight if now else QtCore.Qt.AlignmentFlag.AlignHCenter,
+                       "teď" if now else self.fmt_tick(tv, tstep) + " s")
         if not allv:
+            p.setPen(QtGui.QPen(QtGui.QColor("#2a343c"), 1))
+            p.drawRect(frame)
+            p.setPen(axis_txt)
+            p.drawText(frame, QtCore.Qt.AlignmentFlag.AlignCenter, "žádná data")
             p.end()
             return
-        lo, hi = min(allv), max(allv)
-        if hi - lo < 1e-6:
-            lo, hi = lo - 1.0, hi + 1.0
-        pad = 0.08 * (hi - lo)
-        lo, hi = lo - pad, hi + pad
+        # value axis: a light line and a label at every round value, zero brighter
+        for v, txt in zip(ticks, labels):
+            py = top + ph * (hi - v) / (hi - lo)
+            zero = abs(v) < step * 1e-6
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 75 if zero else 28), 1))
+            p.drawLine(QtCore.QPointF(left, py), QtCore.QPointF(left + pw, py))
+            p.setPen(axis_txt)
+            p.drawText(QtCore.QRectF(0, py - 7, left - 5, 14),
+                       QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, txt)
+        p.setPen(QtGui.QPen(QtGui.QColor("#2a343c"), 1))
+        p.drawRect(frame)
+
         t1 = max(buf[-1][0] for buf in self.data if buf)
         t0 = t1 - self.span
-        p.setPen(QtGui.QColor("#9fb0bb"))
-        p.drawText(QtCore.QRectF(0, top - 6, left - 4, 12),
-                   QtCore.Qt.AlignmentFlag.AlignRight, f"{hi:.4g}")
-        p.drawText(QtCore.QRectF(0, top + ph - 6, left - 4, 12),
-                   QtCore.Qt.AlignmentFlag.AlignRight, f"{lo:.4g}")
-        if lo < 0 < hi:
-            y0 = top + ph * (hi - 0) / (hi - lo)
-            p.setPen(QtGui.QPen(QtGui.QColor("#3a4750"), 1, QtCore.Qt.PenStyle.DashLine))
-            p.drawLine(QtCore.QPointF(left, y0), QtCore.QPointF(left + pw, y0))
+        p.save()
+        p.setClipRect(frame)
         for i, buf in enumerate(self.data):
             if len(buf) < 2:
                 continue
@@ -441,6 +496,7 @@ class StripChart(QtWidgets.QWidget):
                     path.lineTo(px, py)
             p.setPen(QtGui.QPen(QtGui.QColor(self.COLORS[i % 4]), 1.5))
             p.drawPath(path)
+        p.restore()
         p.end()
 
 

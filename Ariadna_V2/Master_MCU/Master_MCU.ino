@@ -195,19 +195,23 @@ static const uint8_t PCA_ADDR = 0x40;
 static const float   PCA_OSC_HZ   = 25000000.0f;
 static const float   PCA_PWM_HZ   = 339.0f;    // see the header note
 
-// Channel map.
+// The flight servos, by INDEX. Which PCA9685 channel each one is on is a
+// PARAMETER since fw 3.28 (srv.ch_*, ids 200..207, in this order), as are
+// its hard pulse limits (srv.*_min_us / *_max_us, ids 208..223, a min/max
+// pair per servo in this order). See servo_map_update().
 enum {
-    CH_TVC_X   = 0,
-    CH_TVC_Y   = 1,
-    CH_CLAMP   = 2,
-    CH_FIN_0   = 3,     // fin 1: on body axis 1 (the TVC X side)
-    CH_FIN_1   = 4,     // fin 2: 90 deg on, toward body axis 2
-    CH_FIN_2   = 5,     // fin 3: opposite fin 1
-    CH_FIN_3   = 6,     // fin 4: opposite fin 2
-    CH_COVER   = 7,     // aerocover latch
-    PCA_N_USED = 8,
-    PCA_N_CH   = 16
+    SV_TVC_X = 0,
+    SV_TVC_Y,
+    SV_CLAMP,
+    SV_COVER,           // aerocover latch
+    SV_FIN_0,           // fin 1: on body axis 1 (the TVC X side); fins 2..4 follow,
+                        // 90 deg apart toward body axis 2, then opposite 1, opposite 2
+    SV_N = SV_FIN_0 + 4,
+    PCA_N_CH = 16
 };
+// Daidalos as wired: TVC X 5, TVC Y 6, clamp 7, cover 8, fins 9..12. Used
+// when the parameters do not describe eight different channels 0..15.
+static const uint8_t SV_CH_DEFAULT[SV_N] = { 5, 6, 7, 8, 9, 10, 11, 12 };
 
 // ---- servo calibration ------------------------------------------------
 //
@@ -237,9 +241,11 @@ static ariadna_params_t s_params;
 #define FIN_SIGN(i)      (s_params.v[ARIADNA_P_SRV_FIN1_SIGN + (i)] < 0.0f ? -1.0f : 1.0f)
 
 // Absolute travel guard. A bad command must not stall a servo against its
-// end stop and burn out on the pad.
-static const float SERVO_US_MIN    = 900.0f;
-static const float SERVO_US_MAX    = 2100.0f;
+// end stop and burn out on the pad. The per-servo limits (srv.*_min_us /
+// *_max_us, default 900..2100) are applied first; this only catches what
+// they cannot: limits switched off (min >= max) or a corrupt value.
+static const float SERVO_US_MIN    = 500.0f;
+static const float SERVO_US_MAX    = 2500.0f;
 
 // ---- flash log --------------------------------------------------------
 static const uint32_t FLASH_SIZE     = 16UL * 1024UL * 1024UL;  // W25Q128
@@ -480,21 +486,57 @@ static bool pca_write_run(uint8_t first_ch, const uint16_t *counts, uint8_t n)
     return Wire.endTransmission() == 0;
 }
 
-// Servo shadow. Written by the actuator path, and kept so that a lost link
-// leaves the surfaces where they were rather than snapping to a default.
-static uint16_t s_servo_counts[PCA_N_USED];
+// Servo shadow, per CHANNEL. Written by the actuator path, and kept so that
+// a lost link leaves the surfaces where they were rather than snapping to a
+// default. Channels without a flight servo hold PCA_FULL_OFF (no pulse).
+static const uint16_t PCA_FULL_OFF = 0x1000;          // OFF_H bit 4
+static uint16_t s_pca[PCA_N_CH];
+static uint8_t  s_ch[SV_N]   = { 5, 6, 7, 8, 9, 10, 11, 12 };   // servo -> channel in force
+static bool     s_map_ok     = true;                  // the srv.ch_* parameters were usable
+// The span of channels that holds every flight servo, written in ONE
+// auto-increment I2C transaction (~0.9 ms for 8 channels at 400 kHz, ~1.7 ms
+// for all 16). Keep the servos on neighbouring channels and it stays short.
+static uint8_t  s_run_lo = 5, s_run_n = 8;
+
+static bool ch_is_flight(uint8_t ch)
+{
+    for (uint8_t i = 0; i < SV_N; i++) if (s_ch[i] == ch) return true;
+    return false;
+}
+
+/** The servo's own hard limits; min >= max = none (the absolute guard only). */
+static inline float srv_limit(uint8_t sv, float us)
+{
+    const float lo = s_params.v[ARIADNA_P_SRV_TVC_X_MIN + 2 * sv];
+    const float hi = s_params.v[ARIADNA_P_SRV_TVC_X_MIN + 2 * sv + 1];
+    if (lo < hi) {
+        if (us < lo) us = lo;
+        if (us > hi) us = hi;
+    }
+    return us;
+}
+static inline void     srv_set(uint8_t sv, float us) { s_pca[s_ch[sv]] = us_to_counts(srv_limit(sv, us)); }
+static inline uint16_t srv_get(uint8_t sv)           { return s_pca[s_ch[sv]]; }
+static inline bool     servos_write(void)            { return pca_write_run(s_run_lo, &s_pca[s_run_lo], s_run_n); }
+
+static bool pca_full_off(uint8_t ch)
+{
+    Wire.beginTransmission(PCA_ADDR);
+    Wire.write((uint8_t)(PCA_LED0_ON_L + 4 * ch));
+    Wire.write(0); Wire.write(0); Wire.write(0); Wire.write(0x10);
+    return Wire.endTransmission() == 0;
+}
 
 static void servos_park(void)
 {
-    s_servo_counts[CH_TVC_X] = us_to_counts(TVC_TRIM_X_US);
-    s_servo_counts[CH_TVC_Y] = us_to_counts(TVC_TRIM_Y_US);
+    srv_set(SV_TVC_X, TVC_TRIM_X_US);
+    srv_set(SV_TVC_Y, TVC_TRIM_Y_US);
     // Wide open on the pad: the clamp starts the burn open (the startup
     // gate in the guidance), and open is the position that chokes nothing.
-    s_servo_counts[CH_CLAMP] = us_to_counts(CLAMP_US_OPEN);
+    srv_set(SV_CLAMP, CLAMP_US_OPEN);
     for (uint8_t i = 0; i < 4; i++)
-        s_servo_counts[CH_FIN_0 + i] = us_to_counts(FIN_TRIM_US(i));
-    s_servo_counts[CH_COVER] = us_to_counts(s_cover_open ? PRM(SRV_COVER_UNLOCK)
-                                                         : PRM(SRV_COVER_LOCK));
+        srv_set((uint8_t)(SV_FIN_0 + i), FIN_TRIM_US(i));
+    srv_set(SV_COVER, s_cover_open ? PRM(SRV_COVER_UNLOCK) : PRM(SRV_COVER_LOCK));
 }
 
 /**
@@ -506,13 +548,11 @@ static void servos_park(void)
 static void servos_apply(const ariadna_actuator_t *a)
 {
     if (a->flags & ARIADNA_ACT_VALID) {
-        s_servo_counts[CH_TVC_X] =
-            us_to_counts(TVC_TRIM_X_US + TVC_SIGN_X * a->tvc_x_deg * TVC_US_PER_DEG);
-        s_servo_counts[CH_TVC_Y] =
-            us_to_counts(TVC_TRIM_Y_US + TVC_SIGN_Y * a->tvc_y_deg * TVC_US_PER_DEG);
+        srv_set(SV_TVC_X, TVC_TRIM_X_US + TVC_SIGN_X * a->tvc_x_deg * TVC_US_PER_DEG);
+        srv_set(SV_TVC_Y, TVC_TRIM_Y_US + TVC_SIGN_Y * a->tvc_y_deg * TVC_US_PER_DEG);
     } else if (a->flags & ARIADNA_ACT_TVC_PARK) {
-        s_servo_counts[CH_TVC_X] = us_to_counts(TVC_TRIM_X_US);
-        s_servo_counts[CH_TVC_Y] = us_to_counts(TVC_TRIM_Y_US);
+        srv_set(SV_TVC_X, TVC_TRIM_X_US);
+        srv_set(SV_TVC_Y, TVC_TRIM_Y_US);
     }
 
     // The clamp is applied whether or not the solution is valid, because
@@ -522,8 +562,7 @@ static void servos_apply(const ariadna_actuator_t *a)
     float f = (a->clamp - DG_CLAMP_MIN) / (DG_CLAMP_MAX - DG_CLAMP_MIN);
     if (f < 0.0f) f = 0.0f;
     if (f > 1.0f) f = 1.0f;
-    s_servo_counts[CH_CLAMP] =
-        us_to_counts(CLAMP_US_CLOSED + f * (CLAMP_US_OPEN - CLAMP_US_CLOSED));
+    srv_set(SV_CLAMP, CLAMP_US_CLOSED + f * (CLAMP_US_OPEN - CLAMP_US_CLOSED));
 
     // Fins. Not live (ascent with fins parked, a lost navigation solution)
     // means neutral, not "wherever they were": a fin left deflected is a
@@ -533,8 +572,7 @@ static void servos_apply(const ariadna_actuator_t *a)
         float d = fins ? a->fin_deg[i] : 0.0f;
         if (d >  30.0f) d =  30.0f;
         if (d < -30.0f) d = -30.0f;
-        s_servo_counts[CH_FIN_0 + i] =
-            us_to_counts(FIN_TRIM_US(i) + FIN_SIGN(i) * d * FIN_US_PER_DEG);
+        srv_set((uint8_t)(SV_FIN_0 + i), FIN_TRIM_US(i) + FIN_SIGN(i) * d * FIN_US_PER_DEG);
     }
 
     // Aerocover: a request latches. It is honoured only once the vehicle
@@ -542,10 +580,58 @@ static void servos_apply(const ariadna_actuator_t *a)
     if ((a->flags & ARIADNA_ACT_COVER_OPEN) && s_state >= ARIADNA_STATE_ASCENT &&
         s_state <= ARIADNA_STATE_GUIDANCE)
         s_cover_open = true;
-    s_servo_counts[CH_COVER] = us_to_counts(s_cover_open ? PRM(SRV_COVER_UNLOCK)
-                                                         : PRM(SRV_COVER_LOCK));
+    srv_set(SV_COVER, s_cover_open ? PRM(SRV_COVER_UNLOCK) : PRM(SRV_COVER_LOCK));
 
-    s_servo_ok = pca_write_run(0, s_servo_counts, PCA_N_USED);
+    s_servo_ok = servos_write();
+}
+
+/**
+ * Put the srv.ch_* parameters into force. Ground only: called at boot and
+ * whenever the table changes (PARAM SET / LOAD / DEFAULTS), never in flight.
+ * Eight different channels 0..15, or the default map is kept and the
+ * servo bus is reported as faulty, which blocks arming.
+ */
+static void servo_map_update(void)
+{
+    uint8_t  m[SV_N];
+    uint16_t used = 0;
+    bool     ok = true;
+    for (uint8_t sv = 0; sv < SV_N; sv++) {
+        const float v = s_params.v[ARIADNA_P_SRV_CH_TVC_X + sv];
+        const int   c = (int)(v + 0.5f);
+        if (!(v >= -0.5f) || c < 0 || c >= PCA_N_CH || (used & (1u << c))) { ok = false; break; }
+        used = (uint16_t)(used | (1u << c));
+        m[sv] = (uint8_t)c;
+    }
+    if (!ok) memcpy(m, SV_CH_DEFAULT, sizeof(m));
+    if (ok != s_map_ok)
+        MASTER_PRINT("# servo map: %s\n", ok ? "parameters in force"
+                                              : "srv.ch_* not 8 different channels 0..15 - DEFAULT map, servo bus FAULT");
+    s_map_ok = ok;
+    if (!memcmp(m, s_ch, sizeof(m))) return;
+
+    uint16_t was = 0;
+    for (uint8_t sv = 0; sv < SV_N; sv++) was = (uint16_t)(was | (1u << s_ch[sv]));
+    memcpy(s_ch, m, sizeof(m));
+    uint8_t lo = PCA_N_CH, hi = 0;
+    uint16_t now = 0;
+    for (uint8_t sv = 0; sv < SV_N; sv++) {
+        now = (uint16_t)(now | (1u << m[sv]));
+        if (m[sv] < lo) lo = m[sv];
+        if (m[sv] > hi) hi = m[sv];
+    }
+    s_run_lo = lo;
+    s_run_n  = (uint8_t)(hi - lo + 1);
+    for (uint8_t ch = 0; ch < PCA_N_CH; ch++)
+        if (!(now & (1u << ch))) s_pca[ch] = PCA_FULL_OFF;
+    servos_park();
+    if (!s_test) {                    // in TEST the GUI owns the outputs
+        for (uint8_t ch = 0; ch < PCA_N_CH; ch++)
+            if ((was & ~now) & (1u << ch)) (void)pca_full_off(ch);
+        s_servo_ok = servos_write();
+    }
+    MASTER_PRINT("# servo map: TVC X %u, TVC Y %u, clamp %u, cover %u, fins %u %u %u %u\n",
+                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
 }
 
 // =====================================================================
@@ -567,26 +653,27 @@ static void servos_apply(const ariadna_actuator_t *a)
 enum { SC_IDLE = 0, SC_BASE, SC_MOVE, SC_BACK, SC_GAP };
 static const uint16_t SC_TICKS_BASE = 60, SC_TICKS_MOVE = 60, SC_TICKS_BACK = 60, SC_TICKS_GAP = 80;
 static uint8_t  s_sc_phase = SC_IDLE;
-static uint8_t  s_sc_ch    = 0;
+static uint8_t  s_sc_ch    = 0;              // servo INDEX (SV_*): channel = s_ch[s_sc_ch]
+// SRVCHK res[]/ma[] are by servo: TVC X, TVC Y, clamp, cover, fin 1..4
 static uint16_t s_sc_tick  = 0;
 static float    s_sc_base  = 0.0f, s_sc_peak = 0.0f, s_sc_win[4] = { 0, 0, 0, 0 };
-static uint8_t  s_sc_res[PCA_N_USED];      // 0 untested, 1 connected, 2 NOT detected
-static float    s_sc_ma[PCA_N_USED];       // measured rise, mA
+static uint8_t  s_sc_res[SV_N];      // 0 untested, 1 connected, 2 NOT detected
+static float    s_sc_ma[SV_N];       // measured rise, mA
 static bool     s_sc_report = false;       // a result line is due on USB
 static bool     s_sc_ran    = false;       // at least one complete run since boot
 
 static inline bool srvchk_active(void) { return s_sc_phase != SC_IDLE; }
 
-/** Pulse offset for "5 deg" on this channel, signed so nothing is released. */
-static float srvchk_delta_us(uint8_t ch)
+/** Pulse offset for "5 deg" on this servo, signed so nothing is released. */
+static float srvchk_delta_us(uint8_t sv)
 {
-    switch (ch) {
-    case CH_TVC_X: case CH_TVC_Y: return 5.0f * TVC_US_PER_DEG;
-    case CH_CLAMP: {
+    switch (sv) {
+    case SV_TVC_X: case SV_TVC_Y: return 5.0f * TVC_US_PER_DEG;
+    case SV_CLAMP: {
         const float d = 5.0f * 10.0f;                       // ~10 us/deg servo
         return CLAMP_US_CLOSED < CLAMP_US_OPEN ? -d : d;   // toward closed
     }
-    case CH_COVER: {
+    case SV_COVER: {
         const float d = 5.0f * 10.0f;
         return PRM(SRV_COVER_LOCK) < PRM(SRV_COVER_UNLOCK) ? -d : d;   // deeper into the lock
     }
@@ -600,7 +687,7 @@ static void srvchk_start(void)
     memset(s_sc_res, 0, sizeof(s_sc_res));
     memset(s_sc_ma, 0, sizeof(s_sc_ma));
     servos_park();
-    pca_write_run(0, s_servo_counts, PCA_N_USED);
+    servos_write();
     s_sc_ch = 0; s_sc_tick = 0; s_sc_phase = SC_BASE;
     s_sc_base = 0.0f; s_sc_peak = -1e9f;
     s_sc_report = true;
@@ -614,7 +701,7 @@ static void srvchk_service(void)
     if (s_state != ARIADNA_STATE_IDLE) {             // TEST, ARMED, ERROR...: give up
         s_sc_phase = SC_IDLE;
         servos_park();
-        pca_write_run(0, s_servo_counts, PCA_N_USED);
+        servos_write();
         s_sc_report = true;
         return;
     }
@@ -622,15 +709,15 @@ static void srvchk_service(void)
     s_sc_win[s_sc_tick & 3] = s_amps_tick;
     const float a20 = 0.25f * (s_sc_win[0] + s_sc_win[1] + s_sc_win[2] + s_sc_win[3]);
     const uint16_t t = ++s_sc_tick;
-    const uint16_t park = s_servo_counts[s_sc_ch];
+    const uint16_t park = srv_get(s_sc_ch);
 
     switch (s_sc_phase) {
     case SC_BASE:
         if (t > 4) s_sc_base += s_amps_tick;              // skip the window warm-up
         if (t >= SC_TICKS_BASE) {
             s_sc_base /= (float)(SC_TICKS_BASE - 4);
-            uint16_t c = us_to_counts(counts_to_us(park) + srvchk_delta_us(s_sc_ch));
-            pca_write_run(s_sc_ch, &c, 1);
+            uint16_t c = us_to_counts(srv_limit(s_sc_ch, counts_to_us(park) + srvchk_delta_us(s_sc_ch)));
+            pca_write_run(s_ch[s_sc_ch], &c, 1);
             s_sc_phase = SC_MOVE; s_sc_tick = 0;
         }
         break;
@@ -639,7 +726,7 @@ static void srvchk_service(void)
         if (t > 3 && a20 > s_sc_peak) s_sc_peak = a20;
         if (t >= (s_sc_phase == SC_MOVE ? SC_TICKS_MOVE : SC_TICKS_BACK)) {
             if (s_sc_phase == SC_MOVE) {
-                pca_write_run(s_sc_ch, &park, 1);        // and back
+                pca_write_run(s_ch[s_sc_ch], &park, 1);         // and back
                 s_sc_phase = SC_BACK;
             } else {
                 const float rise_ma = (s_sc_peak - s_sc_base) * 1000.0f;
@@ -653,7 +740,7 @@ static void srvchk_service(void)
         break;
     case SC_GAP:
         if (t >= SC_TICKS_GAP) {
-            if (++s_sc_ch >= PCA_N_USED) {
+            if (++s_sc_ch >= SV_N) {
                 s_sc_phase = SC_IDLE;
                 s_sc_ran = true;
                 s_sc_report = true;
@@ -1259,7 +1346,7 @@ static void state_machine(void)
     case ARIADNA_STATE_LANDED:
         s_flags &= (uint8_t)~ARIADNA_MST_ARMED;     // down: no pyro may fire any more
         servos_park();
-        pca_write_run(0, s_servo_counts, PCA_N_USED);
+        servos_write();
         if (millis() - s_state_since > 5000)
             set_state(ARIADNA_STATE_RECOVERY);
         break;
@@ -1292,7 +1379,7 @@ static uint8_t health_bits(void)
     if (s_have_nav && (s_nav.flags & ARIADNA_NAV_VALID)) h |= ARIADNA_HLT_NAV_VALID;
     if (s_flash_ok)                              h |= ARIADNA_HLT_FLASH_OK;
     if (s_flags & ARIADNA_MST_LOGGING)           h |= ARIADNA_HLT_LOGGING;
-    if (s_servo_ok)                              h |= ARIADNA_HLT_SERVO_OK;
+    if (s_servo_ok && s_map_ok)                  h |= ARIADNA_HLT_SERVO_OK;
     if (s_have_pos_status && s_pos_status.fix >= 3)  h |= ARIADNA_HLT_GPS_FIX;
     if (s_post_pass)                             h |= ARIADNA_HLT_POST_PASS;
     return h;
@@ -1396,7 +1483,7 @@ static void build_telemetry(ariadna_tlm_t *t)
     else if (!(s_have_nav && link_alive(s_nav_us)))      err = 2;
     else if (!(s_have_act && link_alive(s_act_us)))      err = 3;
     else if (!s_flash_ok)                                err = 4;
-    else if (!s_servo_ok)                                err = 5;
+    else if (!s_servo_ok || !s_map_ok)                   err = 5;
     else if (s_state <= ARIADNA_STATE_ARMED && !params_synced()) err = 7;
     else if (s_vbat > 0.5f && s_vbat < 7.0f)             err = 6;   // low pack
     f |= (uint8_t)((err << ARIADNA_TF_ERR_SHIFT) & ARIADNA_TF_ERR_MASK);
@@ -1478,7 +1565,7 @@ static bool self_test(void)
         ok = false;
     }
     // The travel guard must actually clamp.
-    if (us_to_counts(500.0f) != us_to_counts(SERVO_US_MIN) ||
+    if (us_to_counts(400.0f) != us_to_counts(SERVO_US_MIN) ||
         us_to_counts(3000.0f) != us_to_counts(SERVO_US_MAX)) {
         usb_printf("POST servo travel guard not clamping\n");
         ok = false;
@@ -1571,6 +1658,9 @@ static uint16_t pimg_ids(const ParamImage *im)
 {
     if (im->magic != PARAM_MAGIC) return 0;
     if (im->layout == ARIADNA_PARAM_LAYOUT) return ARIADNA_PARAM_ID_MAX;
+    // Layout 4 (fw 3.25..3.27): 200 ids. The servo map and limits (ids
+    // 200..223) start at their defaults, everything else is kept.
+    if (im->layout == 4) return ARIADNA_PARAM_ID_MAX_V4;
     // Layout 3 (fw <= 3.24): 164 ids. Kept readable so that going to 200
     // ids does not throw away a calibrated vehicle's servo trims.
     if (im->layout == 3) return ARIADNA_PARAM_ID_MAX_V3;
@@ -1799,6 +1889,7 @@ static void params_request_poll(void)
             params_apply_image(&s_pimg);
             s_param_crc = ariadna_params_crc(&s_params);
             s_params_from_flash = true;
+            servo_map_update();
             usb_printf("OK PARAM LOAD flash %u\n", s_param_crc);
         } else {
             usb_printf("ERR PARAM LOAD no valid copy in flash\n");
@@ -2074,8 +2165,9 @@ static void test_leave(void)
     s_pwm_hz = PCA_PWM_HZ;                            // back to the flight refresh rate
     s_servo_ok = pca_begin();
     servos_park();
-    pca_write_run(0, s_servo_counts, PCA_N_USED);
-    for (uint8_t ch = PCA_N_USED; ch < PCA_N_CH; ch++) { s_test_us[ch] = 0; (void)test_write_ch(ch); }
+    servos_write();
+    for (uint8_t ch = 0; ch < PCA_N_CH; ch++)
+        if (!ch_is_flight(ch)) { s_test_us[ch] = 0; (void)test_write_ch(ch); }
     broadcast_cmd(ARIADNA_CMD_TEST_MODE, 0, 0);
     broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
     set_state(s_post_pass ? ARIADNA_STATE_IDLE : ARIADNA_STATE_ERROR);
@@ -2148,9 +2240,10 @@ static void console_param(char *a1, char *a2, char *a3)
             return;
         }
         s_param_crc = ariadna_params_crc(&s_params);
+        servo_map_update();                           // srv.ch_* take effect at once
         if (!s_test) {                                // servo trims show at once
             servos_park();
-            pca_write_run(0, s_servo_counts, PCA_N_USED);
+            servos_write();
         }
         MASTER_PRINT("OK PARAM %u %s %.9g\n", info->id, info->key, s_params.v[info->id]);
         return;
@@ -2167,6 +2260,7 @@ static void console_param(char *a1, char *a2, char *a3)
     if (!strcmp(a1, "DEFAULTS")) {
         ariadna_params_default(&s_params);
         s_param_crc = ariadna_params_crc(&s_params);
+        servo_map_update();
         usb_printf("OK PARAM DEFAULTS %u (not saved)\n", s_param_crc);
         return;
     }
@@ -2447,8 +2541,8 @@ static void diag_emit(void)
                 us[ch] = s_test_us[ch];
                 if (s_test_us[ch] && s_test_awake[ch]) on = (uint16_t)(on | (1u << ch));
             } else {
-                us[ch] = ch < PCA_N_USED ? counts_to_us(s_servo_counts[ch]) : 0;
-                if (ch < PCA_N_USED) on = (uint16_t)(on | (1u << ch));
+                us[ch] = ch_is_flight(ch) ? counts_to_us(s_pca[ch]) : 0;
+                if (ch_is_flight(ch)) on = (uint16_t)(on | (1u << ch));
             }
         }
         const bool rep = s_test && pyro_rep_fresh();
@@ -2603,8 +2697,11 @@ void setup()
     Wire.begin();
     Wire.setClock(400000);
     s_servo_ok = pca_begin();
+    for (uint8_t ch = 0; ch < PCA_N_CH; ch++) s_pca[ch] = PCA_FULL_OFF;
+    s_ch[0] = 0xFF;                      // force servo_map_update() to build the map
+    servo_map_update();                  // srv.ch_* from the parameters (loaded above)
     servos_park();
-    pca_write_run(0, s_servo_counts, PCA_N_USED);
+    servos_write();
     digitalWrite(PIN_PCA_OE, LOW);       // outputs on, at the parked pulse
 
 

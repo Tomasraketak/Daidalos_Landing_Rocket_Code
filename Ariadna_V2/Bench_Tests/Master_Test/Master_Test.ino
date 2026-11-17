@@ -93,7 +93,10 @@ static const float ACS712_DIVIDER = 0.50f;   // 2:1 divider into GP26
 static const uint8_t PCA_ADDR   = 0x40;
 static const float   PCA_OSC_HZ = 25000000.0f;
 static const float   PCA_PWM_HZ = 339.0f;      // flight rate: DIGITAL servos only
-enum { CH_TVC_X = 0, CH_TVC_Y = 1, CH_CLAMP = 2, CH_FIN_0 = 3, CH_SPARE = 7, PCA_N_USED = 8 };
+// Servo INDEX into s_counts, in channel order; channel = PCA_FIRST + index.
+// As wired on Daidalos (same as Master_MCU.ino): TVC X 5, TVC Y 6, clamp 7,
+// aerocover 8, fins 9..12.
+enum { PCA_FIRST = 5, CH_TVC_X = 0, CH_TVC_Y = 1, CH_CLAMP = 2, CH_COVER = 3, CH_FIN_0 = 4, PCA_N_USED = 8 };
 
 static const float TVC_TRIM_X_US   = 1500.0f;
 static const float TVC_TRIM_Y_US   = 1500.0f;
@@ -263,7 +266,7 @@ static bool pca_begin(void)
 static bool pca_write_all(void)
 {
     Wire.beginTransmission(PCA_ADDR);
-    Wire.write(0x06);                               // LED0_ON_L, auto-increment
+    Wire.write((uint8_t)(0x06 + 4 * PCA_FIRST));    // LEDn_ON_L of the first flight channel, auto-increment
     for (uint8_t i = 0; i < PCA_N_USED; i++) {
         Wire.write(0); Wire.write(0);
         Wire.write((uint8_t)(s_counts[i] & 0xFF));
@@ -304,22 +307,22 @@ static void servo_service(void)
 
     if (s_servo_test) {
         static const char *const NAME[PCA_N_USED] =
-            { "TVC_X", "TVC_Y", "CLAMP", "FIN_0", "FIN_1", "FIN_2", "FIN_3", "SPARE" };
+            { "TVC_X", "TVC_Y", "CLAMP", "COVER", "FIN_0", "FIN_1", "FIN_2", "FIN_3" };
         static const float TVC_STEP[5]   = { 0.0f, +1.0f, 0.0f, -1.0f, 0.0f };
         float us;
         if (ch < 2) {
             const float trim = ch == 0 ? TVC_TRIM_X_US : TVC_TRIM_Y_US;
             us = trim + TVC_STEP[step] * SERVO_TEST_DEG * TVC_US_PER_DEG;
-            bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", ch, NAME[ch],
+            bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", (unsigned)(PCA_FIRST + ch), NAME[ch],
                          (double)(TVC_STEP[step] * SERVO_TEST_DEG), (double)us);
-        } else if (ch >= CH_FIN_0) {
+        } else if (ch >= CH_COVER) {
             us = FIN_TRIM_US + TVC_STEP[step] * SERVO_TEST_DEG * FIN_US_PER_DEG;
-            bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", ch, NAME[ch],
+            bench_printf("# servo ch%u %-5s %+5.1f deg  %4.0f us\n", (unsigned)(PCA_FIRST + ch), NAME[ch],
                          (double)(TVC_STEP[step] * SERVO_TEST_DEG), (double)us);
         } else {
             static const float CL[5] = { 0.5f, 0.0f, 0.5f, 1.0f, 0.5f };
             us = CLAMP_US_CLOSED + CL[step] * (CLAMP_US_OPEN - CLAMP_US_CLOSED);
-            bench_printf("# servo ch%u %-5s %3.0f %% open %4.0f us\n", ch, NAME[ch],
+            bench_printf("# servo ch%u %-5s %3.0f %% open %4.0f us\n", (unsigned)(PCA_FIRST + ch), NAME[ch],
                          (double)(CL[step] * 100.0f), (double)us);
         }
         servos_neutral();

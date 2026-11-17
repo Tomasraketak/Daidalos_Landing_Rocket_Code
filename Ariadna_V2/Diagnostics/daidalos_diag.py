@@ -79,7 +79,7 @@ HEALTH_ERR = {1: "POST selhal", 2: "spoj s Position MCU", 3: "spoj s Navigation 
 
 # What every parameter does, for the editor's tooltip. Keys from ariadna_params.h.
 PARAM_HELP = {
-    "seq.cover_lead_s": "Kolik sekund PŘED příkazem k zážehu se odjistí aerokryt (servo, kanál 7).",
+    "seq.cover_lead_s": "Kolik sekund PŘED příkazem k zážehu se odjistí aerokryt (servo, kanál 8).",
     "seq.backup_win_s": "Okno po příkazu k zážehu: když v něm palubní počítač necítí skok zrychlení, "
                         "odpálí záložní roznět na PYRO2.",
     "seq.legs_lead_s": "Kolik sekund PŘED plánovaným dosednutím se pálí gumička nohou (PYRO3).",
@@ -183,6 +183,14 @@ PARAM_HELP["imu.gyr_off_x"] = ("Nulový offset gyra (osa X desky), °/s. Uloží
                                "Použije se jen, když se kalibrace při zapnutí liší o víc než 1 °/s.")
 PARAM_HELP["imu.gyr_off_y"] = "Nulový offset gyra (osa Y desky), °/s."
 PARAM_HELP["imu.gyr_off_z"] = "Nulový offset gyra (osa Z desky), °/s."
+_SRV_NAMES = {"tvc_x": "TVC X", "tvc_y": "TVC Y", "clamp": "klapky", "cover": "aerokrytu",
+              **{f"fin{i}": f"křidélka {i}" for i in range(1, 5)}}
+for _k, _n in _SRV_NAMES.items():
+    PARAM_HELP[f"srv.ch_{_k}"] = (f"Kanál PCA9685 (0–15) serva {_n}. Všech 8 letových serv musí mít různé kanály, "
+                                  "jinak Master použije výchozí zapojení a nahlásí chybu serv (nelze zastrčit). "
+                                  "Nastavuje se i z tabulky serv v záložce Aktuátory.")
+    PARAM_HELP[f"srv.{_k}_min_us"] = f"Tvrdé minimum pulzu serva {_n}, µs: žádný příkaz ani trim ho nepřekročí."
+    PARAM_HELP[f"srv.{_k}_max_us"] = f"Tvrdé maximum pulzu serva {_n}, µs. Min ≥ max = limit vypnutý (jen 500–2500)."
 for _i in range(3):
     for _j in range(3):
         PARAM_HELP.setdefault(f"imu.mag_si_{_i}{_j}", f"Soft iron magnetometru, prvek matice [{_i}][{_j}]. "
@@ -213,6 +221,34 @@ PARAM_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
      ("pos.",)),
 ]
 PARAM_OTHER = ("Ostatní", "parametry bez skupiny", ())
+
+
+def _param_id_max(path: str = PARAMS_H) -> int:
+    try:
+        m = re.search(r"ARIADNA_PARAM_ID_MAX\s*=\s*(\d+)", open(path, encoding="utf-8").read())
+        return int(m.group(1)) if m else 232
+    except OSError:
+        return 232
+
+
+PARAM_ID_MAX = _param_id_max()
+
+# The servo config table of the actuator page <-> the Master's parameters
+# (fw 3.28). Fields not listed (clamp / cover centre, the spare channels)
+# exist only in the GUI's own JSON file. "reverse" is the servo's sign
+# parameter (-1 = reversed); µs/° is shared by both TVC servos and by all fins.
+SERVO_PARAMS: dict[str, dict[str, str]] = {
+    "tvc_x": {"ch": "srv.ch_tvc_x", "min_us": "srv.tvc_x_min_us", "max_us": "srv.tvc_x_max_us",
+              "center_us": "srv.tvc_x_trim_us", "reverse": "srv.tvc_x_sign", "us_per_deg": "srv.tvc_us_per_deg"},
+    "tvc_y": {"ch": "srv.ch_tvc_y", "min_us": "srv.tvc_y_min_us", "max_us": "srv.tvc_y_max_us",
+              "center_us": "srv.tvc_y_trim_us", "reverse": "srv.tvc_y_sign", "us_per_deg": "srv.tvc_us_per_deg"},
+    "clamp": {"ch": "srv.ch_clamp", "min_us": "srv.clamp_min_us", "max_us": "srv.clamp_max_us"},
+    "cover": {"ch": "srv.ch_cover", "min_us": "srv.cover_min_us", "max_us": "srv.cover_max_us",
+              "lock_us": "srv.cover_lock_us", "unlock_us": "srv.cover_unlock_us"},
+    **{f"fin{i}": {"ch": f"srv.ch_fin{i}", "min_us": f"srv.fin{i}_min_us", "max_us": f"srv.fin{i}_max_us",
+                   "center_us": f"srv.fin{i}_trim_us", "reverse": f"srv.fin{i}_sign",
+                   "us_per_deg": "srv.fin_us_per_deg"} for i in range(1, 5)},
+}
 
 
 def param_group(key: str) -> int:
@@ -280,10 +316,10 @@ class FlightSimBoard(ag.SimBoard):
 
     def crc(self) -> int:
         import struct
-        v = [0.0] * 200
+        v = [0.0] * PARAM_ID_MAX
         for p in self.params:
             v[p["id"]] = p["val"]
-        return crc16(struct.pack("<200f", *v))
+        return crc16(struct.pack(f"<{PARAM_ID_MAX}f", *v))
 
     def _cmd(self, line: str) -> None:
         if not line:
@@ -292,7 +328,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 327 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 328 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -469,7 +505,7 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 327, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 328, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -484,14 +520,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 327, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 328, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 327, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 328, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -945,6 +981,117 @@ class DiagWindow(ag.MainWindow):
             c_.span = s
             c_.update()
 
+    # ---------------------------------------------- servo table <-> params
+    def _config_extra(self, card) -> None:
+        b = button("Zapsat do rakety", "primary",
+                   "Kanály, limity, trimy, reverz (znaménko), µs/° a polohy aerokrytu jako parametry "
+                   "Masteru: PARAM SET + PARAM SAVE (trvale ve flash)")
+        b.clicked.connect(self.servo_params_write)
+        card.head.addWidget(b)
+        b = button("Načíst z rakety", "", "Vyplní tabulku podle parametrů Masteru (PARAM LIST)")
+        b.clicked.connect(lambda: self._cmd("PARAM LIST"))
+        card.head.addWidget(b)
+        self.srv_sync_lbl = label("", "muted")
+        self.srv_sync_lbl.setWordWrap(True)
+        card.lay.addWidget(self.srv_sync_lbl)
+
+    def _pval(self, key: str) -> float | None:
+        r = next((p for p in self.params if p["key"] == key), None)
+        return None if r is None else self.param_edits.get(r["id"], r["val"])
+
+    def _servo_wanted(self) -> dict[str, float]:
+        """Parameter values the servo table describes."""
+        out: dict[str, float] = {}
+        for s in self.cfg.servos:
+            for f, key in SERVO_PARAMS.get(s.key, {}).items():
+                v = getattr(s, f)
+                if v is None:
+                    continue
+                out[key] = (-1.0 if v else 1.0) if f == "reverse" else float(v)
+        return out
+
+    def _servo_diff(self) -> dict[str, float]:
+        diff = {}
+        for k, v in self._servo_wanted().items():
+            cur = self._pval(k)
+            if cur is not None and abs(cur - v) > 1e-3:
+                diff[k] = v
+        return diff
+
+    def _board_has_servo_map(self) -> bool:
+        return any(p["key"] == "srv.ch_tvc_x" for p in self.params)
+
+    def servo_params_from_board(self) -> None:
+        """After PARAM LIST: the flight firmware's servo setup into the table."""
+        if not self._board_has_servo_map():
+            self.srv_sync_lbl.setText("Firmware rakety < 3.28: kanály a limity serv v ní nejsou, tabulka je jen v PC.")
+            return
+        for s in self.cfg.servos:
+            for f, key in SERVO_PARAMS.get(s.key, {}).items():
+                v = self._pval(key)
+                if v is None:
+                    continue
+                if f == "reverse":
+                    s.reverse = v < 0
+                elif f == "us_per_deg":
+                    s.us_per_deg = float(v)
+                else:
+                    setattr(s, f, int(round(v)))
+            if s.min_us >= s.max_us:                     # limit switched off on the board
+                s.min_us, s.max_us = ag.ABS_US_MIN, ag.ABS_US_MAX
+            ag.validate_servo(s)
+        self._fill_config_table()
+        for s in self.cfg.servos:
+            ax = self.axes.get(s.key)
+            if ax:
+                ax.apply_cfg()
+                ax.set_us(ax.value())
+        self._sync_tvc_pad()
+        self._update_cover_state()
+        self._check_conflicts()
+        if self.test_on:
+            self.send_limits()
+        self._servo_sync_note()
+
+    def _servo_sync_note(self) -> None:
+        if not hasattr(self, "srv_sync_lbl") or not self._board_has_servo_map():
+            return
+        d = self._servo_diff()
+        self.srv_sync_lbl.setText(
+            f"⚠ {len(d)} hodnot v tabulce se liší od rakety — „Zapsat do rakety“ je uloží trvale."
+            if d else "Tabulka odpovídá parametrům rakety (kanály, limity, trimy, znaménka).")
+        self.srv_sync_lbl.setStyleSheet(f"color: {ag.C['accent'] if d else ag.C['positive']};")
+
+    def _cfg_changed(self, s, send_pos: bool) -> None:
+        super()._cfg_changed(s, send_pos)
+        self._servo_sync_note()
+
+    def servo_params_write(self) -> None:
+        if not self.link.is_open:
+            return
+        if not self._board_has_servo_map():
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Nejdřív „Načíst z rakety“ (a firmware ≥ 3.28).")
+            return
+        chans = [s.ch for s in self.cfg.servos if s.key in SERVO_PARAMS]
+        if len(set(chans)) != len(chans):
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Dvě letová serva mají stejný kanál - opravte tabulku.")
+            return
+        d = self._servo_diff()
+        if not d:
+            self.log("# serva: raketa už má tyto hodnoty")
+            return
+        if any(k in d for k in ("srv.tvc_x_sign", "srv.tvc_y_sign")):
+            r = QtWidgets.QMessageBox.warning(
+                self, APP_NAME, "Měníte ZNAMÉNKO (reverz) serva TVC. Špatné znaménko = kladná zpětná vazba a "
+                "pád do 1 s. Po změně VŽDY udělejte zkoušku znamének (manuál, kap. Předletové testy).",
+                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel)
+            if r != QtWidgets.QMessageBox.StandardButton.Ok:
+                return
+        for k, v in d.items():
+            self.link.send(f"PARAM SET {k} {v:.6g}")
+        self.link.send("PARAM SAVE")
+        self.log(f"> serva: PARAM SET × {len(d)} + PARAM SAVE")
+
     # ------------------------------------------------------------ params
     # Columns of the parameter tree.
     PC_KEY, PC_VAL, PC_UNIT, PC_DEF, PC_RANGE, PC_OWNER, PC_HELP = range(7)
@@ -1258,6 +1405,7 @@ class DiagWindow(ag.MainWindow):
             self._param_fill()
             if hasattr(self, "ign_tab"):
                 self.ign_tab.load_from_params()
+            self.servo_params_from_board()
         elif line.startswith("OK PARAM ") and len(line.split()) >= 5 and line.split()[2].isdigit():
             _, _, pid, _key, val = line.split()[:5]
             pid = int(pid)
@@ -1265,6 +1413,7 @@ class DiagWindow(ag.MainWindow):
                 self.params[self.param_rows[pid]]["val"] = float(val)
                 self.param_edits.pop(pid, None)
                 self._param_show(pid, float(val))
+                self._servo_sync_note()
         elif line.startswith("OK TEST 1"):
             self.test_on = True
             # The console's PWM / IDLE / LIM are accepted only in TEST: send them now.

@@ -92,9 +92,32 @@ for _old in {os.path.join(os.getcwd(), "map_cache"),
         except OSError:
             pass
 
-# Target pad location (Czech Rocket Challenge).
+# Target pad location (Czech Rocket Challenge). Only the starting point:
+# the map follows the pad the ROCKET reports (its navigation origin, from the
+# telemetry), remembers it in <user dir>/pad.json and downloads the map
+# around it.
 PAD_LAT = 49.7985411
 PAD_LON = 16.6912772
+PAD_FILE = os.path.join(USER_DIR, "pad.json")
+
+
+def load_pad() -> tuple[float, float, str]:
+    try:
+        import json
+        with open(PAD_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return float(d["lat"]), float(d["lon"]), str(d.get("src", "saved"))
+    except (OSError, ValueError, KeyError):
+        return PAD_LAT, PAD_LON, "default"
+
+
+def save_pad(lat: float, lon: float, src: str) -> None:
+    try:
+        import json
+        with open(PAD_FILE, "w", encoding="utf-8") as f:
+            json.dump({"lat": lat, "lon": lon, "src": src, "saved": datetime.now().isoformat()}, f)
+    except OSError:
+        pass
 
 # --- wire format --------------------------------------------------------------
 # Must match ariadna_link.h. See the note at the top of the file.
@@ -144,9 +167,19 @@ ERROR_NAMES = {
     4: "flash", 5: "servo bus", 6: "battery low", 7: "params not synced",
 }
 
-# Google satellite tiles, cached for offline use at the field. Radius in km
-# per zoom level — tight at high zoom so the download stays quick.
-ZOOM_STRATEGY = {15: 2.0, 16: 1.5, 17: 1.0, 18: 0.5, 19: 0.4}
+# Aerial imagery, cached for offline use at the field. The sharpest source
+# for the Czech Republic is the CUZK orthophoto (Czech Office for Surveying,
+# open data): 0.15 m per pixel at zoom 20, where Esri has no imagery at all
+# and Google's is several times blurrier. Outside the Czech Republic CUZK
+# answers 404 and the tile comes from Google instead. Radius in km per zoom
+# level - tight at high zoom so the download stays around ~60 MB.
+TILE_SOURCES = (
+    ("CUZK ortofoto", "https://ags.cuzk.cz/arcgis1/rest/services/ORTOFOTO_WM/MapServer/tile/{z}/{y}/{x}"),
+    ("Google", "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"),
+)
+TILE_DIR = "aerial"                    # under CACHE_DIR; the old "satellite" cache is not reused
+MAX_NATIVE_ZOOM = 20
+ZOOM_STRATEGY = {15: 4.0, 16: 2.5, 17: 1.5, 18: 1.0, 19: 0.6, 20: 0.35}
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -186,7 +219,7 @@ class MapDownloader(QtCore.QThread):
     def __init__(self, lat, lon, strategy):
         super().__init__()
         self.lat, self.lon, self.strategy = lat, lon, strategy
-        self.headers = {"User-Agent": "SpaceCarrots_Ariadna_Map/2.0"}
+        self.headers = {"User-Agent": "Daidalos-GroundStation/2.1"}
 
     def run(self):
         tiles = []
@@ -203,20 +236,27 @@ class MapDownloader(QtCore.QThread):
         self.progress.emit(0, f"Scanning {total} satellite tiles...")
 
         def fetch(z, x, y):
-            tile_dir = os.path.join(CACHE_DIR, "satellite", str(z), str(x))
+            tile_dir = os.path.join(CACHE_DIR, TILE_DIR, str(z), str(x))
             os.makedirs(tile_dir, exist_ok=True)
-            path = os.path.join(tile_dir, f"{y}.png")
+            path = os.path.join(tile_dir, f"{y}.png")      # PNG or JPEG inside: browsers sniff it
             if os.path.exists(path):
                 return
-            url = f"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
-            try:
-                req = urllib.request.Request(url, headers=self.headers)
-                with urllib.request.urlopen(req, timeout=3) as r, open(path, "wb") as f:
-                    f.write(r.read())
-            except Exception:
-                pass  # a missing tile shows as a grey square, not a crash
+            for _name, tmpl in TILE_SOURCES:
+                try:
+                    req = urllib.request.Request(tmpl.format(z=z, x=x, y=y), headers=self.headers)
+                    with urllib.request.urlopen(req, timeout=6) as r:
+                        data = r.read()
+                        ctype = r.headers.get("Content-Type", "")
+                    if ctype.startswith("image/") and len(data) > 1000:
+                        tmp = path + ".part"
+                        with open(tmp, "wb") as f:
+                            f.write(data)
+                        os.replace(tmp, path)
+                        return
+                except Exception:
+                    continue  # next source; a missing tile shows as the live layer or nothing
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             futures = []
             for idx, (z, x, y) in enumerate(tiles):
                 futures.append(ex.submit(fetch, z, x, y))
@@ -257,12 +297,24 @@ LEAFLET_HTML = """
             preferCanvas: true, zoomAnimation: true, fadeAnimation: true
         }).setView([PAD_LAT_V, PAD_LON_V], 18);
 
+        var blank = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
         var tileOptions = {
-            maxZoom: 19, maxNativeZoom: 19, minZoom: 15, keepBuffer: 4,
-            updateWhenZooming: false,
-            errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+            maxZoom: 22, maxNativeZoom: MAX_NATIVE_ZOOM_V, minZoom: 13, keepBuffer: 4,
+            updateWhenZooming: false, errorTileUrl: blank
         };
-        L.tileLayer('CACHE_URI/satellite/{z}/{x}/{y}.png', tileOptions).addTo(map);
+        // Live CUZK orthophoto underneath (when online), the offline cache on top.
+        L.tileLayer('LIVE_TILE_URL', tileOptions).addTo(map);
+        L.tileLayer('CACHE_URI/TILE_DIR_V/{z}/{x}/{y}.png', tileOptions).addTo(map);
+        L.control.scale({imperial: false, position: 'bottomleft'}).addTo(map);
+        var info = L.control({position: 'topright'});
+        info.onAdd = function () {
+            this._div = L.DomUtil.create('div');
+            this._div.style.cssText = 'background:rgba(0,0,0,0.65);color:#fff;font:12px Consolas,monospace;' +
+                                      'padding:6px 9px;border-radius:5px;line-height:1.45;';
+            return this._div;
+        };
+        info.addTo(map);
+        var padSrc = 'PAD_SRC_V';
 
         var padSvg = `<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <circle cx="12" cy="12" r="10" stroke="#000" stroke-width="2" fill="rgba(255,255,255,0.5)"/>
@@ -281,16 +333,32 @@ LEAFLET_HTML = """
             [[padLat + minRadiusDeg, padLon + minRadiusDeg],
              [padLat - minRadiusDeg, padLon - minRadiusDeg]]);
 
-        L.marker([padLat, padLon], {icon: padIcon, zIndexOffset: 100}).addTo(map);
+        var padMarker = L.marker([padLat, padLon], {icon: padIcon, zIndexOffset: 100}).addTo(map);
         var rocketMarker = L.marker([padLat, padLon], {icon: rocketIcon, zIndexOffset: 1000}).addTo(map);
         var trajectory = L.polyline([], {color:'#ff8c00', weight:3, opacity:0.9,
                                          lineCap:'round', lineJoin:'round'}).addTo(map);
 
+        function updateInfo() {
+            var d = map.distance([padLat, padLon], lastRocketPos);
+            info._div.innerHTML = 'PAD ' + padLat.toFixed(6) + ', ' + padLon.toFixed(6) +
+                ' <span style="color:#9a9">(' + padSrc + ')</span><br>' +
+                'ROCKET ' + lastRocketPos[0].toFixed(6) + ', ' + lastRocketPos[1].toFixed(6) +
+                '<br>FROM PAD <b>' + d.toFixed(1) + ' m</b>';
+        }
+        function setPad(lat, lon, src) {
+            padLat = lat; padLon = lon; padSrc = src;
+            padMarker.setLatLng([lat, lon]);
+            minPadBounds = L.latLngBounds([[lat + minRadiusDeg, lon + minRadiusDeg],
+                                           [lat - minRadiusDeg, lon - minRadiusDeg]]);
+            updateInfo();
+            updateMapView();
+        }
         function updateRocketPosition(lat, lon) {
             var p = [lat, lon];
             lastRocketPos = p;
             rocketMarker.setLatLng(p);
             trajectory.addLatLng(p);
+            updateInfo();
             var now = Date.now();
             if (now - lastViewUpdate > 500) { updateMapView(); lastViewUpdate = now; }
         }
@@ -298,8 +366,9 @@ LEAFLET_HTML = """
         function updateMapView() {
             var b = L.latLngBounds(minPadBounds);
             b.extend(lastRocketPos);
-            map.fitBounds(b, {padding:[40,40], maxZoom:19, animate:true, duration:0.5});
+            map.fitBounds(b, {padding:[40,40], maxZoom:21, animate:true, duration:0.5});
         }
+        updateInfo();
         setTimeout(updateMapView, 200);
     </script>
 </body>
@@ -308,9 +377,9 @@ LEAFLET_HTML = """
 
 
 class RocketMapWidget(QtWidgets.QWidget):
-    def __init__(self, pad_lat=PAD_LAT, pad_lon=PAD_LON, parent=None):
+    def __init__(self, pad_lat=PAD_LAT, pad_lon=PAD_LON, pad_src="default", parent=None):
         super().__init__(parent)
-        self.pad_lat, self.pad_lon = pad_lat, pad_lon
+        self.pad_lat, self.pad_lon, self.pad_src = pad_lat, pad_lon, pad_src
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._init_ui()
 
@@ -341,6 +410,10 @@ class RocketMapWidget(QtWidgets.QWidget):
         html = (LEAFLET_HTML
                 .replace("PAD_LAT_V", str(self.pad_lat))
                 .replace("PAD_LON_V", str(self.pad_lon))
+                .replace("PAD_SRC_V", self.pad_src)
+                .replace("MAX_NATIVE_ZOOM_V", str(MAX_NATIVE_ZOOM))
+                .replace("TILE_DIR_V", TILE_DIR)
+                .replace("LIVE_TILE_URL", TILE_SOURCES[0][1])
                 .replace("CACHE_URI", cache_uri)
                 .replace("LEAFLET_CSS_URI", css_uri)
                 .replace("LEAFLET_JS_URI", js_uri))
@@ -348,6 +421,10 @@ class RocketMapWidget(QtWidgets.QWidget):
 
     def update_position(self, lat, lon):
         self.browser.page().runJavaScript(f"updateRocketPosition({lat:.7f}, {lon:.7f});")
+
+    def set_pad(self, lat, lon, src):
+        self.pad_lat, self.pad_lon, self.pad_src = lat, lon, src
+        self.browser.page().runJavaScript(f"setPad({lat:.7f}, {lon:.7f}, '{src}');")
 
     def clear_trajectory(self):
         self.browser.page().runJavaScript("clearTrajectory();")
@@ -929,6 +1006,7 @@ class GroundStation(QtWidgets.QMainWindow):
         self.packet_count = 0
         self.data_alt, self.data_accel, self.data_vel = [], [], []
         self.data_tvc_x, self.data_tvc_y = [], []
+        self.data_t = []                       # arrival time of each sample (monotonic s)
 
         self.boot_time = time.time()
         self.last_packet_time = time.time()
@@ -941,7 +1019,9 @@ class GroundStation(QtWidgets.QMainWindow):
         self.csv_writer = None
         self.last_flush_time = 0.0
 
-        self.sim_lat, self.sim_lon = PAD_LAT, PAD_LON
+        self.pad_lat, self.pad_lon, self.pad_src = load_pad()
+        self.pad_acc = []                      # recent pad estimates from the telemetry
+        self.sim_lat, self.sim_lon = self.pad_lat, self.pad_lon
         self.test_t = 0.0
 
         self.setWindowTitle("Space Carrots — Daidalos / Ariadna V2 Ground Station")
@@ -953,7 +1033,7 @@ class GroundStation(QtWidgets.QMainWindow):
         self.progress_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         self.progress_dialog.setMinimumDuration(0)
 
-        self.downloader = MapDownloader(PAD_LAT, PAD_LON, ZOOM_STRATEGY)
+        self.downloader = MapDownloader(self.pad_lat, self.pad_lon, ZOOM_STRATEGY)
         self.downloader.progress.connect(self.update_progress)
         self.downloader.finished.connect(self.launch_interface)
         self.downloader.start()
@@ -1046,6 +1126,13 @@ class GroundStation(QtWidgets.QMainWindow):
         self.t0_timer = QtCore.QTimer()
         self.t0_timer.timeout.connect(self.update_countdown)
         self.t0_timer.start(200)
+
+        self.map_btn = QtWidgets.QPushButton("MAP ⭳ PAD")
+        self.map_btn.setToolTip("Download the aerial map (CUZK orthophoto, 15 cm/px) around the current pad "
+                                "for offline use at the field")
+        self.map_btn.setStyleSheet("background-color: #555555; color: white;")
+        self.map_btn.clicked.connect(self.download_map_here)
+        bar.addWidget(self.map_btn)
 
         self.record_btn = QtWidgets.QPushButton("⏺ RECORD")
         self.record_btn.setStyleSheet("background-color: #555555; color: white;")
@@ -1148,15 +1235,21 @@ class GroundStation(QtWidgets.QMainWindow):
         self.tvc_x_curve = self.tvc_plot.plot(pen=pg.mkPen("#ffaa00", width=2), name="X")
         self.tvc_y_curve = self.tvc_plot.plot(pen=pg.mkPen("#00aaff", width=2), name="Y")
 
-        for plot in (self.alt_plot, self.accel_plot, self.vel_plot, self.tvc_plot):
-            plot.showGrid(x=True, y=True, alpha=0.4)
+        # Axis captions, so a value can be read off at a glance: the X axis is
+        # seconds before the newest packet, the Y axis is in the plot's unit.
+        for plot, unit in ((self.alt_plot, "m"), (self.accel_plot, "g"),
+                           (self.vel_plot, "m/s"), (self.tvc_plot, "deg")):
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            plot.setLabel("left", unit)
+            plot.setLabel("bottom", "time before now [s]")
+            plot.getAxis("left").setWidth(48)
             graphs.addWidget(plot)
         # Altitude and acceleration cannot go negative; vertical speed and
         # TVC very much can, so they keep a symmetric axis.
         self.alt_plot.getPlotItem().setLimits(yMin=0)
         self.accel_plot.getPlotItem().setLimits(yMin=0)
 
-        self.map_widget = RocketMapWidget(PAD_LAT, PAD_LON)
+        self.map_widget = RocketMapWidget(self.pad_lat, self.pad_lon, self.pad_src)
         lower.addWidget(self.map_widget, stretch=3)
 
         self.tvc_widget = TVCWidget()
@@ -1294,7 +1387,7 @@ class GroundStation(QtWidgets.QMainWindow):
         if enabled:
             self.test_data_timer.start(50)
             self.status.showMessage("NO SIGNAL — LOCAL SIMULATION")
-            self.sim_lat, self.sim_lon = PAD_LAT, PAD_LON
+            self.sim_lat, self.sim_lon = self.pad_lat, self.pad_lon
             self.test_t = 0.0
         else:
             self.test_data_timer.stop()
@@ -1355,9 +1448,9 @@ class GroundStation(QtWidgets.QMainWindow):
         R = 6371000.0
         self.sim_lat += math.degrees(d * math.cos(math.radians(azim)) / R)
         self.sim_lon += math.degrees(d * math.sin(math.radians(azim))
-                                     / (R * math.cos(math.radians(PAD_LAT))))
-        if haversine((self.sim_lat, self.sim_lon), (PAD_LAT, PAD_LON)) * 1000 > 300:
-            self.sim_lat, self.sim_lon = PAD_LAT, PAD_LON
+                                     / (R * math.cos(math.radians(self.pad_lat))))
+        if haversine((self.sim_lat, self.sim_lon), (self.pad_lat, self.pad_lon)) * 1000 > 300:
+            self.sim_lat, self.sim_lon = self.pad_lat, self.pad_lon
 
         burn = (phase == PHASE_BURN)
         self.process_telemetry({
@@ -1422,7 +1515,7 @@ class GroundStation(QtWidgets.QMainWindow):
         if d["STATE"] == 2 and self.last_state not in (None, 2):
             self.map_widget.clear_trajectory()
             self.data_alt.clear(); self.data_accel.clear(); self.data_vel.clear()
-            self.data_tvc_x.clear(); self.data_tvc_y.clear()
+            self.data_tvc_x.clear(); self.data_tvc_y.clear(); self.data_t.clear()
         self.last_state = d["STATE"]
 
         for series, key in ((self.data_alt, "ALT"), (self.data_accel, "ACCEL"),
@@ -1430,12 +1523,16 @@ class GroundStation(QtWidgets.QMainWindow):
                             (self.data_tvc_y, "TVC_Y")):
             series.append(d[key])
             del series[:-400]
+        now = time.monotonic()
+        self.data_t.append(now)
+        del self.data_t[:-400]
+        tx = [ti - now for ti in self.data_t]
 
-        self.alt_curve.setData(self.data_alt)
-        self.accel_curve.setData(self.data_accel)
-        self.vel_curve.setData(self.data_vel)
-        self.tvc_x_curve.setData(self.data_tvc_x)
-        self.tvc_y_curve.setData(self.data_tvc_y)
+        self.alt_curve.setData(tx, self.data_alt)
+        self.accel_curve.setData(tx, self.data_accel)
+        self.vel_curve.setData(tx, self.data_vel)
+        self.tvc_x_curve.setData(tx, self.data_tvc_x)
+        self.tvc_y_curve.setData(tx, self.data_tvc_y)
 
         self.alt_plot.setYRange(0, max(100, max(self.data_alt)))
         self.accel_plot.setYRange(0, max(2, max(self.data_accel)))
@@ -1547,12 +1644,45 @@ class GroundStation(QtWidgets.QMainWindow):
 
         if d["LAT"] or d["LON"]:
             self.map_widget.update_position(d["LAT"], d["LON"])
+            if not is_simulated:
+                self.track_pad(d)
 
         if not self.is_recording:
             src = "SIMULATION" if is_simulated else self.port_combo.currentText()
             bad = getattr(self, "_link_bad", 0)
             self.status.showMessage(
                 f"{src} | PACKETS: {self.packet_count} | DROPPED: {bad}")
+
+    # ------------------------------------------------------------------ pad
+    def track_pad(self, d):
+        """The rocket's navigation origin, from its GPS position and its
+        position relative to the pad (px/py, whole metres, saturating at
+        +-127). Averaged on the ground, where it does not move."""
+        if d["STATE"] not in (1, 2) or abs(d["PX"]) >= 120 or abs(d["PY"]) >= 120:
+            return
+        m_lat = 111320.0
+        m_lon = 111320.0 * math.cos(math.radians(d["LAT"]))
+        self.pad_acc.append((d["LAT"] - d["PY"] / m_lat, d["LON"] - d["PX"] / m_lon))
+        del self.pad_acc[:-50]
+        if len(self.pad_acc) < 20:
+            return
+        lat = sum(a for a, _ in self.pad_acc) / len(self.pad_acc)
+        lon = sum(b for _, b in self.pad_acc) / len(self.pad_acc)
+        moved = haversine((lat, lon), (self.pad_lat, self.pad_lon)) * 1000.0
+        if moved > 2.0 or self.pad_src != "rocket":
+            self.pad_lat, self.pad_lon, self.pad_src = lat, lon, "rocket"
+            self.map_widget.set_pad(lat, lon, "rocket")
+            save_pad(lat, lon, "rocket")
+            if moved > 300.0:
+                self.status.showMessage("Pad moved >300 m - press MAP ⭳ PAD for the offline map there")
+
+    def download_map_here(self):
+        if getattr(self, "map_dl", None) is not None and self.map_dl.isRunning():
+            return
+        self.map_dl = MapDownloader(self.pad_lat, self.pad_lon, ZOOM_STRATEGY)
+        self.map_dl.progress.connect(lambda v, t: self.map_btn.setText(f"MAP {v} %"))
+        self.map_dl.finished.connect(lambda: self.map_btn.setText("MAP ⭳ PAD"))
+        self.map_dl.start()
 
     def closeEvent(self, event):
         if self.is_recording and self.csv_file:

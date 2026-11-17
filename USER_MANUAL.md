@@ -74,11 +74,19 @@ přehled:
 
 | kanál | co | poznámka |
 |---|---|---|
-| 0 | TVC osa 1 (X) | znaménko `srv.tvc_x_sign` |
-| 1 | TVC osa 2 (Y) | znaménko `srv.tvc_y_sign` |
-| 2 | klapka (clamp) | `srv.clamp_closed_us` … `srv.clamp_open_us` |
-| 3–6 | křidélka 1–4 | křidélko 1 leží na tělesové ose 1 (strana serva TVC X), další po 90° |
-| 7 | **aerokryt** | `srv.cover_lock_us` / `srv.cover_unlock_us` |
+| 5 | TVC osa 1 (X) | znaménko `srv.tvc_x_sign` |
+| 6 | TVC osa 2 (Y) | znaménko `srv.tvc_y_sign` |
+| 7 | klapka (clamp) | `srv.clamp_closed_us` … `srv.clamp_open_us` |
+| 8 | **aerokryt** | `srv.cover_lock_us` / `srv.cover_unlock_us` |
+| 9–12 | křidélka 1–4 | křidélko 1 leží na tělesové ose 1 (strana serva TVC X), další po 90° |
+| 0–4, 13–15 | volné | letový software je nepoužívá; v GUI karta *Volné výstupy* (TEST režim) |
+
+Výchozí od fw 3.28 (dřív 0–7). **Kanál každého serva je parametr** (`srv.ch_*`) a mění se z
+diagnostického GUI: záložka *Aktuátory* → tabulka *Přiřazení kanálů a limity serv* → **Zapsat do
+rakety** (uloží trvale do flash Masteru; stejně i Min/Max, střed = trim, reverz = znaménko, µs/°,
+polohy aerokrytu). Osm letových serv musí mít různé kanály, jinak Master použije výchozí
+zapojení a hlásí chybu serv (nelze zastrčit). Master zapisuje jedním I²C přenosem rozsah od
+nejnižšího po nejvyšší použitý kanál — serva vedle sebe = nejkratší zpoždění.
 
 ### Pyro kanály (Navigation MCU)
 
@@ -396,7 +404,7 @@ Kód `common/ariadna_seq.h` (bez Arduina, testovaný v `test/seq_test.cpp`).
 
 | událost | pravidlo | parametr |
 |---|---|---|
-| **Aerokryt** | odjistí se `seq.cover_lead_s` (0,6 s) **před příkazem k zážehu**; když odpočet nikdy neplatil, nejpozději s příkazem. Je to **servo** (kanál 7), Master ho po odjištění drží odjištěný až do přistání. | `seq.cover_lead_s`, `seq.cover_enable`, `srv.cover_*_us` |
+| **Aerokryt** | odjistí se `seq.cover_lead_s` (0,6 s) **před příkazem k zážehu**; když odpočet nikdy neplatil, nejpozději s příkazem. Je to **servo** (kanál 8), Master ho po odjištění drží odjištěný až do přistání. | `seq.cover_lead_s`, `seq.cover_enable`, `srv.cover_*_us` |
 | **PYRO1** hlavní roznět | v okamžiku příkazu k zážehu | `seq.ign_pulse_s` (0,6 s) |
 | **PYRO2** záložní roznět | jen když **v okamžiku příkazu ani do `seq.backup_win_s` (150 ms) po něm** palubní počítač necítí skok osového zrychlení ≥ `g.onset_bump` | `seq.backup_win_s`, `seq.backup_enable` |
 | **PYRO3** nohy | `seq.legs_lead_s` (1,7 s) **před plánovaným dosednutím**, proud **nejméně 0,5 s** (`seq.legs_pulse_s`, minimum vynuceno v kódu); nikdy nad `seq.legs_h_max_m`; když během hoření odpočet není platný, nohy jdou pod 10 m | `seq.legs_*` |
@@ -494,7 +502,7 @@ do USB se předá jen tolik, kolik USB právě vezme — kód nikdy na počíta�
 | **Grafy** | výška, rychlosti, náklon vs. příkaz, úhlové rychlosti, TVC + klapka, křidélka, napájení, doba smyčky Navigation MCU; okno 10–300 s, pauza |
 | **Surová data IMU** | po zapnutí tlačítkem (příkaz `RAW 1`, jen na zemi) posílá Position MCU ~25×/s akcelerometr [g], gyro [°/s], magnetometr surový i kalibrovaný [µT], tlak a teplotu — v osách desky TriSense, jak jsou natištěné; tabulka + grafy. Na rampě v klidu: akcelerometr ≈ (0, −1, 0) g, \|a\| ≈ 1,00, \|ω\| < 1 °/s. Řádky `R` se ukládají i do CSV při „Nahrávat“ |
 | **Kalibrace** | gyro (`CAL GYRO`; offset se sám uloží jako `imu.gyr_off_*` a slouží jako záloha, když se raketa při zapnutí hýbala); akcelerometr z 6+ libovolných poloh v klidu (offset + škála); magnetometr hard + soft iron z otáčení (s ukazatelem pokrytí směrů); **Rampa = tady** (10 s průměr GPS → `pos.pad_lat_deg/_lon_deg`, počátek navigace je pak pevně na rampě); **kontrola serv** — Master pohne každým servem o 5° a zpět a podle nárůstu proudu pozná, jestli je připojené (spouští se i po vytažení RBF, `mst.servo_check_on_rbf`, zastrčení počká; práh `mst.servo_check_ma`). Vše se ukládá jako parametry do flash |
-| **Aktuátory a pyro** | **celá původní Actuator Console**, beze změny funkcí: TVC pad, křidélka (i společně a test pohybu), klapka, aerokryt (zajistit/odjistit/uložit polohy), pyro (aktivace, podržení k odpálení), konfigurace serv, záznam a ruční příkazy; **volné výstupy — serva 9–16** (kanály 8–15 PCA9685, které letový software nepoužívá; dřív pro ně GUI nemělo ovládání, takže se nehýbaly) |
+| **Aktuátory a pyro** | **celá původní Actuator Console**, beze změny funkcí: TVC pad, křidélka (i společně a test pohybu), klapka, aerokryt (zajistit/odjistit/uložit polohy), pyro (aktivace, podržení k odpálení), konfigurace serv, záznam a ruční příkazy; **volné výstupy** (kanály PCA9685 0–4 a 13–15, které letový software nepoužívá) |
 | **Parametry a časování** | celá tabulka parametrů s popisem, **rozdělená do skupin** (sekvence a pyro, raketa a motor, zážeh, TVC, křidélka, serva, Master, kalibrace senzorů a rampa, poloha a senzory); hledání v názvu i popisu, přepínač „Jen změněné“, hodnota se upravuje klepnutím; úprava, odeslání, uložení do flash, výchozí hodnoty, export/import profilu (včetně montážní odchylky lidaru `pos.lidar_tilt_*`) |
 | **Zážeh a LandSim** | parametry rakety (hmotnost, palivo, Cd, průměr, škála tahu, rezerva na zpoždění, brzda křidélek), výpočet pásma zážehu simulací LandSim_Light, graf pásma s křivkou pádu, náhled výšky zážehu pro apogea 80–240 m, odeslání do rakety a uložení do flash |
 
@@ -627,6 +635,14 @@ python Ground_Visualizer\ground_visualizer.py
 * **Rozložení:** vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC) přes celou
   výšku okna, uprostřed karty v mřížce 4 × N s lištami a pod nimi orientace, mapa a TVC;
   vpravo výškoměr. Záznam CSV (klávesa R).
+* **Grafy** mají popsané osy: vlevo jednotka, dole čas v sekundách před posledním paketem.
+* **Mapa** (fw 3.28): letecký snímek **ČÚZK ortofoto, 15 cm/px** (zoom 20; mimo ČR Google).
+  Při startu se stáhne do `Dokumenty/Daidalos/map_cache/aerial` kolem rampy (~60 MB) a pak
+  funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAP ⭳ PAD** stáhne mapu
+  kolem aktuální rampy znovu. **Rampa** se bere z rakety: GPS poloha minus posun od rampy
+  (`px/py`), průměrovaná na zemi (IDLE/ARMED), a ukládá se do `Dokumenty/Daidalos/pad.json`
+  — příště se mapa stáhne rovnou tam. V rohu mapy: souřadnice rampy (zdroj), rakety a
+  vzdálenost; dole měřítko.
 
 ---
 
@@ -641,7 +657,7 @@ python Ground_Visualizer\ground_visualizer.py
 | `g.*` | Navigation | hmotnost, palivo, **Cd trupu, průměr, škála tahu, rezerva na zpoždění roznětu, adaptace odporu, odpor křidélek (neutrál / aerobrzda), předpověď tahu**, zisky smyček (fitované v simulaci), kužel náklonu, rezerva výšky, posun/přepis výšky zážehu, plánovač, detekce zážehu |
 | `tbl.*` | Navigation | pásmo zážehu z LandSim (`tbl.vz0`, `tbl.dvz`, `tbl.hmin_00…31`, `tbl.hmax_00…31`); v záložce Parametry skryté, upravuje se v záložce *Zážeh a LandSim* |
 | `fin.*` | Navigation | křidélka: povolení, mez, brzda, režim při stoupání, drift, adaptace |
-| `srv.*` | Master | kalibrace serv: střed, µs/°, **znaménka**, klapka, aerokryt |
+| `srv.*` | Master | kalibrace serv: střed, µs/°, **znaménka**, klapka, aerokryt; od fw 3.28 i **kanál každého serva** (`srv.ch_*`) a **tvrdé min/max pulzu** (`srv.*_min_us/_max_us`) — nejsnáz z tabulky serv v záložce *Aktuátory* tlačítky **Načíst z rakety** / **Zapsat do rakety** (PARAM SET + SAVE, trvale ve flash) |
 | `mst.*` | Master | práh detekce startu, automatické zastrčení |
 | `pos.*` | Position | **zpoždění GPS**, lidar (povolení, offset, dosah, **zpoždění po vyklopení nohou**, **montážní odchylka X/Y**), orientace jen z gyra, UWB |
 

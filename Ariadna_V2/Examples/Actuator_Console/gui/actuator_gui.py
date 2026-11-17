@@ -278,26 +278,27 @@ class ServoCfg:
         return -d if self.reverse else d
 
 
-# PCA9685 outputs 8..15 have no job in flight (PINOUT.md). Counted from 1
-# like the board's connectors, they are servos 9..16. Until fw 3.27 the GUI
-# had no control for them at all, so nothing ever sent them a pulse.
-AUX_CHANNELS = range(8, 16)
-AUX_KEYS = tuple(f"aux{ch + 1}" for ch in AUX_CHANNELS)
+# PCA9685 channels as wired on Daidalos (Master_MCU.ino, fw 3.28): the
+# eight flight servos are on 5..12. The rest have no job in flight and are
+# driven only from the GUI's "Volné kanály" card.
+FLIGHT_CHANNELS = range(5, 13)
+AUX_CHANNELS = tuple(ch for ch in range(16) if ch not in FLIGHT_CHANNELS)
+AUX_KEYS = tuple(f"aux_ch{ch}" for ch in AUX_CHANNELS)
 
 
 def default_servos() -> list[ServoCfg]:
     # Channels and the clamp's end points follow Master_MCU.ino. TVC: the
     # flight code moves the servo +-10 deg at 10 us/deg, so +-100 us here.
     return [
-        ServoCfg("tvc_x", "TVC X", 0, 1400, 1500, 1600),
-        ServoCfg("tvc_y", "TVC Y", 1, 1400, 1500, 1600),
-        ServoCfg("clamp", "Clamp", 2, 1150, 1500, 1900),
-        ServoCfg("fin1", "Křidélko 1", 3, 1200, 1500, 1800),
-        ServoCfg("fin2", "Křidélko 2", 4, 1200, 1500, 1800),
-        ServoCfg("fin3", "Křidélko 3", 5, 1200, 1500, 1800),
-        ServoCfg("fin4", "Křidélko 4", 6, 1200, 1500, 1800),
-        ServoCfg("cover", "Aerokryt", 7, 1000, 1500, 2000, lock_us=1200, unlock_us=1800),
-    ] + [ServoCfg(f"aux{ch + 1}", f"Servo {ch + 1}", ch, 1000, 1500, 2000) for ch in AUX_CHANNELS]
+        ServoCfg("tvc_x", "TVC X", 5, 1400, 1500, 1600),
+        ServoCfg("tvc_y", "TVC Y", 6, 1400, 1500, 1600),
+        ServoCfg("clamp", "Clamp", 7, 1150, 1500, 1900),
+        ServoCfg("cover", "Aerokryt", 8, 1000, 1500, 2000, lock_us=1200, unlock_us=1800),
+        ServoCfg("fin1", "Křidélko 1", 9, 1200, 1500, 1800),
+        ServoCfg("fin2", "Křidélko 2", 10, 1200, 1500, 1800),
+        ServoCfg("fin3", "Křidélko 3", 11, 1200, 1500, 1800),
+        ServoCfg("fin4", "Křidélko 4", 12, 1200, 1500, 1800),
+    ] + [ServoCfg(f"aux_ch{ch}", f"Volný {ch}", ch, 1000, 1500, 2000) for ch in AUX_CHANNELS]
 
 
 @dataclass
@@ -1262,16 +1263,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------- spare outputs
     def _build_aux(self) -> QtWidgets.QWidget:
-        card = Card("Volné výstupy", "Serva 9–16 (kanály 8–15)")
+        card = Card("Volné výstupy", "Kanály " + ", ".join(str(c) for c in AUX_CHANNELS))
         b = button("Vše střed", "primary")
         b.clicked.connect(lambda: [self.axes[k].set_us(self.cfg.servo(k).center_us, emit=True) for k in AUX_KEYS])
         card.head.addWidget(b)
-        b = button("Vypnout", tip="Zastaví pulz na kanálech 8–15")
+        b = button("Vypnout", tip="Zastaví pulz na volných kanálech")
         b.clicked.connect(self._aux_off)
         card.head.addWidget(b)
-        note = label("Letový software tyto kanály nepoužívá; ovládají se jen odsud (u letového firmwaru v TEST "
-                     "režimu). Servo 9 = kanál 8 … Servo 16 = kanál 15 PCA9685. Limity a přejmenování v tabulce "
-                     "Nastavení. „Vše na střed“ nahoře je nechává být, aby se nic nečekaně nepohnulo.", "subtle")
+        note = label("Letový software tyto kanály PCA9685 nepoužívá (letová serva jsou na 5–12); ovládají se jen "
+                     "odsud (u letového firmwaru v TEST režimu). Limity a přejmenování v tabulce Nastavení. "
+                     "„Vše na střed“ nahoře je nechává být, aby se nic nečekaně nepohnulo.", "subtle")
         note.setWordWrap(True)
         card.lay.addWidget(note)
         g = QtWidgets.QGridLayout()
@@ -1293,7 +1294,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in AUX_KEYS:
             self.pending.pop(self.cfg.servo(key).ch, None)
             self.link.send(f"OFF {self.cfg.servo(key).ch}")
-        self.log("> OFF kanály 8–15")
+        self.log("> OFF volné kanály")
 
     # ------------------------------------------------------------ aerocover
     def _build_cover(self) -> QtWidgets.QWidget:
@@ -1467,6 +1468,7 @@ class MainWindow(QtWidgets.QMainWindow):
             b = button(txt, kind)
             b.clicked.connect(fn)
             card.head.addWidget(b)
+        self._config_extra(card)
         self.cfg_warn = label("", "muted")
         card.lay.addWidget(self.cfg_warn)
         t = QtWidgets.QTableWidget(len(self.cfg.servos), len(CFG_COLS))
@@ -1486,6 +1488,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "µs / ° slouží jen pro zobrazení úhlu.", "subtle"))
         self._fill_config_table()
         return card
+
+    def _config_extra(self, card: "Card") -> None:
+        """Hook for the diagnostic console: more buttons on the config card."""
 
     def _spin(self, lo, hi, val, step=10, dbl=False) -> QtWidgets.QAbstractSpinBox:
         sp = QtWidgets.QDoubleSpinBox() if dbl else QtWidgets.QSpinBox()
