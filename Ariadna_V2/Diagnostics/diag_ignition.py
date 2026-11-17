@@ -301,7 +301,13 @@ class IgnitionTab(QtWidgets.QWidget):
         # ---- LandSim
         sc = Card("LandSim_Light", "Výpočet pásma zážehu")
         r = QtWidgets.QHBoxLayout()
-        self.sim_path = QtWidgets.QLineEdit(self.settings.value("landsim_path", os.path.join(ROOT, "..", "LandSim_Light")))
+        # DAIDALOS_LANDSIM is set by the Windows launcher (tools/windows), which
+        # keeps LandSim_Light up to date next to the repository; it wins over a
+        # folder remembered from an older checkout.
+        env_sim = os.environ.get("DAIDALOS_LANDSIM", "")
+        default_sim = env_sim if env_sim and os.path.isdir(env_sim) else \
+            self.settings.value("landsim_path", os.path.join(ROOT, "..", "LandSim_Light"))
+        self.sim_path = QtWidgets.QLineEdit(default_sim)
         self.sim_path.setToolTip("Složka s tvc_sim.py (git clone https://github.com/Tomasraketak/LandSim_Light)")
         r.addWidget(label("Složka", "muted"))
         r.addWidget(self.sim_path, 1)

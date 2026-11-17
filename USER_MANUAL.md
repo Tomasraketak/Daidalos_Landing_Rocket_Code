@@ -455,6 +455,21 @@ python daidalos_diag.py              :: vybrat port v okně
 python daidalos_diag.py --demo       :: bez hardwaru, simulovaná raketa
 ```
 
+**Windows — zástupce na ploše s automatickou aktualizací** (jednou, v `cmd`):
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Tomasraketak/Daidalos_Landing_Rocket_Code/main/tools/windows/daidalos_setup.ps1 | iex"
+```
+
+Doinstaluje Git a Python 3.12 (winget), stáhne celé repo jako git klon do
+`Plocha\Daidalos code` (stávající složka, která není klon, se jen přejmenuje na „stara kopie“)
+a vedle něj `LandSim_Light`, a vytvoří zástupce **Daidalos diagnostika** s ikonou rakety.
+Zástupce při každém spuštění aktualizuje obě repa na nejnovější `main` (vlastní úpravy
+sledovaných souborů odloží do `git stash`), jednou denně Python, vždy všechny balíčky
+(vlastní prostředí v `%LOCALAPPDATA%\Daidalos\venv`) a pak otevře diagnostiku. Bez internetu
+spustí, co je na disku. Záznam: `%LOCALAPPDATA%\Daidalos\launch.log`. Skripty:
+`tools/windows/`.
+
 ![Diagnostická konzole](Ariadna_V2/Diagnostics/screenshot.png)
 
 ### Proč nezdržuje let
