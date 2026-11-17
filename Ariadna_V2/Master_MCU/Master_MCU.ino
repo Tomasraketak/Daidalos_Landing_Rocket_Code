@@ -284,6 +284,17 @@ static void usb_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)
 // LogRecord *) have a prototype at all.
 struct LogRecord;
 
+// Parameter image stored in flash. Defined here (not next to its users) so the
+// Arduino-generated function prototypes can see the type.
+struct ParamImage {
+    uint32_t magic;
+    uint32_t seq;
+    uint16_t layout;
+    uint16_t crc;
+    float    v[ARIADNA_PARAM_ID_MAX];
+};
+static const uint32_t PARAM_MAGIC = 0x44414932;      // "DAI2"
+
 // Forward declarations. The Arduino IDE generates these by itself, but
 // `make syntax` compiles this file as plain C++ where it does not - and a
 // build that only works inside one IDE cannot be checked on a workstation.
@@ -1394,16 +1405,9 @@ static bool self_test(void)
 // The flash bus belongs to core 1 (the log). Core 0 never touches it after
 // setup(): a save or load is a REQUEST that core 1 executes between two log
 // pages, and the USB console reports the result when it is done.
-struct ParamImage {
-    uint32_t magic;
-    uint32_t seq;
-    uint16_t layout;
-    uint16_t crc;
-    float    v[ARIADNA_PARAM_ID_MAX];
-};
-static const uint32_t PARAM_MAGIC = 0x44414932;      // "DAI2"
-
-static ParamImage        s_pimg;                     // staging, handed between cores
+// (struct ParamImage is defined near the top of the file, before the
+//  auto-generated prototypes that mention it.)
+static ParamImage        s_pimg;                    // staging, handed between cores
 static volatile uint8_t  s_flash_req = 0;            // 1 save, 2 load (core 0 -> core 1)
 static volatile uint8_t  s_flash_res = 0;            // 0 pending, 1 ok, 2 failed
 static uint32_t          s_param_seq = 0;            // seq of the copy in use
@@ -1742,10 +1746,10 @@ static void log_dump_service(void)
            (uint16_t)((s_usb_head - s_usb_tail) & (USB_RING_SZ - 1)) < USB_RING_SZ - 512) {
         char line[2 * LOG_REC_SZ + 24];
         int k = snprintf(line, sizeof(line), "LOGR %lu ", (unsigned long)rec);
-        static const char HEX[] = "0123456789abcdef";
+        static const char HEXCH[] = "0123456789abcdef";
         for (uint32_t i = 0; i < LOG_REC_SZ; i++) {
-            line[k++] = HEX[s_dump_buf[off + i] >> 4];
-            line[k++] = HEX[s_dump_buf[off + i] & 15];
+            line[k++] = HEXCH[s_dump_buf[off + i] >> 4];
+            line[k++] = HEXCH[s_dump_buf[off + i] & 15];
         }
         line[k++] = '\n';
         usb_puts_n(line, (uint16_t)k);
