@@ -2404,10 +2404,11 @@ void setup()
 
 
     // ---- inter-processor links ----
-    POS_PORT.setTX(PIN_POS_TX); POS_PORT.setRX(PIN_POS_RX);
-    POS_PORT.begin(ARIADNA_MCU_BAUD);
-    NAV_PORT.setTX(PIN_NAV_TX); NAV_PORT.setRX(PIN_NAV_RX);
-    NAV_PORT.begin(ARIADNA_MCU_BAUD);
+    // ariadna_uart_begin() sets a 2 kB receive buffer before begin(); the
+    // arduino-pico default of 32 bytes overflowed every 5 ms tick and cost
+    // ~99 % of the frames (see ariadna_uart_dma.h).
+    ariadna_uart_begin(POS_PORT, PIN_POS_TX, PIN_POS_RX);
+    ariadna_uart_begin(NAV_PORT, PIN_NAV_TX, PIN_NAV_RX);
 
     // Serial1 is uart0 and Serial2 is uart1 on the arduino-pico core.
     // Swapping these two sends the Navigation MCU's traffic out of the
@@ -2448,16 +2449,22 @@ void loop()
     static uint32_t next_bcast_ms = 0;
     const  uint32_t period    = 5000;      // 200 Hz
 
+    // ---- routing, highest priority, on EVERY pass ------------------------
+    // Not gated on the 5 ms tick. Reading the ports only once per tick
+    // left the receive buffers to absorb 5 ms of 921600 baud traffic, and
+    // forwarding the nav state once per tick added up to 5 ms of jitter to
+    // the Navigation MCU's input. Here a frame is forwarded the moment its
+    // last byte arrives and the actuator command reaches the PCA9685 as
+    // soon as it is complete.
+    tx_service_all();     // retire finished DMA runs before queuing more
+    poll_position();      // forwards nav state to Navigation first
+    poll_navigation();    // applies actuator commands to the servos
+
     uint32_t now = micros();
     if (next_us == 0) next_us = now;
     if ((int32_t)(now - next_us) < 0) return;
     next_us += period;
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
-
-    // ---- routing, highest priority ------------------------------------
-    tx_service_all();     // retire finished DMA runs before queuing more
-    poll_position();      // forwards nav state to Navigation first
-    poll_navigation();    // applies actuator commands to the servos
 
     // ---- housekeeping ---------------------------------------------------
     read_analogue();

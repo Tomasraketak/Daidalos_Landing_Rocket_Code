@@ -21,6 +21,7 @@ Odkazy: [`USER_MANUAL.md`](USER_MANUAL.md), [`CALIBRATION_MANUAL.md`](CALIBRATIO
 
 | | co | jak |
 |---|---|---|
+| ☐ | **fw 3.21: link na stole** | GUI → řádek *M*: `pos`/`nav` = [dobré, vadné, živý]; vadné rámce mají růst jen výjimečně, `ok` trvale 1; *P* `hz` ≈ 200–240 (dřív 121); *N* `g` ≈ 1,00 v klidu a `p` drží ~0 m |
 | ☐ | **Přeložit všechny sketche v Arduino IDE / arduino-cli** | testy na počítači používají náhradní hlavičky; arduino-pico, `--warnings all` |
 | ☐ | **Letový záznam 200 Hz / 10 Hz** | na stole: ARMED → simulovat start (`mst.launch_g` / breakwire), 60 s; `LOG INFO`, Najít lety, stáhnout; v CSV kontrolovat rozestupy 5 ms a že `s_log_dropped` (diag *M* řádek) zůstal 0. Ověřit i při mazání sektorů (plný čip → prázdný) |
 | ☐ | `LOG FLIGHTS` na plném čipu | prohledání 16 MB trvá ~5 s; během něj neběží LoRa (na zemi v pořádku) |

@@ -727,9 +727,9 @@ void setup()
     ariadna_rgb_set(&s_rgb, ARIADNA_C_BLUE, ARIADNA_PAT_SOLID, 0);
     ariadna_rgb_service(&s_rgb);
 
-    MASTER_PORT.setTX(PIN_MASTER_TX);
-    MASTER_PORT.setRX(PIN_MASTER_RX);
-    MASTER_PORT.begin(ARIADNA_MCU_BAUD);
+    // 2 kB RX buffer: the nav_state stream is ~113 bytes per 5 ms tick and
+    // the arduino-pico default of 32 bytes lost almost all of it.
+    ariadna_uart_begin(MASTER_PORT, PIN_MASTER_TX, PIN_MASTER_RX);
     ariadna_uart_tx_begin(&s_tx, uart0);     // uart0 is Serial1. Must match MASTER_PORT.
 
     ariadna_rx_init(&s_rx);
@@ -761,6 +761,14 @@ void loop()
     static uint32_t next_report_ms = 0;
     const  uint32_t period         = (uint32_t)(1e6f / DG_CTRL_HZ);
 
+    // ---- link, on EVERY pass ------------------------------------------
+    // Draining the port only once per 5 ms tick overflowed the receive
+    // buffer (fw <= 3.20) and made the state up to 5 ms older than it had
+    // to be. The DMA ring is serviced here too, so a queued actuator frame
+    // starts the moment the previous one has left.
+    ariadna_uart_tx_service(&s_tx);
+    link_poll();
+
     uint32_t now = micros();
     if (next_us == 0) next_us = now;
     if ((int32_t)(now - next_us) < 0) return;
@@ -772,7 +780,7 @@ void loop()
     uint32_t t0 = micros();
     const uint32_t now_ms = millis();
 
-    // ---- link ---------------------------------------------------------
+    // ---- link: drained once more, so the tick sees the newest state ----
     ariadna_uart_tx_service(&s_tx);
     link_poll();
 
