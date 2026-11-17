@@ -328,6 +328,12 @@ static ariadna_nav_state_t   s_nav;          // newest from Position
 static ariadna_actuator_t    s_act;          // newest from Navigation
 static ariadna_nav_status_t  s_nav_status;
 static ariadna_pos_status_t  s_pos_status;
+// Raw sensor data for the GUI (ariadna_raw_imu_t). s_raw_on is the GUI's
+// "RAW 1" switch; it goes out in the state broadcast as ARIADNA_MST_RAW_IMU
+// and drops by itself when the USB host goes away.
+static ariadna_raw_imu_t     s_raw;
+static bool                  s_raw_on  = false;
+static volatile bool         s_raw_new = false;
 
 static uint32_t s_nav_us = 0, s_act_us = 0;
 static bool     s_have_nav = false, s_have_act = false;
@@ -902,6 +908,9 @@ static void poll_position(void)
                 s_have_pos_status = true;
                 s_pos_status_ms   = millis();
             }
+        } else if (type == ARIADNA_PKT_RAW_IMU) {
+            // Stored only; printed by diag_emit(), outside the forwarding path.
+            if (ariadna_unpack(pl, len, &s_raw, sizeof(s_raw))) s_raw_new = true;
         }
     }
 }
@@ -1793,6 +1802,7 @@ static void usb_service(void)
         // it connects is the present, not the last four kilobytes.
         s_usb_tail = s_usb_head;
         s_gui_alive = false;
+        s_raw_on = false;
         len = 0;
         return;
     }
@@ -2060,6 +2070,16 @@ static void console_line(char *line)
         }
         return;
     }
+    if (!strcmp(cmd, "RAW")) {
+        // Raw TriSense data as "R" lines (Position MCU, ~25 Hz). Ground only.
+        const bool on = a1[0] == '1';
+        if (on && !on_ground_state()) { usb_printf("ERR RAW not on the ground\n"); return; }
+        s_raw_on = on;
+        s_raw_new = false;
+        send_master_state();                 // tell the Position MCU now, not in 100 ms
+        usb_printf("OK RAW %d\n", on ? 1 : 0);
+        return;
+    }
     if (!strcmp(cmd, "PADREF")) {
         if (!on_ground_state()) { usb_printf("ERR PADREF not on the ground\n"); return; }
         broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
@@ -2243,6 +2263,21 @@ static void diag_emit(void)
     int n = 0;
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")
+    if (s_raw_new && s_raw_on) {
+        // R: raw TriSense data, board axes. Extra to the five rotating lines.
+        s_raw_new = false;
+        const ariadna_raw_imu_t &r = s_raw;
+        n = snprintf(b, sizeof(b),
+            "R {\"t\":%lu,\"acc\":[%.4f,%.4f,%.4f],\"gyr\":[%.3f,%.3f,%.3f],"
+            "\"mag\":[%.2f,%.2f,%.2f],\"magc\":[%.2f,%.2f,%.2f],\"p\":%.1f,\"temp\":%.2f,"
+            "\"src\":%u,\"mf\":%u,\"hz\":%u}\n",
+            (unsigned long)r.t_ms, r.acc_g[0], r.acc_g[1], r.acc_g[2],
+            r.gyr_dps[0], r.gyr_dps[1], r.gyr_dps[2], r.mag_ut[0], r.mag_ut[1], r.mag_ut[2],
+            r.mag_cal_ut[0], r.mag_cal_ut[1], r.mag_cal_ut[2], r.pressure_pa, r.temp_c,
+            r.src, r.mag_fresh, r.imu_hz);
+        if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
+        n = 0;
+    }
     switch (which) {
     case 0: {       // T: the Actuator Console's line, key for key
         uint16_t on = 0, us[PCA_N_CH];
@@ -2365,6 +2400,7 @@ static void send_master_state(void)
     ms.flags       = s_flags;
     ms.nav_events  = s_act.events;
     if (s_flash_ok) ms.flags |= ARIADNA_MST_LOGGING;
+    if (s_raw_on && on_ground_state()) ms.flags |= ARIADNA_MST_RAW_IMU;
     send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
     send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
 }

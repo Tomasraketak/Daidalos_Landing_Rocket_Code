@@ -70,6 +70,7 @@ static void test_layout(void)
     check(sizeof(ariadna_actuator_t)      == 36, "actuator is 36 bytes");
     check(sizeof(ariadna_nav_status_t)    == 92, "nav_status is 92 bytes");
     check(sizeof(ariadna_pos_status_t)    == 96, "pos_status is 96 bytes");
+    check(sizeof(ariadna_raw_imu_t)       == 64, "raw_imu is 64 bytes");
     check(sizeof(ariadna_master_state_t)  == 16, "master_state is 16 bytes");
     check(sizeof(ariadna_cmd_t)           ==  8, "cmd is 8 bytes");
     check(sizeof(ariadna_tlm_t)           == 50, "telemetry is 50 bytes");
@@ -248,6 +249,7 @@ static void test_all_types(void)
     printf("all packet types\n");
     roundtrip_one<ariadna_nav_state_t>(ARIADNA_PKT_NAV_STATE,   "NAV_STATE round trip");
     roundtrip_one<ariadna_pos_status_t>(ARIADNA_PKT_POS_STATUS, "POS_STATUS round trip");
+    roundtrip_one<ariadna_raw_imu_t>(ARIADNA_PKT_RAW_IMU, "RAW_IMU round trip");
     roundtrip_one<ariadna_actuator_t>(ARIADNA_PKT_ACTUATOR,     "ACTUATOR round trip");
     roundtrip_one<ariadna_nav_status_t>(ARIADNA_PKT_NAV_STATUS, "NAV_STATUS round trip");
     roundtrip_one<ariadna_master_state_t>(ARIADNA_PKT_MASTER_STATE, "MASTER_STATE round trip");
@@ -534,7 +536,10 @@ static void test_link_budget(void)
     double act_load = (ARIADNA_HDR_LEN + sizeof(ariadna_actuator_t) + ARIADNA_CRC_LEN)
                     * ARIADNA_ACTUATOR_HZ * byte_time;
     double sts_load = (ARIADNA_HDR_LEN + sizeof(ariadna_pos_status_t) + ARIADNA_CRC_LEN)
-                    * ARIADNA_STATUS_HZ * byte_time;
+                    * ARIADNA_STATUS_HZ * byte_time
+                    // the raw-IMU stream counts as always on: the worst case
+                    + (ARIADNA_HDR_LEN + sizeof(ariadna_raw_imu_t) + ARIADNA_CRC_LEN)
+                    * ARIADNA_RAW_IMU_HZ * byte_time;
     double nst_load = (ARIADNA_HDR_LEN + sizeof(ariadna_nav_status_t) + ARIADNA_CRC_LEN)
                     * ARIADNA_STATUS_HZ * byte_time;
 

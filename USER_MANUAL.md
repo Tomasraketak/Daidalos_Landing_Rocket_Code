@@ -486,6 +486,7 @@ do USB se předá jen tolik, kolik USB právě vezme — kód nikdy na počíta�
 | **Přehled** | tři desky (online, **verze firmwaru**, POST, spoje, čítače chyb), **3-D model rakety** v rámci rampy (orientace, výchylka křidélek, plamen), **terč náklonu** (kam se naklání vršek, kruhy 5/10/20°, zelená = 4° brána přistání), údaje navedení (výška zážehu, odpočty, tah, škrcení, účinnost křidélek), události, a **seznam chyb a varování** seřazený podle závažnosti |
 | **Poloha a senzory** | poloha vůči rampě s nejistotou a stopou, rychlost, zrychlení, příznaky navigace; GPS, UWB (kotvy, režim, reziduál), baro trim, lidar, INSLIB režim |
 | **Grafy** | výška, rychlosti, náklon vs. příkaz, úhlové rychlosti, TVC + klapka, křidélka, napájení, doba smyčky Navigation MCU; okno 10–300 s, pauza |
+| **Surová data IMU** | po zapnutí tlačítkem (příkaz `RAW 1`, jen na zemi) posílá Position MCU ~25×/s akcelerometr [g], gyro [°/s], magnetometr surový i kalibrovaný [µT], tlak a teplotu — v osách desky TriSense, jak jsou natištěné; tabulka + grafy. Na rampě v klidu: akcelerometr ≈ (0, −1, 0) g, \|a\| ≈ 1,00, \|ω\| < 1 °/s. Řádky `R` se ukládají i do CSV při „Nahrávat“ |
 | **Aktuátory a pyro** | **celá původní Actuator Console**, beze změny funkcí: TVC pad, křidélka (i společně a test pohybu), klapka, aerokryt (zajistit/odjistit/uložit polohy), pyro (aktivace, podržení k odpálení), konfigurace serv, záznam a ruční příkazy |
 | **Parametry a časování** | celá tabulka parametrů s popisem; úprava, odeslání, uložení do flash, výchozí hodnoty, export/import profilu (včetně montážní odchylky lidaru `pos.lidar_tilt_*`) |
 | **Zážeh a LandSim** | parametry rakety (hmotnost, palivo, Cd, průměr, škála tahu, rezerva na zpoždění, brzda křidélek), výpočet pásma zážehu simulací LandSim_Light, graf pásma s křivkou pádu, náhled výšky zážehu pro apogea 80–240 m, odeslání do rakety a uložení do flash |
@@ -657,13 +658,14 @@ Pořadí. Žádný krok nevynechávat.
    „Parametry: synchronní“, žádné rx chyby.
 3. **⚠️ Znaménka TVC** — tryska se v letovém firmwaru hýbe jen během hoření, proto se
    znaménka ověřují **staticky** z definic rámců. Tělesové osy jsou osy senzoru TriSense
-   (Position MCU): +Z ke špičce, +X = osa 1 (`BODY_SERVO1_AXIS`), osa tahu b = −Z.
+   (Position MCU), od fw 3.24 podle skutečné montáže: **−Y ke špičce** (na rampě nahoru,
+   při přistání dolů), +X = osa 1 (`BODY_SERVO1_AXIS`), osa tahu b = **+Y**.
    Kladný příkaz osy 1 (`tvc_x_deg > 0`) vychýlí **vektor tahu k tělesové +X**, tedy
    **výstup trysky (výtokový proud) míří k tělesové −X**. Kladný příkaz osy 2 vychýlí tah
-   k **b × u1 = −Y**, výstup trysky míří k **+Y**.
+   k **b × u1 = −Z**, výstup trysky míří k **+Z**.
    Postup: TEST režim, záložka Aktuátory, serva na střed; posunout TVC X o +50 µs ×
    `srv.tvc_x_sign` od `srv.tvc_x_trim_us` (se znaménkem +1 tedy vyšší pulz). Výtok trysky
-   se musí vychýlit k −X. Jinak `srv.tvc_x_sign = −1`. Totéž osa Y (výtok k +Y).
+   se musí vychýlit k −X. Jinak `srv.tvc_x_sign = −1`. Totéž osa Y (výtok k +Z).
    **Tento test chytá nejnebezpečnější chybu v celém projektu** (kladná zpětná vazba → pád
    do 1 s). Obě osy, nikdy jen jednu.
 4. **⚠️ Znaménka křidélek** — křidélko i sedí na r_i (1: +X, 2: −Y, 3: −X, 4: +Y, vše

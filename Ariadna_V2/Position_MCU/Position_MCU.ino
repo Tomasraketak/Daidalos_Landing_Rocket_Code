@@ -1097,8 +1097,9 @@ static inline bool gps_acquire(GpsFix *g)
 //      and West without changing anything that looks obviously wrong on a
 //      bench that is not pointed North.
 //
-//   3. Where the sensor is mounted. Handled by the library's
-//      setMountOrientation(), configured in setup().
+//   3. Where the sensor is mounted. NOT handed to the library: the
+//      attitude is kept in the TriSense's own axes and the mounting is
+//      expressed by BODY_NOSE_AXIS / BODY_THRUST_AXIS below (board -Y = nose).
 //
 //  BENCH IT. Section 11 checks the arithmetic; only a board on a table
 //  checks the conventions. Point the nose North, then East, then tip it
@@ -1106,18 +1107,31 @@ static inline bool gps_acquire(GpsFix *g)
 // =====================================================================
 
 /**
+ * HOW THE TRISENSE SITS IN DAIDALOS (fw 3.24, measured on the airframe):
+ * its -Y axis points UP when the vehicle stands on the pad, i.e. -Y is the
+ * NOSE and the long axis of the vehicle is the board's Y axis. Board X is
+ * the radial reference axis (TVC servo 1 / fin 1, BODY_SERVO1_AXIS on the
+ * Navigation MCU), board Z the other radial axis. Until fw 3.23 the code
+ * assumed the board lay flat with +Z toward the nose - every attitude-
+ * derived quantity (u, the lidar beam) was then 90 deg off on this vehicle.
+ *
+ * "Body" everywhere in this file means the TriSense's own axes, so these
+ * three vectors are the ONLY place the mounting enters.
+ */
+static const float BODY_NOSE_AXIS[3]   = { 0.0f, -1.0f, 0.0f };
+
+/**
  * The landing motor's thrust direction, in BODY axes.
  *
  * The landing motor sits in the nose and fires forward-out, so it pushes
- * the vehicle along its own tail-ward axis. With the TriSense mounted
- * Z-up on a vehicle standing on the pad, that is body -Z.
+ * the vehicle along its own tail-ward axis: body +Y.
  *
- * Sanity check against the link header's convention: standing on the pad,
- * body -Z maps to pad -Z, giving u = (0, 0, -1). Correct. In a nose-first
- * descent the vehicle is inverted, body -Z maps to pad +Z, u = (0, 0, +1),
- * which is thrust straight up — the attitude the landing burn wants.
+ * Standing on the pad, -Y is up, so +Y maps to pad -Z: u = (0, 0, -1).
+ * The vehicle flips at apogee and descends nose-first, +Y on top, so +Y
+ * maps to pad +Z: u = (0, 0, +1), thrust straight up - the attitude the
+ * landing burn wants. self_test() checks both.
  */
-static const float BODY_THRUST_AXIS[3] = { 0.0f, 0.0f, -1.0f };
+static const float BODY_THRUST_AXIS[3] = { 0.0f, 1.0f, 0.0f };
 
 /**
  * Build the body-to-pad rotation matrix from the fused Euler angles.
@@ -2669,9 +2683,9 @@ static bool sensors_begin(void)
     }
 
     // ---- fusion ------------------------------------------------------
-    // Mount orientation: TriSense Z-up on a vehicle standing on the pad.
-    // Change this ONE line if the board is rotated, rather than patching
-    // signs into the rotation matrix — that is what it exists for.
+    // No axis remap: the attitude stays in the TriSense's own axes and the
+    // mounting (board -Y = nose) is expressed by BODY_NOSE_AXIS /
+    // BODY_THRUST_AXIS in section 6, the same as on the INSLIB path.
     fusion.setMountOrientation(ORIENTATION_Z_UP);
 
     // Learn gyro drift continuously. The descent is long enough for a
@@ -2710,18 +2724,31 @@ static bool self_test(void)
     // A sign error here mirrors an axis for the whole flight, so it is
     // checked whichever attitude source is compiled in.
     {
-        // Level, board X to the North: R_nb = I. Standing on the pad the
-        // thrust axis must point DOWN, and body X must be pad North (+y).
-        const float I3[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
-        float R[3][3], v[3], q[4], vq[3];
-        ins_to_pad(I3, R);
+        // ON THE PAD: board -Y up, board X to the North. INSLIB's body is
+        // FRD = (X, -Y, -Z) of the board, so FRD x = North, FRD y (= -Y,
+        // the nose) = Up = NED (0,0,-1), FRD z = x cross y = East. The
+        // columns of R_nb are those three. The thrust axis must point DOWN,
+        // the nose UP, body X North.
+        const float PAD[3][3] = { { 1, 0, 0 }, { 0, 0, 1 }, { 0, -1, 0 } };
+        float R[3][3], v[3], q[4], vq[3], nz[3];
+        ins_to_pad(PAD, R);
         rotate(R, BODY_THRUST_AXIS, v);
+        rotate(R, BODY_NOSE_AXIS, nz);
         const float bx[3] = { 1.0f, 0.0f, 0.0f };
         float n[3];
         rotate(R, bx, n);
-        if (fabsf(v[2] + 1.0f) > 1e-5f || fabsf(n[1] - 1.0f) > 1e-5f || fabsf(n[0]) > 1e-5f) {
-            POS_PRINT("POST ins_to_pad level: u=(%.2f %.2f %.2f) x=(%.2f %.2f %.2f)\n",
+        if (fabsf(v[2] + 1.0f) > 1e-5f || fabsf(nz[2] - 1.0f) > 1e-5f ||
+            fabsf(n[1] - 1.0f) > 1e-5f || fabsf(n[0]) > 1e-5f) {
+            POS_PRINT("POST ins_to_pad pad: u=(%.2f %.2f %.2f) x=(%.2f %.2f %.2f)\n",
                       v[0], v[1], v[2], n[0], n[1], n[2]);
+            ok = false;
+        }
+        // LANDING: flipped 180 deg about body X (board +Y up). u must point UP.
+        const float LAND[3][3] = { { 1, 0, 0 }, { 0, 0, -1 }, { 0, 1, 0 } };
+        ins_to_pad(LAND, R);
+        rotate(R, BODY_THRUST_AXIS, v);
+        if (fabsf(v[2] - 1.0f) > 1e-5f) {
+            POS_PRINT("POST ins_to_pad landing: u=(%.2f %.2f %.2f) want (0 0 1)\n", v[0], v[1], v[2]);
             ok = false;
         }
         // Yawed 90 deg clockwise seen from above (heading East): body X is
@@ -2752,11 +2779,12 @@ static bool self_test(void)
     // --- rotation matrix -----------------------------------------------
     float R[3][3], u[3];
 
-    // Level, nose up, pointing North. Body -Z must map to pad -Z.
-    build_rotation(0.0f, 0.0f, 0.0f, R);
+    // On the pad: board rolled -90 deg about X (board -Y up), X to the
+    // North. The thrust axis (board +Y) must map to pad -Z.
+    build_rotation(-90.0f, 0.0f, 0.0f, R);
     rotate(R, BODY_THRUST_AXIS, u);
     if (fabsf(u[0]) > 1e-4f || fabsf(u[1]) > 1e-4f || fabsf(u[2] + 1.0f) > 1e-4f) {
-        POS_PRINT("POST rot level u=(%.3f %.3f %.3f) want (0 0 -1)\n", u[0], u[1], u[2]);
+        POS_PRINT("POST rot pad u=(%.3f %.3f %.3f) want (0 0 -1)\n", u[0], u[1], u[2]);
         ok = false;
     }
 
@@ -3175,6 +3203,7 @@ void loop()
     static uint32_t next_status_ms = 0;
     static uint32_t last_uwb_solve_ms = 0;
     static uint32_t last_uwb_gen  = 0;
+    static float    last_p_pa     = 0.0f;
 
     const uint32_t period = (uint32_t)(1000000UL / ESTIMATOR_HZ);
 
@@ -3252,6 +3281,7 @@ void loop()
     if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
         float p = sensor.readPressure();
+        last_p_pa = p;
         // PROVISIONAL PAD REFERENCE (fw 3.21). Until fw 3.20 the reference
         // was taken only by ARIADNA_CMD_SET_PAD_REF, which the Master sends
         // AT ARMING — but arming needs NAV_VALID, and NAV_VALID needs a pad
@@ -3403,8 +3433,9 @@ void loop()
     // Height = range * cos(beam angle) + pos.lidar_offset_m. The beam angle
     // is the vehicle's attitude AND the mounting error of the leg, which the
     // diagnostic GUI sets in two axes (pos.lidar_tilt_x_deg / _y_deg): the
-    // beam is body +Z (toward the nose, i.e. down in the descent) tilted by
-    // tilt_x about body X, then by tilt_y about body Y.
+    // beam is the nose axis, board -Y (down in the descent), tilted by
+    // tilt_x about board X, then by tilt_y about board Z (fw 3.24: the
+    // TriSense's long axis is Y; tilt_y used to be about Y).
     //
     // It is polled at 5 Hz before that (so the pad crew can see it alive)
     // and at 50 Hz once the leg is out.
@@ -3422,7 +3453,9 @@ void loop()
             if (s_lidar.poll(now_ms) && leg_out) {
                 const float tx = PRM(POS_LIDAR_TILT_X) * (float)DEG_TO_RAD;
                 const float ty = PRM(POS_LIDAR_TILT_Y) * (float)DEG_TO_RAD;
-                const float beam[3] = { sinf(ty) * cosf(tx), -sinf(tx), cosf(ty) * cosf(tx) };
+                // The nose axis (board -Y) tilted by tilt_x about board X,
+                // then by tilt_y about board Z.
+                const float beam[3] = { cosf(tx) * sinf(ty), -cosf(tx) * cosf(ty), -sinf(tx) };
                 float d[3];
                 rotate(s_att.R, beam, d);
                 const float cos_beam = -d[2];              // component pointing DOWN
@@ -3638,6 +3671,57 @@ void loop()
         }
 
         link_send(ARIADNA_PKT_POS_STATUS, &ps, sizeof(ps));
+    }
+
+    // ---- raw sensor data, on request ---------------------------------------
+    // Only while the GUI's switch is on (ARIADNA_MST_RAW_IMU in the Master's
+    // broadcast) and never in flight. Built from values already in memory:
+    // no bus transaction, and above all no IMU FIFO read - that FIFO
+    // belongs to the attitude filter alone (see accel_magnitude_g()).
+    {
+        static uint32_t next_raw_ms = 0;
+        static float    mag_cal[3] = { 0.0f, 0.0f, 0.0f };
+        static float    mag_last[3] = { 0.0f, 0.0f, 0.0f };
+        const bool want = s_have_master && (s_master.flags & ARIADNA_MST_RAW_IMU) && !in_flight;
+        if (want && (int32_t)(now_ms - next_raw_ms) >= 0) {
+            next_raw_ms = now_ms + 1000u / ARIADNA_RAW_IMU_HZ;
+            ariadna_raw_imu_t r;
+            memset(&r, 0, sizeof(r));
+            r.t_ms = now_ms;
+#if ARIADNA_USE_INSLIB
+            // INSLIB's epoch, in its FRD body = board (X, -Y, -Z) with the
+            // ComponentsUp mount set in attitude_begin(); back to board axes.
+            const ins_measurements_t &m = ins.lastMeasurements();
+            const float k_a = 1.0f / 9.80665f, k_g = (float)RAD_TO_DEG;
+            r.acc_g[0]   =  m.acc.data[0] * k_a;
+            r.acc_g[1]   = -m.acc.data[1] * k_a;
+            r.acc_g[2]   = -m.acc.data[2] * k_a;
+            r.gyr_dps[0] =  m.gyr.data[0] * k_g;
+            r.gyr_dps[1] = -m.gyr.data[1] * k_g;
+            r.gyr_dps[2] = -m.gyr.data[2] * k_g;
+            if (m.mag.is_valid) {
+                mag_cal[0] = m.mag.data[0]; mag_cal[1] = -m.mag.data[1]; mag_cal[2] = -m.mag.data[2];
+            }
+            r.src = 1;
+#else
+            r.acc_g[0] = (float)fusion.lastAx; r.acc_g[1] = (float)fusion.lastAy; r.acc_g[2] = (float)fusion.lastAz;
+            r.gyr_dps[0] = (float)fusion.lastGx; r.gyr_dps[1] = (float)fusion.lastGy; r.gyr_dps[2] = (float)fusion.lastGz;
+            r.src = 0;
+#endif
+            r.mag_ut[0] = sensor.mag.x; r.mag_ut[1] = sensor.mag.y; r.mag_ut[2] = sensor.mag.z;
+            r.mag_fresh = (r.mag_ut[0] != mag_last[0] || r.mag_ut[1] != mag_last[1] ||
+                           r.mag_ut[2] != mag_last[2]) ? 1 : 0;
+            memcpy(mag_last, r.mag_ut, sizeof(mag_last));
+#if ARIADNA_USE_INSLIB
+            memcpy(r.mag_cal_ut, mag_cal, sizeof(mag_cal));
+#else
+            memcpy(r.mag_cal_ut, r.mag_ut, sizeof(mag_cal));   // fusion keeps its fit private
+#endif
+            r.pressure_pa = last_p_pa;
+            r.temp_c      = sensor.readTemperature();
+            r.imu_hz      = (uint16_t)(s_att.hz > 0.0f ? s_att.hz : 0.0f);
+            link_send(ARIADNA_PKT_RAW_IMU, &r, sizeof(r));
+        }
     }
 
     // ---- annunciator ------------------------------------------------------

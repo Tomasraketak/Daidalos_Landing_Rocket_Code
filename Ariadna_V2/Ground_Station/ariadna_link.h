@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   323   // 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   324   // 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -137,6 +137,7 @@ typedef enum {
     ARIADNA_PKT_NONE         = 0x00,
     ARIADNA_PKT_NAV_STATE    = 0x10,  // Position -> Master -> Navigation
     ARIADNA_PKT_POS_STATUS   = 0x11,  // Position -> Master
+    ARIADNA_PKT_RAW_IMU      = 0x12,  // Position -> Master, only on request (diagnostics)
     ARIADNA_PKT_ACTUATOR     = 0x20,  // Navigation -> Master
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
@@ -460,6 +461,34 @@ typedef struct {
 } ariadna_pos_status_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 96, "pos_status layout changed");
 
+/**
+ * Raw sensor data, for debugging on the bench. Position -> Master at
+ * ARIADNA_RAW_IMU_HZ, and ONLY while the Master's state broadcast carries
+ * ARIADNA_MST_RAW_IMU (the diagnostic GUI's "raw data" switch) and the
+ * vehicle is on the ground. Nothing on the vehicle reads it; the Master
+ * prints it to the USB console as an "R" line.
+ *
+ * Everything in the TriSense's OWN axes (as printed on the board), so a
+ * board turned by hand reads exactly what the silkscreen says - no mount
+ * rotation, no frame conversion. Accelerometer and gyro are what the
+ * attitude filter was fed in its last epoch (the mean of the IMU samples
+ * in it, offset/scale calibration applied, gyro bias NOT removed); the
+ * magnetometer is given both as read and after the hard/soft-iron fit.
+ */
+typedef struct {
+    uint32_t t_ms;
+    float    acc_g[3];        // g
+    float    gyr_dps[3];      // deg/s
+    float    mag_ut[3];       // uT, as read
+    float    mag_cal_ut[3];   // uT, hard/soft iron applied
+    float    pressure_pa;
+    float    temp_c;          // barometer die
+    uint8_t  src;             // 1 INSLIB epoch, 0 TriSense fusion
+    uint8_t  mag_fresh;       // the magnetometer produced a sample since the last packet
+    uint16_t imu_hz;          // attitude epochs per second
+} ariadna_raw_imu_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 64, "raw_imu layout changed");
+
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
 #define ARIADNA_MST_RBF_OUT    (1u << 1)   // Remove-Before-Flight pin pulled
@@ -467,6 +496,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 96, "pos_status layout cha
 #define ARIADNA_MST_TEST       (1u << 3)   // test mode, pyros inhibited
 #define ARIADNA_MST_LOGGING    (1u << 4)   // flash log is running
 #define ARIADNA_MST_ABORT      (1u << 5)
+#define ARIADNA_MST_RAW_IMU    (1u << 6)   // GUI asks the Position MCU for ariadna_raw_imu_t
 
 /** Master flight state machine. Broadcast to both XIAOs at 10 Hz. */
 typedef struct {
@@ -668,6 +698,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 52, "gs serial layout chang
 #define ARIADNA_ACTUATOR_HZ    200   // Navigation -> Master servo commands
 #define ARIADNA_STATUS_HZ       20   // housekeeping both ways
 #define ARIADNA_MASTER_HZ       10   // Master state broadcast
+#define ARIADNA_RAW_IMU_HZ      25   // ariadna_raw_imu_t, only on request
 
 // ---------------------------------------------------------------------
 //  LoRa radio

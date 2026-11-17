@@ -35,6 +35,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -51,7 +52,7 @@ from PyQt6.QtCore import Qt                          # noqa: E402
 import actuator_gui as ag                            # noqa: E402
 from actuator_gui import button, chip, label, set_chip, Card   # noqa: E402
 from daidalos_widgets import (RocketView, TiltBubble, StripChart, PadMap,   # noqa: E402
-                              attitude_summary)
+                              attitude_summary, pad_quaternion)
 from diag_log import LogTab                            # noqa: E402
 from diag_ignition import IgnitionTab                # noqa: E402
 
@@ -150,7 +151,7 @@ PARAM_HELP = {
     "pos.uwb_enable": "1 = UWB kotvy se používají.",
     "pos.lidar_delay_ms": "Lidar je na vyklápěcí noze: do fúze se započítá až tolik ms po aktivaci nohou (PYRO3).",
     "pos.lidar_tilt_x_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy X.",
-    "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Y.",
+    "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Z (osa rakety je Y).",
     "g.cd_body": "Cd samotného trupu. Křidélka se přičítají z CFD. Za letu se odpor navíc měří.",
     "g.thrust_scale": "Násobek katalogové tahové křivky přistávacího motoru (statický zážeh).",
     "g.ign_delay_pad_s": "Na jak dlouhé zpoždění roznětu se výška zážehu jistí (nejhorší případ + ~0,1 s).",
@@ -212,6 +213,8 @@ class FlightSimBoard(ag.SimBoard):
         self.next_diag = 0.0
         self.which = 0
         self.list_queue: list[str] = []
+        self.raw = False
+        self.next_raw = 0.0
 
     def crc(self) -> int:
         import struct
@@ -227,7 +230,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 323 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 324 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -262,6 +265,10 @@ class FlightSimBoard(ag.SimBoard):
             return
         if c == "LOG":
             self._log_cmd(p)
+            return
+        if c == "RAW":
+            self.raw = len(p) > 1 and p[1] == "1"
+            self.q.put(f"OK RAW {1 if self.raw else 0}")
             return
         if c in ("PADREF", "CAL", "FLIGHTARM"):
             self.q.put(f"OK {line.upper()}")
@@ -340,6 +347,9 @@ class FlightSimBoard(ag.SimBoard):
         now = time.monotonic()
         if self.list_queue:
             return self.list_queue.pop(0)
+        if self.raw and now >= self.next_raw:
+            self.next_raw = now + 0.04
+            return self._raw(now - self.t0)
         if now >= self.next_diag:
             self.next_diag = now + 0.02
             self.which = (self.which + 1) % 5
@@ -347,15 +357,35 @@ class FlightSimBoard(ag.SimBoard):
                 return self._diag(self.which, now - self.t0)
         return super().readline(timeout)
 
+    def _sim_tilt(self, t: float):
+        # standing on the pad, nose up, swaying a little
+        return math.radians(2.0 + 1.5 * math.sin(t * 0.7)), t * 0.3
+
+    def _raw(self, t: float) -> str:
+        """An R line: the TriSense at rest with board -Y up (fw 3.24 mount)."""
+        tilt, az = self._sim_tilt(t)
+        n = lambda s_: round(random.gauss(0.0, s_), 4)      # noqa: E731
+        # specific force points UP (+1 g along the nose, board -Y), plus the lean
+        ax, az_ = math.sin(tilt) * math.cos(az), math.sin(tilt) * math.sin(az)
+        d = {"t": int(t * 1000), "acc": [round(ax + n(0.003), 4), round(-math.cos(tilt) + n(0.003), 4),
+                                         round(az_ + n(0.003), 4)],
+             "gyr": [n(0.05), n(0.05), n(0.05)], "mag": [round(21.0 + n(0.3), 2), round(-38.5 + n(0.3), 2),
+                                                        round(12.2 + n(0.3), 2)],
+             "magc": [round(18.0 + n(0.3), 2), round(-41.0 + n(0.3), 2), round(9.5 + n(0.3), 2)],
+             "p": round(97234.0 + n(2.0), 1), "temp": 24.6, "src": 1, "mf": 1, "hz": 200}
+        return "R " + json.dumps(d, separators=(",", ":"))
+
     def _diag(self, which: int, t: float) -> str:
         crc = self.crc()
-        tilt = math.radians(2.0 + 1.5 * math.sin(t * 0.7))
-        az = t * 0.3
-        # standing on the pad, nose up, swaying a little
-        qw, qx, qy = math.cos(tilt / 2), math.sin(tilt / 2) * math.cos(az), math.sin(tilt / 2) * math.sin(az)
-        nz = 1 - 2 * (qx * qx + qy * qy)
+        tilt, az = self._sim_tilt(t)
+        qw, qx, qy, qz = pad_quaternion(tilt, az)
+        # thrust axis u = q applied to board +Y: down on the pad
+        R = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+             [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+             [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
+        u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 323, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 324, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -365,19 +395,19 @@ class FlightSimBoard(ag.SimBoard):
             d = {"p": [round(0.05 * math.sin(t * 0.2), 2), round(0.04 * math.cos(t * 0.17), 2),
                        round(0.03 * math.sin(t), 2)],
                  "v": [0.0, 0.0, 0.0], "a": [0.0, 0.0, 0.0],
-                 "q": [round(qw, 4), round(qx, 4), round(qy, 4), 0.0],
-                 "u": [0.0, 0.0, round(-nz, 3)], "w": [round(0.01 * math.sin(t * 3), 3), 0.0, 0.0],
+                 "q": [round(qw, 4), round(qx, 4), round(qy, 4), round(qz, 4)],
+                 "u": u, "w": [round(0.01 * math.sin(t * 3), 3), 0.0, 0.0],
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 323, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 324, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 200, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 323, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 324, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -483,8 +513,8 @@ def fmt(v, nd=1, unit="", sign=False):
 # ---------------------------------------------------------------------------
 class DiagWindow(ag.MainWindow):
     def __init__(self, cfg_path: str, demo: bool, port: str | None):
-        self.d: dict[str, dict] = {"M": {}, "N": {}, "P": {}, "G": {}}
-        self.d_time: dict[str, float] = {"M": 0.0, "N": 0.0, "P": 0.0, "G": 0.0}
+        self.d: dict[str, dict] = {"M": {}, "N": {}, "P": {}, "G": {}, "R": {}}
+        self.d_time: dict[str, float] = {"M": 0.0, "N": 0.0, "P": 0.0, "G": 0.0, "R": 0.0}
         self.flight_fw = False
         self.fw_info = ""
         self.test_on = False
@@ -516,6 +546,7 @@ class DiagWindow(ag.MainWindow):
         self.tabs.addTab(self._scroll(self._build_overview()), "Přehled")
         self.tabs.addTab(self._scroll(self._build_nav_tab()), "Poloha a senzory")
         self.tabs.addTab(self._build_graphs(), "Grafy")
+        self.tabs.addTab(self._scroll(self._build_raw_tab()), "Surová data IMU")
         self.tabs.addTab(act_scroll, "Aktuátory a pyro")
         self.tabs.addTab(self._build_params(), "Parametry a časování")
         self.ign_tab = IgnitionTab(self)
@@ -767,6 +798,61 @@ class DiagWindow(ag.MainWindow):
             g.setRowStretch(r, 1)
         return w
 
+    # ------------------------------------------------------------ raw IMU
+    def _build_raw_tab(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        g = QtWidgets.QGridLayout(w)
+        g.setContentsMargins(20, 16, 20, 20)
+        g.setSpacing(12)
+        top = QtWidgets.QHBoxLayout()
+        self.raw_btn = button("Zapnout surová data", "primary")
+        self.raw_btn.setCheckable(True)
+        self.raw_btn.toggled.connect(lambda on: self.link.is_open and self.link.send(f"RAW {1 if on else 0}"))
+        top.addWidget(self.raw_btn)
+        top.addWidget(label("Position MCU posílá ~25×/s, jen na zemi. Osy desky TriSense, jak jsou "
+                            "natištěné: na rampě míří −Y nahoru (k nosu), při přistání +Y nahoru. "
+                            "V klidu na rampě má akcelerometr ukazovat ≈ (0, −1, 0) g.", "muted"))
+        top.addStretch(1)
+        g.addLayout(top, 0, 0, 1, 2)
+
+        kv = Card("Hodnoty", "Poslední vzorek")
+        self.raw_kv = KV(["Akcelerometr X / Y / Z", "|a|", "Gyroskop X / Y / Z", "|ω|",
+                          "Magnetometr surový X / Y / Z", "Magnetometr kalibrovaný X / Y / Z", "|B| kalibr.",
+                          "Barometr", "Teplota", "Zdroj / epochy"])
+        kv.lay.addWidget(self.raw_kv)
+        g.addWidget(kv, 1, 0, 3, 1, Qt.AlignmentFlag.AlignTop)
+        self.ch_raw_acc = StripChart("Akcelerometr", ["X", "Y", "Z"], "g", span_s=10.0)
+        self.ch_raw_gyr = StripChart("Gyroskop", ["X", "Y", "Z"], "°/s", span_s=10.0)
+        self.ch_raw_mag = StripChart("Magnetometr (kalibrovaný)", ["X", "Y", "Z"], "µT", span_s=10.0)
+        for i, c_ in enumerate((self.ch_raw_acc, self.ch_raw_gyr, self.ch_raw_mag)):
+            c_.setMinimumHeight(180)
+            g.addWidget(c_, 1 + i, 1)
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 2)
+        for r in (1, 2, 3):
+            g.setRowStretch(r, 1)
+        return w
+
+    def _refresh_raw(self, d: dict) -> None:
+        def v3(k, nd):
+            x = d.get(k) or [0.0, 0.0, 0.0]
+            return " / ".join(f"{c:+.{nd}f}" for c in x), math.sqrt(sum(c * c for c in x))
+        a, am = v3("acc", 3)
+        gy, gm = v3("gyr", 2)
+        m, _ = v3("mag", 1)
+        mc, mcm = v3("magc", 1)
+        kv = self.raw_kv
+        kv.set("Akcelerometr X / Y / Z", a + " g")
+        kv.set("|a|", f"{am:.3f} g", GOOD if abs(am - 1.0) < 0.04 else None)
+        kv.set("Gyroskop X / Y / Z", gy + " °/s")
+        kv.set("|ω|", f"{gm:.2f} °/s", GOOD if gm < 1.0 else None)
+        kv.set("Magnetometr surový X / Y / Z", m + " µT" + ("" if d.get("mf") else "  (bez nového vzorku)"))
+        kv.set("Magnetometr kalibrovaný X / Y / Z", mc + " µT")
+        kv.set("|B| kalibr.", f"{mcm:.1f} µT", GOOD if 25.0 < mcm < 65.0 else WARN)
+        kv.set("Barometr", f"{d.get('p', 0.0):.1f} Pa")
+        kv.set("Teplota", f"{d.get('temp', 0.0):.2f} °C")
+        kv.set("Zdroj / epochy", ("INSLIB" if d.get("src") else "TriSense fusion") + f" · {d.get('hz', 0)} Hz")
+
     def _span_changed(self) -> None:
         s = float(self.span_box.currentData())
         for c_ in self.charts:
@@ -922,13 +1008,18 @@ class DiagWindow(ag.MainWindow):
         self.flight_fw = False
         self.test_on = False
         self.test_btn.setChecked(False)
+        if hasattr(self, "raw_btn"):
+            self.raw_btn.blockSignals(True)
+            self.raw_btn.setChecked(False)
+            self.raw_btn.blockSignals(False)
+            self.raw_btn.setText("Zapnout surová data")
         if up:
             QtCore.QTimer.singleShot(500, lambda: self.link.is_open and self.link.send("PARAM LIST"))
 
     def on_line(self, line: str) -> None:
         if self.rec_writer:
             self.rec_writer.writerow([f"{time.time():.3f}", line[:1], line])
-        if len(line) > 2 and line[0] in "MNPG" and line[1] == " " and line[2] == "{":
+        if len(line) > 2 and line[0] in "MNPGR" and line[1] == " " and line[2] == "{":
             try:
                 self.d[line[0]] = json.loads(line[2:])
                 self.d_time[line[0]] = time.monotonic()
@@ -980,6 +1071,17 @@ class DiagWindow(ag.MainWindow):
             self.send_limits()
         elif line.startswith("OK TEST 0"):
             self.test_on = False
+        elif line.startswith("OK RAW"):
+            on = line.strip().endswith("1")
+            self.raw_btn.blockSignals(True)
+            self.raw_btn.setChecked(on)
+            self.raw_btn.blockSignals(False)
+            self.raw_btn.setText("Vypnout surová data" if on else "Zapnout surová data")
+        elif line.startswith("ERR RAW"):
+            self.raw_btn.blockSignals(True)
+            self.raw_btn.setChecked(False)
+            self.raw_btn.blockSignals(False)
+            self.raw_btn.setText("Zapnout surová data")
         super().on_line(line)
 
     def _prm(self, line: str) -> None:
@@ -1020,6 +1122,11 @@ class DiagWindow(ag.MainWindow):
             self.ch_loop.add(t, [d.get("loop", 0)])
         elif k == "M" and d:
             self.ch_pwr.add(t, [d.get("vbat"), d.get("i")])
+        elif k == "R" and d:
+            self.ch_raw_acc.add(t, d.get("acc", [0, 0, 0]))
+            self.ch_raw_gyr.add(t, d.get("gyr", [0, 0, 0]))
+            self.ch_raw_mag.add(t, d.get("magc", [0, 0, 0]))
+            self._refresh_raw(d)
 
     def _refresh_status(self) -> None:
         super()._refresh_status()

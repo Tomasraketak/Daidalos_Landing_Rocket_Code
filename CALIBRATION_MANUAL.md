@@ -197,11 +197,15 @@ Chyba 20 ms při 30 m/s je 0,6 m — filtr ji unese, jen pomaleji věří GPS.
 
 ### 3.6 Montáž TriSense a osa serva 1 — kontrola, ne měření
 
-Tělesové osy rakety **jsou** osy TriSense: +Z ke špičce, +X je osa, na které leží servo
-TVC 1 a křidélko 1 (`BODY_SERVO1_AXIS = {1,0,0}` v `Navigation_MCU.ino`). TriSense musí být
-namontovaný součástkami nahoru (`ComponentsUp`) a jeho osa X musí mířit ke straně serva
-TVC 1. Pokud je deska otočená, buď ji přemontujte, nebo změňte `BODY_SERVO1_AXIS` — a pak
-**znovu udělejte testy znamének** (kap. 6.4 a 6.7). Kontrola orientace: `USER_MANUAL.md`
+Tělesové osy rakety **jsou** osy TriSense. Daidalos (fw 3.24): **−Y míří ke špičce**
+(na rampě nahoru; po překlopení v apogeu je při přistání nahoře +Y), osa tahu
+přistávacího motoru je +Y, +X je osa, na které leží servo TVC 1 a křidélko 1
+(`BODY_SERVO1_AXIS = {1,0,0}` v `Navigation_MCU.ino`), +Z je druhá radiální osa. Montáž je
+zapsaná na jediném místě: `BODY_NOSE_AXIS` / `BODY_THRUST_AXIS` v `Position_MCU.ino`
+(a `BODY_NOSE` / `BODY_FIN1` v `Diagnostics/daidalos_widgets.py` pro GUI). Pokud je deska
+otočená jinak, změňte tyto konstanty nebo `BODY_SERVO1_AXIS` — a pak **znovu udělejte testy
+znamének** (kap. 6.4 a 6.7). Rychlá kontrola: záložka *Surová data IMU* — raketa svisle
+na rampě ukazuje akcelerometr ≈ (0, −1, 0) g. Kontrola orientace: `USER_MANUAL.md`
 kap. 12, krok 5.
 
 ---
@@ -227,8 +231,10 @@ Ověření: zvedněte raketu (svisle) o změřených 1,00 m → výška lidaru 1
 ### 4.2 Montážní odchylka `pos.lidar_tilt_x_deg`, `pos.lidar_tilt_y_deg`
 
 Úhel, o který paprsek lidaru míří vedle podélné osy rakety, když je noha vyklopená
-(noha nikdy nedosedne přesně). Kladná `tilt_x` = otočení kolem tělesové +X (paprsek se
-odkloní k −Y), kladná `tilt_y` = otočení kolem +Y (paprsek k +X).
+(noha nikdy nedosedne přesně). Paprsek bez odchylky míří podél špičky (tělesová −Y).
+Kladná `tilt_x` = otočení kolem tělesové +X (paprsek se odkloní k −Z), kladná `tilt_y` =
+otočení kolem +Z (paprsek k +X). (Do fw 3.23 byla druhá osa +Y — staré hodnoty `tilt_y`
+přeměřte.)
 
 **Metoda A — přímo (nejrychlejší):** raketu zavěste špičkou dolů (nebo položte na bok
 s lidarem proti stěně) tak, aby podélná osa byla přesně kolmo na stěnu ve vzdálenosti
@@ -237,13 +243,13 @@ lidar (TF-Luna svítí v blízké IR — **mobilní kamerou** je bod vidět). Od
 osy `e_x`, `e_y` ve vzdálenosti `L`:
 
 ```
-tilt = atan(e / L)        (e ve směru tělesové −Y → kladná tilt_x;  ve směru +X → kladná tilt_y)
+tilt = atan(e / L)        (e ve směru tělesové −Z → kladná tilt_x;  ve směru +X → kladná tilt_y)
 ```
 
 **Metoda B — z výšky:** raketa svisle (špičkou dolů) ve známé výšce `H` nad rovnou zemí,
 noha vyklopená. Naklánějte raketu kolem osy X o −10, 0, +10°. Výška z lidaru se mění;
 `tilt_x` je úhel, při kterém je *naměřená vzdálenost nejkratší*, s opačným znaménkem.
-Totéž kolem Y. V diagnostice nastavte nalezené hodnoty a ověřte, že výška z lidaru je při
+Totéž kolem Z (`tilt_y`). V diagnostice nastavte nalezené hodnoty a ověřte, že výška z lidaru je při
 ±10° náklonu stejná (± 2 cm).
 
 ### 4.3 Zpoždění po vyklopení `pos.lidar_delay_ms`

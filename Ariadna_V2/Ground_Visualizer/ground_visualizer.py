@@ -61,7 +61,7 @@ from haversine import haversine
 # console and live next to it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "Diagnostics"))
-from daidalos_widgets import (RocketView, TiltBubble, attitude_summary,
+from daidalos_widgets import (RocketView, TiltBubble, attitude_summary, pad_quaternion,
                               quat_from_smallest_three)
 
 # ==============================================================================
@@ -1321,8 +1321,8 @@ class GroundStation(QtWidgets.QMainWindow):
         tilt = math.radians(5 + 4 * math.sin(t * 0.9))
         az = t * 0.6
         ang = math.pi - tilt if phase >= 2 else tilt
-        quat = (math.cos(ang / 2), math.sin(ang / 2) * math.cos(az),
-                math.sin(ang / 2) * math.sin(az), 0.0)
+        # board -Y is the nose (fw 3.24 mount): daidalos_widgets builds it
+        quat = pad_quaternion(ang, az)
         if quat[0] < 0:
             quat = tuple(-c for c in quat)
 

@@ -8,8 +8,14 @@ Only PyQt6 is needed. Everything here is drawn with QPainter, so neither tool
 needs OpenGL or a 3-D library to show which way the rocket is pointing.
 
 Frames, as on the wire (ariadna_link.h): the attitude is a quaternion that
-rotates BODY vectors into pad-ENU (x East, y North, z Up). The body's +Z axis
-is the NOSE (it points up on the pad); the landing motor pushes along body -Z.
+rotates BODY vectors into pad-ENU (x East, y North, z Up). "Body" is the
+TriSense board's own axes. On Daidalos (fw 3.24) the board's -Y axis is the
+NOSE (up on the pad, down in the nose-first descent), +Y is the direction the
+landing motor pushes, +X is the radial reference axis (fin 1 / TVC servo 1).
+
+Everything here works on the quaternion and on vectors derived from it - no
+Euler angles anywhere, so nothing has a gimbal lock, including the flip at
+apogee where the nose passes through the horizontal.
 """
 from __future__ import annotations
 
@@ -30,6 +36,45 @@ def quat_matrix(w: float, x: float, y: float, z: float):
         (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
         (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
     )
+
+
+# The airframe in TriSense axes. Change these three if the board is re-mounted.
+BODY_NOSE = (0.0, -1.0, 0.0)          # nose (landing motor end)
+BODY_FIN1 = (1.0, 0.0, 0.0)           # fin 1 / TVC servo 1 radial axis
+BODY_SIDE = (0.0, 0.0, 1.0)           # NOSE x FIN1: completes the right-handed set
+
+
+def airframe(a: float, b: float, c: float):
+    """Airframe coordinates (along FIN1, SIDE, NOSE) -> TriSense body vector."""
+    return tuple(a * BODY_FIN1[i] + b * BODY_SIDE[i] + c * BODY_NOSE[i] for i in range(3))
+
+
+def quat_mul(a, b):
+    """Hamilton product a * b (w first)."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw)
+
+
+# Board -> "airframe upright" (nose = pad +Z, fin 1 = pad +X): -90 deg about X.
+_MOUNT_Q = (math.cos(math.radians(-45.0)), math.sin(math.radians(-45.0)), 0.0, 0.0)
+
+
+def pad_quaternion(tilt_rad: float, tilt_az_rad: float, roll_rad: float = 0.0):
+    """
+    Body -> pad quaternion for an airframe whose nose is tilted `tilt_rad` from
+    vertical toward compass azimuth `tilt_az_rad`, rolled `roll_rad` about its
+    own axis. tilt = pi is the nose-first descent. For simulators and tests.
+    """
+    roll = (math.cos(roll_rad / 2), 0.0, 0.0, math.sin(roll_rad / 2))          # about pad Z (= nose)
+    # tilt about the horizontal axis perpendicular to the lean direction
+    ax, ay = -math.cos(tilt_az_rad), math.sin(tilt_az_rad)
+    s = math.sin(tilt_rad / 2)
+    tilt = (math.cos(tilt_rad / 2), ax * s, ay * s, 0.0)
+    return quat_mul(tilt, quat_mul(roll, _MOUNT_Q))
 
 
 def rotate(R, v):
@@ -59,8 +104,8 @@ def attitude_summary(w: float, x: float, y: float, z: float) -> dict:
       heading   deg, compass heading of the nose's ground projection
     """
     R = quat_matrix(w, x, y, z)
-    nose = rotate(R, (0.0, 0.0, 1.0))
-    bx = rotate(R, (1.0, 0.0, 0.0))
+    nose = rotate(R, BODY_NOSE)
+    bx = rotate(R, BODY_FIN1)
     nz = max(-1.0, min(1.0, nose[2]))
     tilt = math.degrees(math.acos(abs(nz)))
     # the end that is on top leans toward...
@@ -171,7 +216,8 @@ class RocketView(QtWidgets.QWidget):
         info = attitude_summary(*self._q)
 
         def body(v):
-            return rotate(R, v)
+            # v is in airframe coordinates (fin 1, side, nose)
+            return rotate(R, airframe(*v))
 
         # body: a cylinder of radius r from z = -0.8 (tail) to z = +0.7, cone to +1.0
         r = 0.09
@@ -210,7 +256,7 @@ class RocketView(QtWidgets.QWidget):
             for k in range(3):
                 line(pts[k], pts[k + 1], pen)
 
-        # thrust: along body +Z out of the nose, tilted by the nozzle
+        # thrust: out of the nose (airframe +z), tilted by the nozzle
         if self._burn:
             sx = math.sin(math.radians(self._tvc[0] / 2.0)) * 4.0
             sy = math.sin(math.radians(self._tvc[1] / 2.0)) * 4.0
