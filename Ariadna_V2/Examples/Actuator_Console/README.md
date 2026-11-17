@@ -36,7 +36,8 @@ python -m pip install -r requirements.txt
 to `Documents/Daidalos/actuator_config.json` (or `$DAIDALOS_DATA`) — outside the code
 folder, so an update can never take it with it. An `actuator_config.json` from an older
 version (in `gui/`, or in a `Daidalos code (stara kopie …)` folder left by the Windows
-setup) is copied there automatically on the first start.
+setup) is copied there automatically on the first start. On macOS / Linux the commands are the same, with `/` in the path and
+`python3` instead of `python`.
 
 ## What is on the screen
 
