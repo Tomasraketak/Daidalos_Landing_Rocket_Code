@@ -72,6 +72,7 @@ public:
     void   begin(uint32_t) {}
     void   setTX(uint8_t) {}
     void   setRX(uint8_t) {}
+    bool   setFIFOSize(size_t) { return true; }
     int    available(void) { return 0; }
     int    availableForWrite(void) { return 256; }
     explicit operator bool() const { return true; }

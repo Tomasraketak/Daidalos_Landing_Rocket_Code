@@ -244,6 +244,10 @@ static const uint32_t ESTIMATOR_HZ = ARIADNA_NAV_STATE_HZ;   // 240 Hz
 // correlated over seconds and does not average down with more samples.
 static const uint32_t BARO_HZ = 50;
 
+// The barometer is far from the motor on Daidalos: trust it in the burn too.
+// See the call to set_baro_trust() in loop().
+static const bool BARO_TRUST_IN_BURN = true;
+
 // Diagnostics only. printf promotes float to double by language rule and
 // the RP2350 emulates double in software, so the promotion is confined
 // here to keep -Wdouble-promotion meaningful in the estimator.
@@ -334,18 +338,33 @@ struct RangeFix {
  * TF Luna lidar, I2C, on the sensor bus with the barometer, the
  * magnetometer and the UWB tag.
  *
- * The register protocol is the one in
- * https://github.com/Tomasraketak/TF-Luna-I2C-Library (TFLuna::read():
- * nine bytes from register 0x00 - distance in cm, signal strength, chip
- * temperature). That library is not instantiated here for one reason: its
- * begin() re-initialises the global `Wire` on pins of its own, and this
- * board's sensor bus is whichever of Wire / Wire1 the pinout puts on
- * D4/D5, already running at 400 kHz with three other devices on it.
+ * Follows https://github.com/Tomasraketak/TF-Luna-I2C-Library (TFLuna):
+ * the same frame read (register 0x00: distance cm, signal strength, chip
+ * temperature in 0.01 degC) and the same configuration calls - frame rate,
+ * save, I2C address. The library itself is not instantiated, because it
+ * is hard-wired to the global `Wire` and its begin() re-maps that bus's
+ * pins, while on this board the sensor bus is Wire1 (D4/D5), already
+ * running at 400 kHz with three other devices. Everything else it does is
+ * here, plus two things it does not do yet:
  *
- * WHAT IT IS FOR. Below about seven metres the barometer is inside the
- * motor's plume and the altitude it reports is wrong by up to a metre.
- * The lidar sees the ground directly, and the guidance drops its altitude
- * margin the moment it does (ARIADNA_NAV_LIDAR_OK).
+ *   * FRESH-FRAME DETECTION from the sensor's own timestamp (0x06/0x07).
+ *     The TF-Luna answers every read with its LAST frame, so before fw
+ *     3.21 a 50 Hz poll of a 100 Hz sensor was fine but any faster poll,
+ *     or a sensor that had stopped measuring, re-fused the same range as
+ *     new evidence - the over-confidence the barometer's baro_fresh flag
+ *     exists to prevent. poll() now returns true only on a new frame.
+ *   * FRAME RATE set at start-up to 250 Hz (FPS registers 0x26/0x27, not
+ *     saved to the sensor's flash), so the frame read at each 20 ms poll
+ *     is at most 4 ms old instead of 10 ms.
+ *
+ * NOTE ON THE LIBRARY: its setFrameRate() writes register 0x03 and its
+ * factoryReset() 0x3C. In the TF-Luna map those are the read-only signal
+ * high byte and nothing; the frame rate lives at 0x26/0x27 and the
+ * factory reset at 0x29 (Benewake manual; budryerson/TFLuna-I2C agrees).
+ *
+ * WHAT IT IS FOR. Near the ground the lidar sees the ground directly, and
+ * the guidance drops its altitude margin the moment it does
+ * (ARIADNA_NAV_LIDAR_OK).
  *
  * A reading is used only when it can be believed: a plausible range, a
  * signal neither too weak nor saturated, and a vehicle upright enough
@@ -353,33 +372,48 @@ struct RangeFix {
  */
 class LidarTFLuna {
 public:
+    static const uint8_t  REG_DIST   = 0x00;   // dist, flux, temp, tick: 8 bytes
+    static const uint8_t  REG_SAVE   = 0x20;
+    static const uint8_t  REG_ADDR   = 0x22;
+    static const uint8_t  REG_FPS_LO = 0x26;
+    static const uint16_t FPS        = 250;
+
     bool begin(TwoWire &wire, uint8_t i2c_addr = 0x10)
     {
         _wire = &wire;
         _addr = i2c_addr;
         _fails = 0;
-        _ok = poll(0);
+        _have_tick = false;
+        _ok = read_frame();
+        if (_ok) _fps_set = set_frame_rate(FPS);
         return _ok;
     }
 
-    /** One read, ~0.35 ms at 400 kHz. Returns true on a fresh frame. */
+    /** One read, ~0.3 ms at 400 kHz. Returns true only on a NEW frame. */
     bool poll(uint32_t now_ms)
     {
         // An absent or dead sensor is probed once a second, not fifty times.
         if (_fails >= 10 && (uint32_t)(now_ms - _last_try_ms) < 1000u) return false;
         _last_try_ms = now_ms;
 
-        _wire->beginTransmission(_addr);
-        _wire->write((uint8_t)0x00);
-        if (_wire->endTransmission() != 0)          { fail(); return false; }
-        if (_wire->requestFrom((int)_addr, 9) != 9) { fail(); return false; }
-        uint8_t b[9];
-        for (uint8_t i = 0; i < 9; i++) b[i] = (uint8_t)_wire->read();
-
-        _dist_cm  = (uint16_t)(b[0] | (b[1] << 8));
-        _strength = (uint16_t)(b[2] | (b[3] << 8));
+        const uint16_t prev_tick = _tick;
+        const bool had_tick = _have_tick;
+        if (!read_frame()) { fail(); return false; }
+        if (!_ok) {                        // came back: configure it again
+            _fps_set = set_frame_rate(FPS);
+        }
         _fails = 0;
         _ok    = true;
+        _have_tick = true;
+
+        // The same timestamp means the same frame: nothing new to fuse.
+        // (A sensor whose clock stopped looks exactly like this too, and
+        // is correctly treated as giving no information.)
+        if (had_tick && _tick == prev_tick) {
+            if (++_stale >= 25) _fix.valid = false;   // ~0.5 s of nothing
+            return false;
+        }
+        _stale = 0;
 
         // TF Luna: 0.2..8 m; below 100 the return is too weak to trust and
         // 65535 means the receiver saturated.
@@ -394,12 +428,50 @@ public:
         return true;
     }
 
+    /** Frame rate, 1..250 Hz. Volatile unless save() follows. */
+    bool set_frame_rate(uint16_t fps)
+    {
+        if (fps < 1) fps = 1;
+        if (fps > 250) fps = 250;
+        _wire->beginTransmission(_addr);
+        _wire->write(REG_FPS_LO);
+        _wire->write((uint8_t)(fps & 0xFF));
+        _wire->write((uint8_t)(fps >> 8));
+        return _wire->endTransmission() == 0;
+    }
+
+    /** Persist the current settings in the sensor's own flash. */
+    bool save(void)
+    {
+        _wire->beginTransmission(_addr);
+        _wire->write(REG_SAVE);
+        _wire->write((uint8_t)0x01);
+        return _wire->endTransmission() == 0;
+    }
+
     const RangeFix &fix(void) const { return _fix; }
     bool     healthy(void)  const { return _ok && _fails < 10; }
     uint16_t strength(void) const { return _strength; }
     float    range_m(void)  const { return (float)_dist_cm * 0.01f; }
+    float    temp_c(void)   const { return (float)_temp_cdeg * 0.01f; }
+    bool     fps_set(void)  const { return _fps_set; }
 
 private:
+    bool read_frame(void)
+    {
+        _wire->beginTransmission(_addr);
+        _wire->write(REG_DIST);
+        if (_wire->endTransmission() != 0) return false;
+        if (_wire->requestFrom((int)_addr, 8) != 8) return false;
+        uint8_t b[8];
+        for (uint8_t i = 0; i < 8; i++) b[i] = (uint8_t)_wire->read();
+        _dist_cm   = (uint16_t)(b[0] | (b[1] << 8));
+        _strength  = (uint16_t)(b[2] | (b[3] << 8));
+        _temp_cdeg = (int16_t)(b[4] | (b[5] << 8));
+        _tick      = (uint16_t)(b[6] | (b[7] << 8));
+        return true;
+    }
+
     void fail(void)
     {
         if (_fails < 255) _fails++;
@@ -410,9 +482,13 @@ private:
     TwoWire *_wire = nullptr;
     uint8_t  _addr = 0x10;
     bool     _ok   = false;
+    bool     _fps_set = false;
+    bool     _have_tick = false;
     uint8_t  _fails = 0;
+    uint8_t  _stale = 0;
     uint32_t _last_try_ms = 0;
-    uint16_t _dist_cm = 0, _strength = 0;
+    uint16_t _dist_cm = 0, _strength = 0, _tick = 0;
+    int16_t  _temp_cdeg = 0;
     RangeFix _fix  = { 0.0f, 0.0f, 0, false };
 };
 
@@ -2146,16 +2222,28 @@ static Estimator s_est;
 // weight instead of dragging the solution back along the flight path.
 #define GPS_LATENCY_S  (PRM(POS_GPS_LATENCY) * 1e-3f)
 
-/** Measured specific force magnitude, in g. Includes gravity. */
-static float accel_magnitude_g(void)
-{
-    TriSenseDataSnapshot snap;
-    if (!sensor.getSnapshot(snap)) return 1.0f;    // assume 1 g rather than 0
-    const float g2 = snap.accelX * snap.accelX +
-                     snap.accelY * snap.accelY +
-                     snap.accelZ * snap.accelZ;
-    return sqrtf(g2) * (1.0f / 9.80665f);          // library reports m/s^2
-}
+/**
+ * Measured specific force magnitude, in g. Includes gravity.
+ *
+ * Taken from the attitude source's own gravity-free acceleration, with
+ * gravity added back: |a_pad + g·ẑ| = |f_body|, independent of the
+ * rotation, so it does not matter how good the attitude is.
+ *
+ * FIXED IN fw 3.21 — TWO BUGS IN ONE LINE. This used to call
+ * sensor.getSnapshot():
+ *
+ *   1. getSnapshot() DRAINS THE IMU FIFO (it keeps only the newest
+ *      packet). INSLIB's update() reads the same FIFO, so every sample this
+ *      function swallowed was a sample the attitude filter never saw: the
+ *      INS ran at ~120 epochs/s instead of 200-240 and integrated a gyro
+ *      with holes in it. That is the "attitude all over the place" on the
+ *      bench.
+ *   2. The ICM42688 driver reports acceleration in g, not m/s^2, and the
+ *      result was divided by 9.81 once more: |a| read 0.10 g standing
+ *      still, so the pad ZUPT (needs 1 g +- 0.04) never engaged and the
+ *      Master's acceleration launch test could never trigger.
+ */
+static float accel_magnitude_g(void);   // defined after s_att, below
 
 /**
  * Standstill detector for the zero-velocity update.
@@ -2200,6 +2288,7 @@ struct Attitude {
     float w_pad[3];       // rad/s, measured rates rotated into the pad frame
     float w_abs;          // |rate| in deg/s, for the standstill detector
     float a_pad[3];       // m/s^2, gravity removed
+    bool  a_valid;        // a_pad has been produced at least once
     float roll, pitch, heading;   // deg, telemetry only
     float hz;             // update rate actually achieved
     bool  fresh;
@@ -2329,6 +2418,7 @@ static void attitude_update(bool in_flight)
     float an = 0.0f, ae = 0.0f, ad = 0.0f;
     if (ins.getAccelerationNED(an, ae, ad)) {
         s_att.a_pad[0] = ae;  s_att.a_pad[1] = an;  s_att.a_pad[2] = -ad;
+        s_att.a_valid = true;
     }
     (void)ins.getRPY(s_att.roll, s_att.pitch, s_att.heading);
     s_att.hz = (float)ins.getEpochRateHz();
@@ -2356,9 +2446,18 @@ static void attitude_update(bool in_flight)
     float ab[3];
     fusion.getLinearAcceleration(ab[0], ab[1], ab[2], ACCEL_UNIT_MS2);
     rotate(s_att.R, ab, s_att.a_pad);
+    s_att.a_valid = s_att.fresh || s_att.a_valid;
     s_att.hz = fusion.getActualFusionHz();
 #endif
     was_in_flight = in_flight;
+}
+
+static float accel_magnitude_g(void)
+{
+    if (!s_att.a_valid) return 1.0f;               // assume 1 g rather than 0
+    const float fx = s_att.a_pad[0], fy = s_att.a_pad[1];
+    const float fz = s_att.a_pad[2] + 9.80665f;   // gravity back in (up +)
+    return sqrtf(fx * fx + fy * fy + fz * fz) * (1.0f / 9.80665f);
 }
 
 // =====================================================================
@@ -3099,9 +3198,7 @@ void setup()
 
     // The Master link belongs to core 0: it transmits, so it owns the DMA
     // ring. Core 1 only receives, which needs no state of its own.
-    MASTER_PORT.setTX(PIN_MASTER_TX);
-    MASTER_PORT.setRX(PIN_MASTER_RX);
-    MASTER_PORT.begin(ARIADNA_MCU_BAUD);
+    ariadna_uart_begin(MASTER_PORT, PIN_MASTER_TX, PIN_MASTER_RX);   // 2 kB RX buffer
     ariadna_uart_tx_begin(&s_tx, uart0);   // uart0 is Serial1 on this core
     ariadna_rx_init(&s_rx);
     memset(&s_master, 0, sizeof(s_master));
@@ -3135,12 +3232,16 @@ void loop()
     // MATTERS: the return below is what makes this the idle path, so
     // anything placed after it runs at 240 Hz instead.
     ariadna_rgb_service(&s_rgb);
+    // The DMA ring is serviced on every pass, not once per tick. Serviced
+    // only per tick, a nav_state queued behind the 20 Hz status frame
+    // waited for the NEXT tick to start, and every later one inherited
+    // that 4 ms: the stream ran one tick late for good after the first
+    // status packet.
+    ariadna_uart_tx_service(&s_tx);
 
     if ((int32_t)(now - next_us) < 0) return;
     next_us += period;
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
-
-    ariadna_uart_tx_service(&s_tx);      // retire a finished DMA run
 
     // ---- deferred commands from core 1 ---------------------------------
     // Executed here because they touch the sensor buses, which belong to
@@ -3194,6 +3295,23 @@ void loop()
     if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
         float p = sensor.readPressure();
+        // PROVISIONAL PAD REFERENCE (fw 3.21). Until fw 3.20 the reference
+        // was taken only by ARIADNA_CMD_SET_PAD_REF, which the Master sends
+        // AT ARMING — but arming needs NAV_VALID, and NAV_VALID needs a pad
+        // reference. Without a manual PADREF from the GUI the vehicle could
+        // not be armed, and until then the barometer was never fused: the
+        // vertical channel dead-reckoned the accelerometer on its own and
+        // ran off to -43 km on the bench. Now the first good sample, a
+        // couple of seconds after boot (the BMP580 settles), becomes the
+        // reference; arming still re-takes it, exactly as before, so the
+        // weather between boot and launch still drops out.
+        if (!s_est.have_pad_reference() && millis() > 2000u &&
+            p > 30000.0f && p < 110000.0f) {
+            GpsFix g0;
+            const bool have0 = gps_acquire(&g0);
+            s_est.set_pad_reference(p, have0 ? &g0 : nullptr);
+            POS_PRINT("# provisional pad reference %.1f Pa (re-taken at arming)\n", p);
+        }
         if (p > 30000.0f && p < 110000.0f) {
             h_baro      = s_est.baro_altitude(p);
             baro_fresh  = s_est.have_pad_reference();
@@ -3222,12 +3340,15 @@ void loop()
     float dt = (float)(step_now - last_step_us) * 1e-6f;
     last_step_us = step_now;
 
-    // The plume corrupts the barometer during the burn. The Master tells
-    // us when that is; until then the barometer is the altitude
-    // reference. Set BEFORE the correction, not after, or the first
-    // sample of the burn goes in at full weight.
-    s_est.set_baro_trust(!(s_have_master &&
-                           s_master.state == ARIADNA_STATE_GUIDANCE));
+    // Barometer during the burn. On Daidalos the TriSense sits far enough
+    // from the nozzle that the plume does not reach its static port, so
+    // since fw 3.21 the barometer stays a full-weight altitude reference
+    // through the landing burn as well (BARO_TRUST_IN_BURN). Set it to
+    // false for an airframe where the static port IS near the motor: the
+    // filter then inflates the barometer's variance to BARO_SIGMA_BURN for
+    // the burn, as fw <= 3.20 did. Set BEFORE the correction, not after.
+    s_est.set_baro_trust(BARO_TRUST_IN_BURN ||
+                         !(s_have_master && s_master.state == ARIADNA_STATE_GUIDANCE));
 
     s_est.predict(dt, a_pad[0], a_pad[1], a_pad[2]);
     if (baro_fresh) s_est.fuse_baro(h_baro, now_ms);

@@ -69,6 +69,43 @@
 #define ARIADNA_USE_DMA_TX 1
 #endif
 
+// ---------------------------------------------------------------------
+//  RECEIVE BUFFER — THE BUG THAT KILLED THE LINK ON THE BENCH (fw 3.21)
+//
+//  arduino-pico's SerialUART keeps received bytes in a SOFTWARE ring that
+//  is only 32 bytes long unless setFIFOSize() is called BEFORE begin().
+//  At 921600 baud that is 350 us of line time, and every flight sketch
+//  reads its port once per 5 ms control tick. A Position MCU sending a
+//  94-byte nav_state at 240 Hz puts ~113 bytes on the wire per tick, so
+//  everything past the first 32 (+32 in the hardware FIFO) was silently
+//  thrown away: the bench log showed 171 good frames against 15 973 CRC
+//  failures on the Position link, and the same picture on the Navigation
+//  link. The parser then resynchronised on fragments, which is why the
+//  link "kept dropping out" and the attitude on the GUI jumped around —
+//  the GUI was being fed one stale nav_state in a hundred.
+//
+//  The bench sketches (Bench_Tests/common/bench_common.h) and the
+//  examples always called setFIFOSize(); the flight sketches did not.
+//  ARIADNA_UART_RX_FIFO is sized for the worst case of several missed
+//  ticks (a flash erase, a USB burst): 2 kB is ~22 ms of a fully loaded
+//  921600 baud line, and RAM is not short on any of these boards.
+//
+//  Call ariadna_uart_begin() instead of port.begin() — it does both, in
+//  the right order.
+// ---------------------------------------------------------------------
+#ifndef ARIADNA_UART_RX_FIFO
+#define ARIADNA_UART_RX_FIFO 2048
+#endif
+
+template <typename PortT>
+static inline void ariadna_uart_begin(PortT &port, uint8_t tx_pin, uint8_t rx_pin)
+{
+    port.setTX(tx_pin);
+    port.setRX(rx_pin);
+    port.setFIFOSize(ARIADNA_UART_RX_FIFO);   // MUST precede begin()
+    port.begin(ARIADNA_MCU_BAUD);
+}
+
 /**
  * One DMA-fed transmit port.
  *
