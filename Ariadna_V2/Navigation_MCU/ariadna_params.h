@@ -42,7 +42,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   5     // stored with the flash image (5: 232 ids - servo map and limits; 4: 200 ids)
+#define ARIADNA_PARAM_LAYOUT   6     // stored with the flash image (6: 232 ids - battery model; 5: servo map and limits; 4: 200 ids)
+// Layout 5 images (fw 3.28, 232 ids) hold zeros at ids 224..231: only the first 224 are trusted,
+// the battery model (ids 224..227, fw 3.29) starts at its defaults.
+#define ARIADNA_PARAM_ID_MAX_V5 224
 // Layout 4 images (fw 3.25-3.27, 200 ids) are still read: ids >= 200 keep their defaults.
 #define ARIADNA_PARAM_ID_MAX_V4 200
 // Ids 186..188 (gyro offset, fw 3.27) were added INSIDE layout 4: an image saved
@@ -214,7 +217,13 @@
     X(220, SRV_FIN3_MIN,    "srv.fin3_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
     X(221, SRV_FIN3_MAX,    "srv.fin3_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M') \
     X(222, SRV_FIN4_MIN,    "srv.fin4_min_us",    900.0f, 500.0f, 2500.0f, "us", 'M') \
-    X(223, SRV_FIN4_MAX,    "srv.fin4_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M')
+    X(223, SRV_FIN4_MAX,    "srv.fin4_max_us",   2100.0f, 500.0f, 2500.0f, "us", 'M') \
+    /* ---- battery model for the "time to 20 %" estimate (Master, fw 3.29, layout 6). */ \
+    /*      2S LiPo. See common/ariadna_batt.h for how they are used.                  */ \
+    X(224, BATT_CAP_MAH,    "batt.cap_mah",      2200.0f, 100.0f, 20000.0f, "mAh", 'M') \
+    X(225, BATT_HEALTH,     "batt.health",          0.90f,  0.50f,     1.00f, "-",   'M') \
+    X(226, BATT_R25_MOHM,   "batt.r25_mohm",       60.0f,   5.0f,    500.0f, "mOhm", 'M') \
+    X(227, BATT_CUTOFF_PCT, "batt.cutoff_pct",     20.0f,   0.0f,     90.0f, "%",   'M')
 
 // ---- ids --------------------------------------------------------------
 enum {

@@ -164,6 +164,12 @@ PARAM_HELP = {
     "pos.pad_lat_deg": "Zeměpisná šířka rampy (počátek navigace). 0 a 0 = nenastaveno: počátek = poloha při zastrčení. Nastavuje „Rampa = tady“.",
     "pos.pad_lon_deg": "Zeměpisná délka rampy. Viz pos.pad_lat_deg.",
     "mst.servo_check_on_rbf": "1 = po vytažení RBF Master zkontroluje připojení všech serv (pohyb 5° a proud), zastrčení počká; 0 = jen tlačítkem.",
+    "batt.cap_mah": "Kapacita baterie podle štítku, mAh (2S LiPo 2200 mAh).",
+    "batt.health": "Kolik štítkové kapacity baterie ve skutečnosti dá (1,00 = tolik, co má na štítku; 0,85 = o 15 % méně). "
+                   "Starší nebo levná baterie bývá níž. Ladění: vybijte ji známým proudem a porovnejte s výdrží, kterou GUI ukazuje.",
+    "batt.r25_mohm": "Vnitřní odpor celé baterie včetně kabeláže při 25 °C, mΩ. Slouží k dopočtu poklesu napětí pod zátěží; "
+                     "v zimě se sám zvětšuje (≈ 2× při 0 °C).",
+    "batt.cutoff_pct": "Při jakém nabití se počítá „výdrž do limitu“, %. Výchozí 20 %.",
     "mst.servo_check_ma": "Minimální nárůst proudu, při kterém se servo považuje za připojené, mA (1 krok ADC ≈ 16 mA).",
     "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Z (osa rakety je Y).",
     "g.cd_body": "Cd samotného trupu. Křidélka se přičítají z CFD. Za letu se odpor navíc měří.",
@@ -215,6 +221,8 @@ PARAM_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
      ("srv.",)),
     ("Master – start a kontroly", "detekce startu, zastrčení, kontrola serv",
      ("mst.",)),
+    ("Baterie (2S LiPo)", "kapacita, zdraví, odpor – z toho se počítá nabití a výdrž do limitu",
+     ("batt.",)),
     ("Kalibrace senzorů a rampa", "akcelerometr, gyro, magnetometr, poloha rampy (z záložky Kalibrace)",
      ("imu.", "pos.pad_")),
     ("Poloha a senzory", "GPS, lidar, UWB, orientace za letu (Position MCU)",
@@ -328,7 +336,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 328 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 329 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -495,6 +503,15 @@ class FlightSimBoard(ag.SimBoard):
              "goff": self.goff}
         return "R " + json.dumps(d, separators=(",", ":"))
 
+    @staticmethod
+    def _demo_bat(t: float) -> list:
+        """[status, soc %, minutes to the limit, open-circuit V, window s, air C, capacity mAh, mean A]"""
+        soc = max(0.0, 62.0 - 0.02 * t)
+        i = 0.42
+        left = max(0.0, soc - 20.0) * 0.01 * 1980.0
+        return [1 if soc > 20.0 else 3, round(soc, 1), round(60.0 * left / 1000.0 / i, 1) if soc > 20.0 else 0.0,
+                round(7.78 - 0.0003 * t, 2), int(min(300, t)), 21.5, 1980, i]
+
     def _diag(self, which: int, t: float) -> str:
         crc = self.crc()
         tilt, az = self._sim_tilt(t)
@@ -505,11 +522,12 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 328, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 329, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
-                 "peep": 1, "cover": 0, "hl": 0xEF, "usbdrop": 0}
+                 "peep": 1, "cover": 0, "hl": 0xEF, "usbdrop": 0,
+                 "bat": self._demo_bat(t)}
             return "M " + json.dumps(d, separators=(",", ":"))
         if which == 2:
             d = {"p": [round(0.05 * math.sin(t * 0.2), 2), round(0.04 * math.cos(t * 0.17), 2),
@@ -520,14 +538,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 328, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 329, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 328, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 329, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -785,8 +803,8 @@ class DiagWindow(ag.MainWindow):
         self.board_kv = {}
         names = {
             "M": ("Master MCU", "Pico 2 W · stav mise, serva, log, LoRa",
-                  ["Online", "Firmware", "POST", "Stav", "Baterie", "Proud", "RBF", "Breakwire",
-                   "PCA9685", "Flash log", "LoRa", "Spoj Position", "Spoj Navigation", "Aerokryt",
+                  ["Online", "Firmware", "POST", "Stav", "Baterie", "Nabití baterie", "Výdrž do limitu",
+                   "Proud", "RBF", "Breakwire", "PCA9685", "Flash log", "LoRa", "Spoj Position", "Spoj Navigation", "Aerokryt",
                    "USB zahozeno"]),
             "P": ("Position MCU", "XIAO RP2350 · senzory, odhad polohy",
                   ["Online", "Firmware", "Parametry", "Senzory", "Orientace", "Fúze Hz",
@@ -1482,6 +1500,39 @@ class DiagWindow(ag.MainWindow):
             self.ch_raw_mag.add(t, d.get("magc", [0, 0, 0]))
             self._refresh_raw(d)
 
+    @staticmethod
+    def fmt_minutes(m: float) -> str:
+        m = int(round(m))
+        return f"{m} min" if m < 120 else f"{m // 60} h {m % 60:02d} min"
+
+    def _refresh_battery(self, kv, M: dict) -> None:
+        """Charge and run time to the limit, from the Master's "bat" field
+        [status, soc %, minutes, V open-circuit, window s, air C, capacity mAh, mean A].
+        The Master recomputes it once a minute from a 5-minute mean."""
+        bat = M.get("bat")
+        if not bat or len(bat) < 8:
+            kv.set("Nabití baterie", "firmware bez odhadu (starší než 3.29)", DIM)
+            kv.set("Výdrž do limitu", "—", DIM)
+            return
+        st, soc, minutes, voc, win, tair, cap, iavg = bat[:8]
+        lim = self._pval("batt.cutoff_pct")
+        lim = 20.0 if lim is None else lim
+        if st == 0:
+            kv.set("Nabití baterie", "bez baterie / čeká na data", DIM)
+            kv.set("Výdrž do limitu", "—", DIM)
+            return
+        col = BAD if soc <= lim else (WARN if soc <= lim + 15.0 else GOOD)
+        kv.set("Nabití baterie",
+               f"{soc:.0f} %   (Voc {fmt(voc, 2, 'V')}, {tair:.0f} °C, využitelná kapacita {cap:.0f} mAh)", col)
+        if st == 3:
+            kv.set("Výdrž do limitu", f"POD LIMITEM {lim:.0f} %", BAD)
+        elif st == 2:
+            kv.set("Výdrž do limitu", f"> {self.fmt_minutes(minutes)}  (zátěž {fmt(iavg, 2, 'A')} je příliš malá na odhad)", GOOD)
+        else:
+            col = BAD if minutes < 5 else (WARN if minutes < 15 else GOOD)
+            kv.set("Výdrž do limitu",
+                   f"≈ {self.fmt_minutes(minutes)} do {lim:.0f} %   (při {fmt(iavg, 2, 'A')}, okno {int(win)} z 300 s)", col)
+
     def _refresh_status(self) -> None:
         super()._refresh_status()
         if getattr(self, "flight_fw", False) and not getattr(self, "test_on", False):
@@ -1538,6 +1589,7 @@ class DiagWindow(ag.MainWindow):
             kv.set("Stav", f"{STATE_NAMES.get(st, st)}  {STATE_CZ.get(st, '')}")
             vb = M.get("vbat", 0.0)
             kv.set("Baterie", fmt(vb, 2, "V"), BAD if 0.5 < vb < 7.0 else (WARN if vb < 7.4 else GOOD))
+            self._refresh_battery(kv, M)
             kv.set("Proud", fmt(M.get("i"), 2, "A"))
             kv.set("RBF", "vytažen" if M.get("rbf") else "zasunut", WARN if M.get("rbf") else GOOD)
             kv.set("Breakwire", "přerušen" if M.get("bw") else "celý", WARN if M.get("bw") else GOOD)

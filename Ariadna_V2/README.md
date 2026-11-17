@@ -23,6 +23,7 @@ written to be finished rather than admired.
 > | **3.10:** lidar on the folding leg — fused only `pos.lidar_delay_ms` after the leg event, never when maxed out, beam tilt from attitude and a two-axis mount offset | `Position_MCU.ino` §lidar |
 > | **3.20:** gains re-fitted on LandSim_Light's second audit; clamp planner forecasts the thrust deviation decaying back to the table (`g.plan_ts_tau_s`); free-fall drag model follows the airbrake splay the mixer really gave; fin drag (`g.fin_dcd_zero/brake`) and the band come from `landsim_export.py`; flight log readout `LOG DUMP` + `tools/daidalos_log.py` | `common/guidance.cpp`, `Master_MCU.ino`, [`../CALIBRATION_MANUAL.md`](../CALIBRATION_MANUAL.md) |
 > | **3.21 (bench fixes):** inter-MCU UARTs get a 2 kB receive buffer (`ariadna_uart_begin()`; the arduino-pico default of 32 B lost ~99 % of frames) and are drained on every loop pass; the Position MCU no longer drains the IMU FIFO behind INSLIB's back (attitude ran at ~120 Hz on half the samples) and reports \|a\| in g correctly (was 0.10 g → no pad ZUPT, no launch-by-acceleration); provisional pad reference at boot (the barometer was not fused until arming, and arming needed it); barometer trusted through the burn; TF-Luna fresh-frame detection + 250 Hz | `common/ariadna_uart_dma.h`, `Position_MCU.ino` |
+> | **3.29:** battery state of charge and time until 20 % in the diagnostic console: 5-minute mean of voltage, current (ACS712) and air temperature, recomputed once a minute; I·R(T) sag added back, LiPo resting-voltage table, capacity derated for a worn pack, cold and high current (`batt.*` parameters, layout 6, layout-5 images still load); `make batt` | `common/ariadna_batt.h`, `Master_MCU.ino` §7, `Diagnostics/` |
 > | **3.28:** servo channel map and per-servo pulse limits are Master parameters (`srv.ch_*`, `srv.*_min_us/_max_us`; param layout 5, 232 ids, layout-4 images still load), default map TVC 5/6, clamp 7, cover 8, fins 9–12; diagnostic console servo table reads/writes them; graphs with grid and axis labels; ground station map on the 15 cm/px CUZK orthophoto, pad taken from the rocket's telemetry | `Master_MCU.ino` §3, `Diagnostics/`, `Ground_Visualizer/` |
 > | **3.27:** gyro zero offset saved by the GUI as `imu.gyr_off_*` and used when the boot calibration is > 1 °/s from it (vehicle moved while booting); raw IMU packet carries the offset (88 B); GUI: spare servo outputs get controls, parameter editor grouped by topic | `Position_MCU.ino` §gyro, `Diagnostics/` |
 | USB diagnostic console (non-blocking), TEST mode with the Actuator Console built in | `Master_MCU.ino` §13, `Diagnostics/daidalos_diag.py` |
@@ -803,6 +804,7 @@ This matters more than anything else in this README.
 | **link codec** | 111 checks: round trip, CRC, resync after garbage, 2000-frame randomly corrupted stream, transmit ring, link budget. |
 | **navigation filter** | 47 checks: `make est`, including the barometer trim observer. `ariadna_kf.h` compiles unchanged into the test and into the sketch, so the arithmetic checked is the arithmetic that flies. |
 | **UWB multilateration** | 108 checks: `make uwb`. Every degraded case — four anchors down to one and none, NaN and negative ranges, coincident and collinear anchors, a 10 m reflection, a 600-trial Monte Carlo the quoted σ must match, the whole descent profile from 50 m/s down, and the vertical envelope to the ground. `ariadna_uwb.h` likewise compiles unchanged into both. |
+| **battery estimate** | 59 checks: `make batt`. The resting-voltage table, sag compensation (same charge reads the same at 0.5 and 6 A), cold / worn pack / heavy load each shorten the run time, the 5-minute window and the once-a-minute refresh, bad inputs, a simulated discharge. The voltage table and resistance are typical LiPo values - **tune `batt.health` on your pack**. |
 | **header copies** | `make sync` proves every sketch's copy of the guidance module and of `common/` is byte-identical to the original. |
 | **Python decoder** | `make pyfmt` pins the visualiser's struct format against the C header. |
 | **Navigation sketch** | compiles clean under `-Wall -Wextra -Wdouble-promotion`. |
@@ -861,6 +863,7 @@ make          # 124 guidance checks against the simulation
 make est      # 47 navigation filter and barometer-trim checks
 make uwb      # 108 UWB checks: degraded constellations and a moving vehicle
 make link     # 111 link codec checks, the transmit ring, and the link budget
+make batt     # 59 battery state-of-charge / run-time checks
 make sync     # every sketch's copy of guidance and common/ matches the original
 make pyfmt    # ground_visualizer.py matches the C packet layout
 make syntax   # host-compile the sketches that can be host-compiled

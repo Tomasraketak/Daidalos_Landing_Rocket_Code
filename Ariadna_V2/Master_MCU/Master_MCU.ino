@@ -70,6 +70,7 @@
 #include "guidance.h"
 #include "ariadna_params.h"
 #include "ariadna_seq.h"        // ARIADNA_EV_* event bits, for the downlink
+#include "ariadna_batt.h"       // battery state of charge and time to 20 % (fw 3.29)
 #include "actcon_pyro.h"        // bench pyro bridge, TEST mode only
 
 #include <Arduino.h>
@@ -353,6 +354,7 @@ static uint32_t s_state_since = 0;
 
 static float    s_vbat        = 0.0f;
 static float    s_current     = 0.0f;
+static batt_t   s_batt;                          // 5 min window, estimate refreshed once a minute
 static bool     s_rbf_out     = false;
 
 static volatile bool s_flash_ok = false;                // core 1 reads this
@@ -1168,6 +1170,7 @@ static inline bool link_alive(uint32_t last_us)
 // =====================================================================
 //  7. ANALOGUE MONITORING
 // =====================================================================
+
 static void read_analogue(void)
 {
     // Slow-averaged: these feed telemetry and the arming interlock, not a
@@ -1239,6 +1242,30 @@ static inline bool nav_status_fresh(void)
 static inline bool pos_status_fresh(void)
 {
     return s_have_pos_status && (millis() - s_pos_status_ms) < 500;
+}
+
+/**
+ * Battery run-time estimate (common/ariadna_batt.h): one sample per second
+ * of the filtered pack voltage, current and the air temperature, a new
+ * estimate once a minute from the last five. The air temperature is the
+ * Position MCU's barometer; without a fresh status packet the model uses
+ * 20 C, not zero.
+ */
+static void batt_service(void)
+{
+    static uint32_t next_ms = 0;
+    const uint32_t now = millis();
+    if (now < 3000) return;                    // let the ADC filter settle after boot
+    if ((int32_t)(now - next_ms) < 0) return;
+    next_ms = now + 1000;
+
+    batt_cfg_t c;
+    c.cap_mah    = PRM(BATT_CAP_MAH);
+    c.health     = PRM(BATT_HEALTH);
+    c.r25_mohm   = PRM(BATT_R25_MOHM);
+    c.cutoff_pct = PRM(BATT_CUTOFF_PCT);
+    const float t_air = pos_status_fresh() ? s_pos_status.temp_c : BATT_T_DEFAULT_C;
+    (void)batt_feed_1hz(&s_batt, &c, s_vbat, s_current, t_air);
 }
 
 /** Both other boards report the CRC of the parameter table held here. */
@@ -1658,6 +1685,10 @@ static uint16_t pimg_ids(const ParamImage *im)
 {
     if (im->magic != PARAM_MAGIC) return 0;
     if (im->layout == ARIADNA_PARAM_LAYOUT) return ARIADNA_PARAM_ID_MAX;
+    // Layout 5 (fw 3.28): 232 ids, and its CRC covers all 232. The battery model
+    // (224..227) did not exist yet and the image holds zeros there - see
+    // pimg_trusted_ids(): those start at their defaults.
+    if (im->layout == 5) return ARIADNA_PARAM_ID_MAX;
     // Layout 4 (fw 3.25..3.27): 200 ids. The servo map and limits (ids
     // 200..223) start at their defaults, everything else is kept.
     if (im->layout == 4) return ARIADNA_PARAM_ID_MAX_V4;
@@ -1665,6 +1696,14 @@ static uint16_t pimg_ids(const ParamImage *im)
     // ids does not throw away a calibrated vehicle's servo trims.
     if (im->layout == 3) return ARIADNA_PARAM_ID_MAX_V3;
     return 0;
+}
+
+/** How many of those ids hold values somebody actually set (the CRC covers more for layout 5). */
+static uint16_t pimg_trusted_ids(const ParamImage *im)
+{
+    const uint16_t n = pimg_ids(im);
+    if (im->layout == 5 && n > ARIADNA_PARAM_ID_MAX_V5) return ARIADNA_PARAM_ID_MAX_V5;
+    return n;
 }
 
 static bool pimg_valid(const ParamImage *im)
@@ -1721,7 +1760,7 @@ static void params_apply_image(const ParamImage *im)
     // Through ariadna_param_set(), so a stored value outside today's range
     // is clamped rather than trusted, and an id the image does not know
     // keeps its default.
-    const uint16_t n = pimg_ids(im);
+    const uint16_t n = pimg_trusted_ids(im);
     for (uint8_t i = 0; i < ARIADNA_PARAM_COUNT; i++) {
         uint8_t id = ARIADNA_PARAM_INFO[i].id;
         if (id < n) (void)ariadna_param_set(&s_params, id, im->v[id]);
@@ -2500,7 +2539,7 @@ static void diag_emit(void)
     if (millis() < next_ms) return;
     next_ms = millis() + 20;
 
-    char b[400];
+    char b[512];            // the M line alone is ~330 characters (fw 3.29: with the battery estimate)
     int n = 0;
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wdouble-promotion\"")
@@ -2568,7 +2607,8 @@ static void diag_emit(void)
             "M {\"t\":%lu,\"fw\":%d,\"gv\":%d,\"st\":%u,\"fl\":%u,\"tl\":%lu,\"vbat\":%.2f,\"i\":%.2f,"
             "\"rbf\":%d,\"bw\":%d,\"post\":%d,\"servo\":%d,\"flash\":%d,\"lora\":%d,\"log\":%lu,"
             "\"logdrop\":%lu,\"tlm\":[%lu,%lu],\"pos\":[%lu,%lu,%d],\"nav\":[%lu,%lu,%d],"
-            "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu}\n",
+            "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu,"
+            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.1f]}\n",
             (unsigned long)millis(), ARIADNA_FW_VERSION, DG_VERSION, s_state, s_flags,
             (unsigned long)s_t_launch_ms, s_vbat, s_current, s_rbf_out ? 1 : 0,
             digitalRead(PIN_BREAKWIRE) == HIGH ? 1 : 0, s_post_pass ? 1 : 0, s_servo_ok ? 1 : 0,
@@ -2579,7 +2619,9 @@ static void diag_emit(void)
             (unsigned long)s_rx_nav.rx_ok, (unsigned long)(s_rx_nav.rx_crc + s_rx_nav.rx_len),
             (s_have_act && link_alive(s_act_us)) ? 1 : 0,
             s_param_crc, params_synced() ? 1 : 0, s_params_from_flash ? 1 : 0,
-            s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped);
+            s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped,
+            (unsigned)s_batt.status, s_batt.soc_pct, s_batt.minutes, s_batt.v_oc,
+            (unsigned)s_batt.win_s, s_batt.t_avg, s_batt.cap_eff_mah, s_batt.i_avg);
         break;
     case 2:         // N: the navigation state
         n = snprintf(b, sizeof(b),
@@ -2683,6 +2725,7 @@ void setup()
     // waiting in setup1(), so the bus is ours.
     s_flash_ok = flash_begin();
     params_load();
+    batt_init(&s_batt);
 
     // 0xFF: the SK6812 is powered from the board's own rail, so there is
     // no LED power-enable pin to drive as there is on the XIAOs.
@@ -2770,6 +2813,7 @@ void loop()
 
     // ---- housekeeping ---------------------------------------------------
     read_analogue();
+    batt_service();       // battery run-time estimate, 1 Hz feed (section 7)
     srvchk_service();     // servo connection check, when one is running (section 3b)
     state_machine();
     params_stream();

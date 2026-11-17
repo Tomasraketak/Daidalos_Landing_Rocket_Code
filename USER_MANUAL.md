@@ -486,6 +486,42 @@ složky s kódem je tedy nikdy nesmaže. Starý `actuator_config.json` ze složk
 
 ![Diagnostická konzole](Ariadna_V2/Diagnostics/screenshot.png)
 
+### Baterie: nabití a výdrž do 20 %
+
+V kartě **Master MCU** na záložce Přehled jsou dva řádky, které počítá přímo Master
+(`common/ariadna_batt.h`, jednou za minutu z pětiminutového průměru):
+
+* **Nabití baterie** — stav nabití v % a čím se k němu došlo (napětí naprázdno, teplota vzduchu,
+  kapacita, kterou model počítá jako využitelnou);
+* **Výdrž do limitu** — za jak dlouho při **současné zátěži** klesne nabití na limit (výchozí 20 %,
+  `batt.cutoff_pct`). Zelená > 15 min, žlutá 5–15 min, červená < 5 min nebo už pod limitem.
+
+Vstupy jsou napětí z děliče, proud z ACS712 a **teplota** z barometru Position MCU (když Position
+neposílá, počítá se s 20 °C). Master vzorkuje 1×/s do okna 300 s, první odhad je po 10 s dat
+(v řádku je vidět „okno N z 300 s“), pak se obnovuje každou minutu.
+
+Jak se číslo dělá:
+
+1. **Pokles napětí pod zátěží.** Změřené napětí není nabití — baterie pod proudem „sedne“ o `I · R`.
+   Model proto přičte zpět `I · R(T)` a dostane napětí naprázdno. Odpor `R(T) = batt.r25_mohm · e^(0,03·(25−T))`
+   — při 0 °C je zhruba dvojnásobný.
+2. **Napětí článku → %.** Z tabulky napětí naprázdno běžného LiPo (4,20 V = 100 %, 3,73 V = 20 %, 3,27 V = 0 %).
+3. **Skutečná kapacita je menší než štítek:**
+   `C = batt.cap_mah · batt.health · f(teplota) · f(proud)`.
+   `batt.health` je ruční korekce pro starší/levnou baterii (0,90 výchozí = baterie dá 90 % štítku);
+   `f(teplota)` = 1,00 od 25 °C a výš, pak −1 % na stupeň (0,75 při 0 °C, nejméně 0,5);
+   `f(proud)` = ztráta při velkém odběru (Peukert 1,05 nad 1C = 2,2 A, nejvýš −20 %) a nikdy bonus pro malý odběr.
+4. **Výdrž** = (nabití − limit) · C / průměrný proud, nejvýš 999 min. Pod 0,1 A je zátěž na odhad příliš malá
+   (šum ACS712 je ~0,1 A): řádek ukáže „> 999 min“ a nabití v % platí dál.
+
+**Ladění na vaši baterii** (doporučeno, hodnoty jsou obecné): nabijte ji naplno, zapojte stálou zátěž (např. serva
+v TEST režimu) a změřte, za jak dlouho klesne na limit. Poměr skutečné a ukázané výdrže vynásobte do `batt.health`.
+Pokud nabití při plné baterii neukazuje ~100 %, pravděpodobně nesedí dělič napětí (`VBAT_DIVIDER`) nebo je
+jiný vnitřní odpor — upravte `batt.r25_mohm` (2S 2200 mAh: 40–80 mΩ včetně kabelů).
+
+Odhad je **při současné zátěži**: na rampě (serva stojí, ~0,2–0,5 A) vyjde výdrž dlouhá, za letu bude odběr
+řádově vyšší. Číslo na rampě tedy říká „kolik ještě vydrží na stole“, ne „kolik vydrží let“.
+
 ### Proč nezdržuje let
 
 Master posílá diagnostiku **jen když má port otevřený počítač**. Text jde do RAM bufferu a
@@ -659,6 +695,7 @@ python Ground_Visualizer\ground_visualizer.py
 | `fin.*` | Navigation | křidélka: povolení, mez, brzda, režim při stoupání, drift, adaptace |
 | `srv.*` | Master | kalibrace serv: střed, µs/°, **znaménka**, klapka, aerokryt; od fw 3.28 i **kanál každého serva** (`srv.ch_*`) a **tvrdé min/max pulzu** (`srv.*_min_us/_max_us`) — nejsnáz z tabulky serv v záložce *Aktuátory* tlačítky **Načíst z rakety** / **Zapsat do rakety** (PARAM SET + SAVE, trvale ve flash) |
 | `mst.*` | Master | práh detekce startu, automatické zastrčení |
+| `batt.*` | Master | model baterie pro odhad nabití a výdrže (kap. 9, „Baterie“): štítková kapacita, zdraví, vnitřní odpor, limit |
 | `pos.*` | Position | **zpoždění GPS**, lidar (povolení, offset, dosah, **zpoždění po vyklopení nohou**, **montážní odchylka X/Y**), orientace jen z gyra, UWB |
 
 Tabulka se ukládá na flash čip W25Q128 (kap. 9); rozložení verze 3 (164 hodnot; verze 3
@@ -763,6 +800,7 @@ make guid         # navedení vs. simulace + let v uzavřené smyčce (6-DOF)
 make seq          # sekvencer událostí a tabulka parametrů
 make est / uwb    # Kalmanův filtr, UWB
 make link / pyfmt # protokol, Python dekodér
+make batt         # nabití a výdrž baterie: tabulka, pokles napětí, teplota, okno 5 min
 make syntax       # překlad sketchů proti náhradním hlavičkám
 make tables SIM=../../LandSim_Light   # přegenerovat tabulky ze simulace
 ```

@@ -7,6 +7,7 @@
 #   make uwb      Ariadna V2 UWB multilateration
 #   make uwblink  Ariadna V2 UWB tag I2C frame codec
 #   make link     Ariadna V2 inter-processor link codec
+#   make batt     Ariadna V2 battery state of charge and run-time estimate
 #   make syntax   compile the sketches against a stub Arduino header
 #   make sync     verify the sketches' copies of guidance and common/ headers
 #   make pyfmt    verify ground_visualizer.py decodes the current packet
@@ -78,6 +79,18 @@ link: link_test
 
 link_test: link_test.cpp $(LINK_H)
 	$(CXX) $(CXXFLAGS) -o link_test link_test.cpp
+
+# ---------------------------------------------------------------------
+# Battery state of charge and run time to 20 % (fw 3.29). Header only, no
+# Arduino dependency: this test and Master_MCU.ino compile the same file.
+# ---------------------------------------------------------------------
+BATT_H  = $(V2)/common/ariadna_batt.h
+
+batt: batt_test
+	./batt_test
+
+batt_test: batt_test.cpp $(BATT_H)
+	$(CXX) $(CXXFLAGS) -o batt_test batt_test.cpp -lm
 
 # ---------------------------------------------------------------------
 # Ariadna V2 navigation filter. ariadna_kf.h compiles unchanged into
@@ -153,6 +166,7 @@ SYNC_PAIRS = \
   $(V2)/common/actcon_pyro.h:$(V2)/Master_MCU/actcon_pyro.h \
   $(V2)/common/ariadna_link.h:$(V2)/Master_MCU/ariadna_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Master_MCU/ariadna_uart_dma.h \
+  $(V2)/common/ariadna_batt.h:$(V2)/Master_MCU/ariadna_batt.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Master_MCU/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Position_MCU/ariadna_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
@@ -267,7 +281,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink link sync pyfmt calib syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink link batt sync pyfmt calib syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -276,4 +290,4 @@ golden:
 
 clean:
 	rm -f host_test guid_test seq_test link_test est_test uwb_test uwb_link_test actcon_test
-.PHONY: all guid seq tables est uwb uwblink link sync sync-fix pyfmt syntax check golden clean actcon
+.PHONY: all guid seq tables est uwb uwblink link batt sync sync-fix pyfmt syntax check golden clean actcon

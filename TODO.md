@@ -24,6 +24,7 @@ Odkazy: [`USER_MANUAL.md`](USER_MANUAL.md), [`CALIBRATION_MANUAL.md`](CALIBRATIO
 | ☐ | **fw 3.21: link na stole** | GUI → řádek *M*: `pos`/`nav` = [dobré, vadné, živý]; vadné rámce mají růst jen výjimečně, `ok` trvale 1; *P* `hz` ≈ 200–240 (dřív 121); *N* `g` ≈ 1,00 v klidu a `p` drží ~0 m |
 | ☐ | **fw 3.24: montáž TriSense (−Y = špička)** | záložka *Surová data IMU*: raketa svisle na rampě → akcelerometr ≈ (0, −1, 0) g; *Přehled*: 3-D raketa stojí, náklon < 2°; položit špičkou na sever / východ → směr náklonu 0° / 90°; obrátit špičkou dolů → „špička DOLŮ“, tah nahoru. Ověřit, že INSLIB se na rampě (roll desky ±90°) zarovná a nedrifuje |
 | ☐ | **fw 3.25: kalibrace z GUI, rampa, kontrola serv** | po nahrání: parametry ze starého flash zůstaly (servo trimy); kalibrace akcelerometru a magnetometru v záložce Kalibrace a kontrola v *Surová data IMU*; „Rampa = tady“ s 3D fixem; kontrola serv: odpojit jedno servo → „NEREAGUJE“, připojená → „připojeno“; pokud šum proudu dělá falešné výsledky, upravit `mst.servo_check_ma` |
+| ☐ | **fw 3.29: odhad baterie** | *Přehled → Master MCU*: „Nabití baterie“ a „Výdrž do limitu“. Plně nabitá 2S → ~100 % a velká výdrž; po 10 s od zapnutí se objeví první odhad, pak se mění 1×/min; připojit stálou zátěž a ověřit, že výdrž odpovídá (podíl skutečné/ukázané → `batt.health`); v zimě ověřit teplotu (Position `temp`) a že výdrž klesá; zkontrolovat, že po SAVE/restartu `batt.*` drží a že starý flash (layout 5) se načte |
 | ☐ | **fw 3.28: kanály a limity serv z GUI, mapa ČÚZK** | po nahrání: Master USB „servo map: TVC X 5 …“; *Aktuátory → Načíst z rakety* ukáže 5/6/7/8/9–12; změnit kanál nebo Max → *Zapsat do rakety* → restart → hodnoty drží; servo se za letového příkazu nedostane za Max; kontrola serv hlásí správná serva; pozemní stanice: MAP ⭳ PAD stáhne ortofoto, rampa „(rocket)“ sedí s místem rakety |
 | ☐ | **fw 3.27: offset gyra do flash, serva 9–16, skupiny parametrů** | *Kalibrace → Kalibrovat gyro* → „Offset … uložen do flash ✓“ a v *Parametry → Kalibrace senzorů a rampa* jsou `imu.gyr_off_*`; restart s raketou v klidu → Position USB „agrees with the saved one“, restart při pohybu → „using the saved one“. *Aktuátory → Volné výstupy* (TEST): serva 9–16 se hýbou |
 | ☐ | **fw 3.26: rychlost fúze** | GUI *Přehled → Position MCU → Fúze Hz* ≈ 230–240 (dřív 120); *Navigation → Smyčka max* a *Přetečení* Position bez zhoršení |
@@ -49,7 +50,7 @@ Odkazy: [`USER_MANUAL.md`](USER_MANUAL.md), [`CALIBRATION_MANUAL.md`](CALIBRATIO
 |---|---|
 | ☐ | Akcelerometr (6 poloh) a magnetometr (MotionCal) → konstanty v `Position_MCU.ino` |
 | ☐ | Deklinace místa startu |
-| ☐ | Dělič baterie, ACS712, práh kontinuity roznětů |
+| ☐ | Dělič baterie, ACS712, práh kontinuity roznětů; **model baterie** (`batt.health`, `batt.r25_mohm`) vybitím známým proudem |
 | ☐ | Serva: střed, µs/°, **znaménka**, klapka, aerokryt, kontrola aerobrzdy 4 × 15° |
 | ☐ | Lidar: offset, odchylka, zpoždění nohy, dosah na povrchu místa přistání |
 | ☐ | UWB: zaměření kotev (před každým letem), zpoždění antén |

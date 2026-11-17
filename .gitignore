@@ -15,3 +15,4 @@ test/actcon_test
 Ariadna_V2/Examples/Actuator_Console/gui/actuator_config.json
 guid_test
 seq_test
+test/batt_test
