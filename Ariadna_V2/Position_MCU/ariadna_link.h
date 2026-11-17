@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   321   // 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   322   // 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants

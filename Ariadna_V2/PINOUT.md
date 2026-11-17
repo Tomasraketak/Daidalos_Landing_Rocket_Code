@@ -267,7 +267,7 @@ floats, and the outputs then depend on the breakout's own pull-down on /OE.
 |---|---|---|
 | 2S LiPo | Control MCU GP27 via a 3:1 divider | `VBAT_DIVIDER` in `Master_MCU.ino` |
 | current | Control MCU GP26, ACS712 | 5 V part, 100 mV/A, 2:1 divider — zero at 1.252 V on the pin |
-| RBF | Control MCU GP28, pull-up | tag fitted = pin grounded = pyros inhibited |
+| RBF | Control MCU GP28, pull-up | tag fitted = pin HIGH = pyros inhibited; tag removed = pin LOW (`RBF_REMOVED_IS_HIGH 0`) |
 | breakwire | Control MCU GP10, pull-up | broken = launch detected |
 | pyro arming | Navigation MCU, `pyro_permitted()` | requires the Master's armed state |
 

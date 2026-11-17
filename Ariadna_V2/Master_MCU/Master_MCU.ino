@@ -173,10 +173,18 @@ static const float ACS712_ZERO_V   = 2.504f;   // output at 0 A, at the sensor
 static const float ACS712_V_PER_A  = 0.100f;   // 20 A part: 100 mV/A
 static const float ACS712_DIVIDER  = 0.50f;    // pin volts / sensor volts
 
-// RBF: pin pulled to ground while the tag is fitted. Removing it lets the
-// pull-up take the pin high, which is the ARMED-permissive state. Fail
-// safe: a broken wire reads LOW, which inhibits arming.
-#define RBF_REMOVED_IS_HIGH  1
+// RBF polarity, as WIRED on Daidalos (checked on the bench, fw 3.22): the
+// pin reads HIGH (internal pull-up) while the tag is FITTED and is pulled
+// LOW once the tag is REMOVED. fw <= 3.21 assumed the opposite, so the
+// diagnostic GUI showed the tag inverted - and, worse, the arming
+// interlock and TEST mode treated a fitted tag as "removed".
+//
+// Still fail safe: a broken or unplugged RBF wire leaves the pull-up
+// reading HIGH, i.e. "fitted", which inhibits arming.
+//
+// 1 = removed reads HIGH (tag shorts the pin to ground while fitted)
+// 0 = removed reads LOW  (Daidalos)
+#define RBF_REMOVED_IS_HIGH  0
 
 // ---- PCA9685 ----------------------------------------------------------
 static const uint8_t PCA_ADDR = 0x40;
