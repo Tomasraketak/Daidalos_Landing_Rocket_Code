@@ -343,7 +343,7 @@ class LogTab(QtWidgets.QWidget):
         rows = self.selected()
         if not rows:
             return
-        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export záznamu", "let.csv", "CSV (*.csv)")
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export záznamu", ag.user_path("let.csv"), "CSV (*.csv)")
         if not f:
             return
         cols = ["flight", "rec"] + [k for k in rows[0] if k not in ("flight", "rec")]
@@ -354,7 +354,7 @@ class LogTab(QtWidgets.QWidget):
         self.win.log(f"# záznam: {len(rows)} řádků -> {f}")
 
     def open_csv(self) -> None:
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "CSV záznamu", "", "CSV (*.csv)")
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "CSV záznamu", ag.user_dir(), "CSV (*.csv)")
         if f:
             self.load_csv(f)
 

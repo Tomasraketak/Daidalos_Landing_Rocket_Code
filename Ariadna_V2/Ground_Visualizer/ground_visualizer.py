@@ -67,7 +67,30 @@ from daidalos_widgets import (RocketView, TiltBubble, attitude_summary, pad_quat
 # ==============================================================================
 #  Configuration
 # ==============================================================================
-CACHE_DIR = os.path.join(os.getcwd(), "map_cache")
+# Map tiles and recordings live in <Documents>/Daidalos (or $DAIDALOS_DATA),
+# shared with the diagnostic console - never in the code folder, which an
+# update replaces. A map_cache/ left in the working directory by an older
+# version is moved there once.
+def _user_dir() -> str:
+    base = os.environ.get("DAIDALOS_DATA", "")
+    if not base:
+        docs = QtCore.QStandardPaths.writableLocation(
+            QtCore.QStandardPaths.StandardLocation.DocumentsLocation) or os.path.expanduser("~")
+        base = os.path.join(docs, "Daidalos")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+USER_DIR = _user_dir()
+CACHE_DIR = os.path.join(USER_DIR, "map_cache")
+for _old in {os.path.join(os.getcwd(), "map_cache"),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), "map_cache")}:
+    if os.path.isdir(_old) and not os.path.exists(CACHE_DIR):
+        try:
+            import shutil
+            shutil.move(_old, CACHE_DIR)
+        except OSError:
+            pass
 
 # Target pad location (Czech Rocket Challenge).
 PAD_LAT = 49.7985411
@@ -1181,7 +1204,7 @@ class GroundStation(QtWidgets.QMainWindow):
 
     def toggle_recording(self):
         if not self.is_recording:
-            filename = datetime.now().strftime("%Y_%m_%d_%H_%M_ariadna.csv")
+            filename = os.path.join(USER_DIR, datetime.now().strftime("%Y_%m_%d_%H_%M_ariadna.csv"))
             self.csv_file = open(filename, "a", newline="")
             self.csv_writer = csv.writer(self.csv_file)
             if os.stat(filename).st_size == 0:

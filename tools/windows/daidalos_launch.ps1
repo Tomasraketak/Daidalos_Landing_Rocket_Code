@@ -145,6 +145,10 @@ if ($LASTEXITCODE -ne 0) { Fail "V prostredi chybi PyQt6 / pyserial / numpy a ne
 
 $env:DAIDALOS_LANDSIM = $LandSim       # the ignition tab's LandSim_Light folder
 Say "Spoustim diagnostiku..."
-Start-Process -FilePath $VPyW -ArgumentList "`"$diag`"" -WorkingDirectory (Split-Path $diag)
+# Started in <Documents>\Daidalos, where the GUI keeps the servo configuration,
+# recordings and exports - never in the code folder, which updates replace.
+$data = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Daidalos"
+New-Item -ItemType Directory -Force -Path $data | Out-Null
+Start-Process -FilePath $VPyW -ArgumentList "`"$diag`"" -WorkingDirectory $data
 try { Stop-Transcript | Out-Null } catch {}
 Start-Sleep -Seconds 2

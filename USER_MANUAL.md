@@ -470,6 +470,12 @@ sledovaných souborů odloží do `git stash`), jednou denně Python, vždy vše
 spustí, co je na disku. Záznam: `%LOCALAPPDATA%\Daidalos\launch.log`. Skripty:
 `tools/windows/`.
 
+**Vaše soubory jsou mimo složku s kódem:** nastavení serv (`actuator_config.json`),
+nahrávky CSV, exporty parametrů, `vehicle.json` a mapové dlaždice pozemní vizualizace se
+ukládají do **`Dokumenty\Daidalos`** (jinam: proměnná prostředí `DAIDALOS_DATA`). Aktualizace
+složky s kódem je tedy nikdy nesmaže. Starý `actuator_config.json` ze složky s kódem (nebo ze
+„stara kopie“) se při prvním spuštění převezme sám.
+
 ![Diagnostická konzole](Ariadna_V2/Diagnostics/screenshot.png)
 
 ### Proč nezdržuje let

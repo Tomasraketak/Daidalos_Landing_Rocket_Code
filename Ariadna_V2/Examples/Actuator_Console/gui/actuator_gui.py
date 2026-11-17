@@ -44,7 +44,58 @@ except ImportError:  # the demo still runs without pyserial
 
 APP_NAME = "Daidalos · Aktuátory a pyro"
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG = os.path.join(HERE, "actuator_config.json")
+
+
+# ---------------------------------------------------------------------------
+#  Where the user's own files live: NOT in the code checkout
+#
+#  Servo configuration, recordings, exported profiles and the map cache all
+#  go to <Documents>/Daidalos (or $DAIDALOS_DATA). The code folder is replaced
+#  wholesale by an update (git, a new ZIP, the Windows launcher's re-clone),
+#  and anything kept in it went with it.
+# ---------------------------------------------------------------------------
+def user_dir() -> str:
+    base = os.environ.get("DAIDALOS_DATA", "")
+    if not base:
+        docs = QtCore.QStandardPaths.writableLocation(
+            QtCore.QStandardPaths.StandardLocation.DocumentsLocation) or os.path.expanduser("~")
+        base = os.path.join(docs, "Daidalos")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def user_path(name: str) -> str:
+    return os.path.join(user_dir(), name)
+
+
+def _migrate_config(dst: str) -> str | None:
+    """
+    First start after the move: take the newest actuator_config.json from where
+    older versions kept it - next to this file, or in a "<folder> (stara kopie
+    ...)" that the Windows setup left when it replaced a non-git folder. The old
+    file is copied, never deleted. Returns the source, or None.
+    """
+    if os.path.exists(dst):
+        return None
+    import glob
+    import shutil
+    rel = os.path.join("Ariadna_V2", "Examples", "Actuator_Console", "gui", "actuator_config.json")
+    root = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+    cands = [os.path.join(HERE, "actuator_config.json")]
+    cands += glob.glob(os.path.join(glob.escape(root) + " (stara kopie*)", rel))
+    cands = [c for c in cands if os.path.isfile(c)]
+    if not cands:
+        return None
+    src = max(cands, key=os.path.getmtime)
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        return None
+    return src
+
+
+DEFAULT_CONFIG = user_path("actuator_config.json")
+_MIGRATED_FROM = _migrate_config(DEFAULT_CONFIG)
 N_CH = 16
 ABS_US_MIN, ABS_US_MAX = 500, 3500   # same as the board; wide-range servos go to 3500
 PERIOD_GAP_US = 200                    # the board keeps a pulse this far below the PWM period
@@ -842,6 +893,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.cfg_path = cfg_path
         self.cfg = self._load(cfg_path)
+        if _MIGRATED_FROM and os.path.abspath(cfg_path) == os.path.abspath(DEFAULT_CONFIG):
+            msg = f"# nastavení serv převzato z {_MIGRATED_FROM} -> {DEFAULT_CONFIG}"
+            QtCore.QTimer.singleShot(0, lambda: self.log(msg))
         self.link = Link()
         self.link.line.connect(self.on_line)
         self.link.state.connect(self.on_link_state)

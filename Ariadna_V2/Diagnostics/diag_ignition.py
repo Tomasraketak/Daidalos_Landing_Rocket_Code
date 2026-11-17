@@ -449,7 +449,7 @@ class IgnitionTab(QtWidgets.QWidget):
         self.preview()
 
     def browse_curve(self) -> None:
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Tahová křivka", "", "CSV (*.csv *.txt)")
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Tahová křivka", ag.user_dir(), "CSV (*.csv *.txt)")
         if f:
             self.curve_path.setText(f)
 
@@ -497,7 +497,7 @@ class IgnitionTab(QtWidgets.QWidget):
         except (OSError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "LandSim", str(exc))
             return
-        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "vehicle.json", "vehicle.json", "JSON (*.json)")
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "vehicle.json", ag.user_path("vehicle.json"), "JSON (*.json)")
         if f:
             with open(f, "w", encoding="utf-8") as fh:
                 json.dump(veh, fh, indent=1)

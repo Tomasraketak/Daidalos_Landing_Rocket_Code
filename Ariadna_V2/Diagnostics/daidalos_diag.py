@@ -680,7 +680,7 @@ class DiagWindow(ag.MainWindow):
             self.rec_btn.setText("Nahrávat")
             return
         name = time.strftime("daidalos_diag_%Y%m%d_%H%M%S.csv")
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Nahrávat do", name, "CSV (*.csv)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Nahrávat do", ag.user_path(name), "CSV (*.csv)")
         if not path:
             self.rec_btn.setChecked(False)
             return
@@ -1020,13 +1020,13 @@ class DiagWindow(ag.MainWindow):
             QtCore.QTimer.singleShot(300, lambda: self._cmd("PARAM LIST"))
 
     def param_export(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", "daidalos_params.json", "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", ag.user_path("daidalos_params.json"), "JSON (*.json)")
         if path:
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump({p["key"]: self.param_edits.get(p["id"], p["val"]) for p in self.params}, fh, indent=2)
 
     def param_import(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import", "", "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import", ag.user_dir(), "JSON (*.json)")
         if not path:
             return
         with open(path, encoding="utf-8") as fh:

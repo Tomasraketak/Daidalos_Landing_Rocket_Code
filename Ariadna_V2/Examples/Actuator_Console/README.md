@@ -33,9 +33,10 @@ python -m pip install -r requirements.txt
 ```
 
 `--demo` runs against a simulated board, no hardware needed. The servo map is saved
-to `gui/actuator_config.json`. Git ignores that file, so `git pull` never overwrites
-it. On macOS / Linux the commands are the same, with `/` in the path and
-`python3` instead of `python`.
+to `Documents/Daidalos/actuator_config.json` (or `$DAIDALOS_DATA`) — outside the code
+folder, so an update can never take it with it. An `actuator_config.json` from an older
+version (in `gui/`, or in a `Daidalos code (stara kopie …)` folder left by the Windows
+setup) is copied there automatically on the first start.
 
 ## What is on the screen
 
@@ -46,7 +47,7 @@ it. On macOS / Linux the commands are the same, with `/` in the path and
 | **Clamp** | slider, direct entry, *closed (min) / centre / open (max)* |
 | **Aerokryt** | *Zajistit* / *Odjistit* drive the two stored positions; the fine slider plus *uložit jako zajištěno / odjištěno* store the current position as either |
 | **Pyro kanály** | continuity (ADC counts and threshold), fired flag, pulse length, *Aktivovat* with a confirmation, *hold-to-fire* buttons, *Deaktivovat* (also **Esc**) |
-| **Nastavení** | per servo: PCA9685 channel, min / centre / max µs, reverse, µs per degree, and the two aerocover positions; saved to `gui/actuator_config.json` (**Ctrl+S**) |
+| **Nastavení** | per servo: PCA9685 channel, min / centre / max µs, reverse, µs per degree, and the two aerocover positions; saved to `Documents/Daidalos/actuator_config.json` (**Ctrl+S**) |
 | **Záznam** | everything the board says except telemetry, and a line to type raw commands |
 
 Every servo widget also shows **what the board is actually putting out**
