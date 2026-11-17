@@ -1,2 +1,5 @@
 PyQt6>=6.4
 pyserial>=3.5
+# For "Spočítat v LandSim_Light" (the ignition tab). LandSim_Light's own
+# requirements.txt also lists matplotlib and (optional) numba.
+numpy>=1.24

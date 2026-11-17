@@ -503,8 +503,28 @@ class IgnitionTab(QtWidgets.QWidget):
             self.sim_path.setText(d)
 
     # -------------------------------------------------------------- simulation
+    def _python_ready(self) -> bool:
+        """LandSim needs numpy in the SAME interpreter that runs this GUI
+        (the computation is started with sys.executable). Say so in plain
+        words instead of leaving a traceback in the log."""
+        import importlib.util
+        if importlib.util.find_spec("numpy") is not None:
+            return True
+        cmd = f'"{sys.executable}" -m pip install numpy'
+        self.sim_log.clear()
+        self.sim_log.appendPlainText("# CHYBA: v Pythonu, ve kterém běží diagnostika, chybí numpy "
+                                     "(LandSim_Light ho potřebuje).")
+        self.sim_log.appendPlainText(f"# {sys.executable}")
+        self.sim_log.appendPlainText("# Nainstalujte ho (pak diagnostiku restartujte):")
+        self.sim_log.appendPlainText(cmd)
+        QtWidgets.QMessageBox.warning(self, "LandSim", "Chybí balík numpy.\n\nSpusťte v příkazovém "
+                                      f"řádku:\n{cmd}\n\na diagnostiku restartujte.")
+        return False
+
     def run_sim(self) -> None:
         sim = self.sim_path.text().strip()
+        if not self._python_ready():
+            return
         exporter = os.path.join(sim, "landsim_export.py")
         if os.path.isfile(exporter):
             self.settings.setValue("landsim_path", sim)
@@ -545,6 +565,9 @@ class IgnitionTab(QtWidgets.QWidget):
         self.sim_log.clear()
         self.sim_log.appendPlainText(f"> {os.path.basename(GEN)} --sim {sim}   "
                                      "(starý LandSim bez landsim_export.py)")
+        self.sim_log.appendPlainText("# Tento LandSim_Light je starý: bez landsim_export.py se nespočítá "
+                                     "ΔCd křidélek ani zisky. Aktualizujte ho: v jeho složce "
+                                     "'git pull origin main'.")
         self.mode = "bridge"
         self.run_btn.setEnabled(False)
         self.proc.start(sys.executable, [GEN, "--sim", sim, "--vehicle", vpath,
