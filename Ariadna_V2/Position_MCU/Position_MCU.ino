@@ -3752,6 +3752,18 @@ void loop()
             r.gyr_dps[0] =  m.gyr.data[0] * k_g;
             r.gyr_dps[1] = -m.gyr.data[1] * k_g;
             r.gyr_dps[2] = -m.gyr.data[2] * k_g;
+            // m.gyr is the sensor reading BEFORE INSLIB's bias estimate, so it
+            // never settles to zero however often the gyro is calibrated (the
+            // GUI's |w| stayed high after "Kalibrovat gyro"). Report the rate the
+            // filter actually uses - bias removed, deg/s - when it has one.
+            {
+                float wr = 0.0f, wp = 0.0f, wy = 0.0f;
+                if (ins.getAngularRate(wr, wp, wy)) {
+                    r.gyr_dps[0] =  wr;
+                    r.gyr_dps[1] = -wp;
+                    r.gyr_dps[2] = -wy;
+                }
+            }
             if (m.mag.is_valid) {
                 mag_cal[0] = m.mag.data[0]; mag_cal[1] = -m.mag.data[1]; mag_cal[2] = -m.mag.data[2];
             }

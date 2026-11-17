@@ -472,7 +472,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_pos_status_t) == 96, "pos_status layout cha
  * board turned by hand reads exactly what the silkscreen says - no mount
  * rotation, no frame conversion. Accelerometer and gyro are what the
  * attitude filter was fed in its last epoch (the mean of the IMU samples
- * in it, offset/scale calibration applied, gyro bias NOT removed); the
+ * in it, offset/scale calibration applied; gyro with the filter's bias estimate removed); the
  * magnetometer is given both as read and after the hard/soft-iron fit.
  */
 typedef struct {
