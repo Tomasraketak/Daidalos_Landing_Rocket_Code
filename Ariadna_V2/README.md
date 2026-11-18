@@ -746,6 +746,13 @@ slow green + beacon RECOVERY · fast amber ABORT · slow blue TEST · solid red 
 In TEST the LED is slow blue; fast amber (+ the ARMED chirp) when the Navigation MCU
 reports bench pyro armed, solid red while a channel is firing.
 
+**Start-up tune (fw 3.31):** a rising 4-tone, 1.6 s tune at power-up; then a 1.0 s verdict
+once the whole vehicle has finished starting (Master POST / servos / flash, Position sensors +
+boot gyro calibration, Navigation talking, parameters in sync): rising "OK" (1568 / 2093 /
+2637 Hz) or three falling low tones "FAIL" (440 / 330 / 220 Hz; hard faults at once, the rest
+after 30 s). Once per power-up; the console row *Kontrola po startu* names the cause. Full
+table: `USER_MANUAL.md`, "Bzučák".
+
 The buzzer chirps once a second when ARMED (1.8 kHz, 40 ms) and runs a 1 Hz beacon in
 RECOVERY (2.7 kHz, 150 ms). Nothing else: a buzzer during flight is battery drain, and the
 beacon is the thing that finds a vehicle in long grass. The Master LED does **not** show

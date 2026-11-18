@@ -466,7 +466,7 @@ Vzory: **trvale** = svítí pořád · **pomalu** = 1 Hz · **rychle** = 5 Hz ·
 |---|---|
 | modrá trvale | BOOT |
 | zelená pomalu | IDLE — na zemi, bezpečno |
-| **červená rychle** | **ARMED** — zastrčeno, stát za čárou (bzučák 1× za s: krátké pípnutí 1,8 kHz / 40 ms) |
+| **červená rychle** | **ARMED** — zastrčeno, stát za čárou (bzučák 1× za s: krátké pípnutí 1,8 kHz / 40 ms; všechny zvuky viz „Bzučák“ níže) |
 | oranžová trvale | ASCENT |
 | žlutá trvale | APOGEE |
 | fialová trvale | DESCENT |
@@ -516,6 +516,38 @@ IDLE a RECOVERY svítí stejně (zelená pomalu) — rozliší je bzučák. Za l
 **UWB kotvy a tag** (XIAO; kotvy na zemi, tag v raketě): červená trvale = DWM1000 nenaběhl ·
 modrá pomalu = běží, nikdo se neozval · **zelená pulzuje = měří** (takhle mají svítit všechny čtyři při odpočtu) ·
 oranžová rychle = měřilo, ale 5 s ticho. Tag navíc: **žlutá pulzuje** = měří, ale Position MCU ho nečte po I²C.
+
+### Bzučák — jaká melodie nebo tón co znamená
+
+Bzučák je **jen jeden, na Masteru** (GP3). Pozor, aby se nepletly: **melodie po zapnutí** (stoupá) a **zvuky za provozu**
+(pípání) jsou jiné věci.
+
+**Po zapnutí (každé zapnutí Masteru):**
+
+| zvuk | délka | význam |
+|---|---|---|
+| **čtyři stoupající tóny** (1047 → 1319 → 1568 → 2093 Hz, poslední delší) | 1,6 s | „Master žije, startuje.“ Hraje hned po zapnutí. |
+| **dva stoupající tóny a dlouhý vysoký** (1568 → 2093 → 2637 Hz) | 1,0 s | ✅ **start v pořádku** — celá raketa dokončila start |
+| **tři klesající hluboké tóny** s mezerami (440 → 330 → 220 Hz) | 1,0 s | ❌ **něco selhalo** — viz níže, **nezastrkávat** |
+
+*Start v pořádku* znamená, že platí všechno naráz: POST Masteru, serva (PCA9685 a mapa kanálů), flash; **Position MCU**
+hlásí senzory (IMU, barometr) a má **hotovou kalibraci gyra** při startu; Navigation MCU hlásí; **tabulka parametrů sedí na
+všech třech deskách**. Pak hned zazní melodie „OK“. Selhání POST, serv nebo flash se ohlásí hned po první melodii, ostatní
+(Position, Navigation, parametry) má raketa **30 s** na to, aby naběhla — kdo se do 30 s nezvedne, spustí „selhání“.
+Melodie se přehraje **jednou za zapnutí**. Důvod selhání je v konzoli: Přehled → Master MCU → **Kontrola po startu**
+(např. „Position: senzory / kalibrace gyra“) a v USB logu (`# startup check FAIL … mask 0x..`).
+Po restartu Masteru za letu se úvodní melodie ani verdikt nehrají.
+
+**Za provozu:**
+
+| zvuk | délka / opakování | význam |
+|---|---|---|
+| **krátké vysoké pípnutí** 1,8 kHz | 40 ms, 1× za s | **ARMED** — raketa je ostrá, stát za čárou (pípá i TEST s ozbrojeným bench pyro) |
+| **delší střední tón** 2,7 kHz | 150 ms, 1× za s | **RECOVERY** — maják po přistání, podle něj se raketa najde |
+| ticho | | IDLE, TEST bez pyro, celý let (ASCENT až LANDED) — za letu bzučák zbytečně žere baterii |
+
+Jinak bzučák **nepíská** — ani při slabé baterii, ani při chybě za provozu. Ty jsou v konzoli, na telemetrii a v LED.
+Za provozu se zvuky nepřekrývají s úvodní melodií: dokud hraje melodie po zapnutí a verdikt, jsou ostatní zvuky potlačené.
 
 **Před zastrčením má platit:** Master zelená pomalu · Position **zelená trvale** · Navigation **zelená pomalu**
 (po vytažení RBF) — a žádný červený záblesk.

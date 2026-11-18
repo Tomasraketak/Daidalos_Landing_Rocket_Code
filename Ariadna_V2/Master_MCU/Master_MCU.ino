@@ -322,6 +322,7 @@ static bool log_service_busy(void);
 static void send_master_state(void);
 static void params_stream(void);
 static bool params_synced(void);
+static inline bool pos_status_fresh(void);
 static void usb_service(void);
 static void test_service(void);
 static void diag_emit(void);
@@ -999,6 +1000,92 @@ static const ariadna_beep_step_t BEEP_ARMED[] = {
     { 1800,  40 }, { 0, 960 }
 };
 
+// ---------------------------------------------------------------------
+//  Start-up tune and start-up verdict (fw 3.31)
+//
+//  1. Right after power-up a ~1.6 s rising tune says "the Master is alive".
+//  2. Then the Master waits until the whole vehicle has finished its own
+//     start-up (Position MCU: sensors up and gyro calibrated at boot;
+//     Navigation MCU talking; the parameter table in sync on all boards; its
+//     own POST, servo bus and flash) and plays a 1.0 s verdict:
+//        OK   - two rising tones and a long high one
+//        FAIL - three falling low tones
+//     No verdict is played before the first one is decided, and none is played
+//     twice per power-up. A board that is still not ready 30 s after power-up
+//     gets the FAIL tune; the console's "Kontrola po startu" row says what.
+//  Skipped entirely if the Master resets while a flight is in progress.
+// ---------------------------------------------------------------------
+static const ariadna_beep_step_t BEEP_STARTUP[] = {
+    { 1047, 300 }, { 1319, 300 }, { 1568, 300 }, { 2093, 700 }          // 1.6 s
+};
+static const ariadna_beep_step_t BEEP_START_OK[] = {
+    { 1568, 200 }, { 2093, 200 }, { 2637, 600 }                          // 1.0 s
+};
+static const ariadna_beep_step_t BEEP_START_FAIL[] = {
+    { 440, 300 }, { 0, 100 }, { 330, 300 }, { 0, 100 }, { 220, 200 }     // 1.0 s
+};
+
+#define MST_SU_TIMEOUT_MS  30000u
+// bits of s_su_mask: what was NOT ready
+#define MST_SU_POST    (1u << 0)     // Master self test
+#define MST_SU_SERVO   (1u << 1)     // PCA9685 / servo map
+#define MST_SU_FLASH   (1u << 2)     // flash chip (log, parameters)
+#define MST_SU_POS     (1u << 3)     // Position MCU not reporting
+#define MST_SU_POSCAL  (1u << 4)     // Position: IMU / barometer / gyro calibration not done
+#define MST_SU_NAV     (1u << 5)     // Navigation MCU not reporting
+#define MST_SU_PARAMS  (1u << 6)     // parameter table not in sync on all boards
+static uint8_t  s_su_res  = 0;       // 0 deciding, 1 OK, 2 FAIL, 3 skipped (reset in flight)
+static uint8_t  s_su_mask = 0xFF;
+static uint32_t s_su_t0 = 0, s_su_hold_until = 0;
+
+static bool startup_tune_busy(void)
+{
+    return s_su_t0 != 0 && (int32_t)(millis() - s_su_hold_until) < 0;
+}
+
+static uint8_t startup_missing(void)
+{
+    uint8_t m = 0;
+    if (!s_post_pass)                    m |= MST_SU_POST;
+    if (!s_servo_ok || !s_map_ok)        m |= MST_SU_SERVO;
+    if (!s_flash_ok)                     m |= MST_SU_FLASH;
+    if (!pos_status_fresh())             m |= MST_SU_POS;
+    else if (!((s_pos_status.sensor_ok & ARIADNA_SENS_IMU) &&
+               (s_pos_status.sensor_ok & ARIADNA_SENS_BARO) &&
+               s_pos_status.cal_state >= 1)) m |= MST_SU_POSCAL;
+    if (!nav_status_fresh())             m |= MST_SU_NAV;
+    if (!params_synced())                m |= MST_SU_PARAMS;
+    return m;
+}
+
+static void startup_tune_service(void)
+{
+    if (s_su_res == 3) return;
+    const uint32_t now = millis();
+    if (s_su_t0 == 0) {
+        s_su_t0 = now ? now : 1;
+        if (s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_RECOVERY) { s_su_res = 3; return; }
+        ariadna_buzzer_play(&s_buzz, BEEP_STARTUP, 4, 0, 0);
+        s_su_hold_until = now + 1700;            // 1.6 s tune + a short gap
+        return;
+    }
+    if (s_su_res != 0 || (int32_t)(now - s_su_hold_until) < 0) return;
+
+    s_su_mask = startup_missing();
+    if (s_su_mask == 0) {
+        s_su_res = 1;
+    } else if (!s_post_pass || !s_servo_ok || !s_flash_ok || (now - s_su_t0) > MST_SU_TIMEOUT_MS) {
+        s_su_res = 2;                            // hard faults at once, the rest after the timeout
+    } else {
+        return;                                  // others still starting: keep waiting
+    }
+    if (s_su_res == 1) ariadna_buzzer_play(&s_buzz, BEEP_START_OK, 3, 0, 0);
+    else               ariadna_buzzer_play(&s_buzz, BEEP_START_FAIL, 5, 0, 0);
+    s_su_hold_until = now + 1100;
+    usb_printf("# startup check %s (not ready mask 0x%02X: 1 POST, 2 servo, 4 flash, 8 Position, 16 Position cal, 32 Navigation, 64 params)\n",
+               s_su_res == 1 ? "OK" : "FAIL", (unsigned)s_su_mask);
+}
+
 static void annunciate(void)
 {
     // Rate limited because choosing the message is the cheap part; the
@@ -1046,6 +1133,7 @@ static void annunciate(void)
     //
     // min_gap_ms is what lets these be called unconditionally from a
     // state that persists: a sequence already running is not restarted.
+    if (startup_tune_busy()) return;         // the start-up tune / verdict owns the buzzer
     if (s_state == ARIADNA_STATE_RECOVERY) {
         ariadna_buzzer_play(&s_buzz, BEEP_RECOVERY, 2, 1, 2000);
     } else if (s_state == ARIADNA_STATE_ARMED ||
@@ -2661,7 +2749,7 @@ static void diag_emit(void)
             "\"rbf\":%d,\"bw\":%d,\"post\":%d,\"servo\":%d,\"flash\":%d,\"lora\":%d,\"log\":%lu,"
             "\"logdrop\":%lu,\"tlm\":[%lu,%lu],\"pos\":[%lu,%lu,%d],\"nav\":[%lu,%lu,%d],"
             "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu,"
-            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.2f,%.3f,%.2f,%u]}\n",
+            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.2f,%.3f,%.2f,%u],\"su\":[%u,%u]}\n",
             (unsigned long)millis(), ARIADNA_FW_VERSION, DG_VERSION, s_state, s_flags,
             (unsigned long)s_t_launch_ms, s_vbat, s_current, s_rbf_out ? 1 : 0,
             digitalRead(PIN_BREAKWIRE) == HIGH ? 1 : 0, s_post_pass ? 1 : 0, s_servo_ok ? 1 : 0,
@@ -2675,7 +2763,8 @@ static void diag_emit(void)
             s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped,
             (unsigned)s_batt.status, s_batt.soc_pct, s_batt.minutes, s_batt.v_oc,
             (unsigned)s_batt.win_s, s_batt.t_avg, s_batt.cap_eff_mah, s_batt.i_avg,
-            s_batt.learn, s_batt.last_k, (unsigned)s_batt.learn_events);
+            s_batt.learn, s_batt.last_k, (unsigned)s_batt.learn_events,
+            (unsigned)s_su_res, (unsigned)s_su_mask);
         break;
     case 2:         // N: the navigation state
         n = snprintf(b, sizeof(b),
@@ -2876,6 +2965,7 @@ void loop()
     usb_service();        // diagnostic GUI: a no-op unless a host has the port open
     params_request_poll();
     if (s_test) test_service();
+    startup_tune_service();
     annunciate();
     ariadna_rgb_service(&s_rgb);
     ariadna_buzzer_service(&s_buzz);

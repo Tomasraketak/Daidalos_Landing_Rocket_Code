@@ -337,7 +337,7 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 329 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 331 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
             self.test = len(p) > 1 and p[1] == "1"
@@ -523,12 +523,12 @@ class FlightSimBoard(ag.SimBoard):
              [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
         u = [round(R[i][1], 3) for i in range(3)]
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 329, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            d = {"t": int(t * 1000), "fw": 331, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
                  "peep": 1, "cover": 0, "hl": 0xEF, "usbdrop": 0,
-                 "bat": self._demo_bat(t)}
+                 "bat": self._demo_bat(t), "su": [1, 0]}
             return "M " + json.dumps(d, separators=(",", ":"))
         if which == 2:
             d = {"p": [round(0.05 * math.sin(t * 0.2), 2), round(0.04 * math.cos(t * 0.17), 2),
@@ -539,14 +539,14 @@ class FlightSimBoard(ag.SimBoard):
                  "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 329, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 331, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
                  "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
                  "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
                  "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 329, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+        d = {"ok": 1, "fw": 331, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
              "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
              "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
              "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -805,7 +805,7 @@ class DiagWindow(ag.MainWindow):
         names = {
             "M": ("Master MCU", "Pico 2 W · stav mise, serva, log, LoRa",
                   ["Online", "Firmware", "POST", "Stav", "Baterie", "Nabití baterie", "Výdrž do limitu",
-                   "Proud", "RBF", "Breakwire", "PCA9685", "Flash log", "LoRa", "Spoj Position", "Spoj Navigation", "Aerokryt",
+                   "Kontrola po startu", "Proud", "RBF", "Breakwire", "PCA9685", "Flash log", "LoRa", "Spoj Position", "Spoj Navigation", "Aerokryt",
                    "USB zahozeno"]),
             "P": ("Position MCU", "XIAO RP2350 · senzory, odhad polohy",
                   ["Online", "Firmware", "Parametry", "Senzory", "Orientace", "Fúze Hz",
@@ -1537,6 +1537,26 @@ class DiagWindow(ag.MainWindow):
             kv.set("Výdrž do limitu",
                    f"≈ {self.fmt_minutes(minutes)} do {lim:.0f} %   (při {fmt(iavg, 2, 'A')}, okno {int(win)} z 300 s)", col)
 
+    SU_NAMES = [(0, "POST Masteru"), (1, "serva / PCA9685"), (2, "flash"), (3, "Position MCU mlčí"),
+                (4, "Position: senzory / kalibrace gyra"), (5, "Navigation MCU mlčí"), (6, "parametry nesedí")]
+
+    def _refresh_startup(self, kv, M: dict) -> None:
+        """The buzzer's start-up verdict, [result, not-ready mask]: 0 still deciding, 1 OK, 2 FAIL, 3 skipped."""
+        su = M.get("su")
+        if not su or len(su) < 2:
+            kv.set("Kontrola po startu", "—", DIM)
+            return
+        res, mask = int(su[0]), int(su[1])
+        if res == 1:
+            kv.set("Kontrola po startu", "OK (bzučák: dva stoupavé tóny a dlouhý vysoký)", GOOD)
+        elif res == 2:
+            what = ", ".join(n for b, n in self.SU_NAMES if mask & (1 << b)) or "?"
+            kv.set("Kontrola po startu", f"SELHALA (bzučák: tři klesající hluboké tóny): {what}", BAD)
+        elif res == 3:
+            kv.set("Kontrola po startu", "přeskočena (restart za letu)", DIM)
+        else:
+            kv.set("Kontrola po startu", "probíhá…", WARN)
+
     def _refresh_status(self) -> None:
         super()._refresh_status()
         if getattr(self, "flight_fw", False) and not getattr(self, "test_on", False):
@@ -1594,6 +1614,7 @@ class DiagWindow(ag.MainWindow):
             vb = M.get("vbat", 0.0)
             kv.set("Baterie", fmt(vb, 2, "V"), BAD if 0.5 < vb < 7.0 else (WARN if vb < 7.4 else GOOD))
             self._refresh_battery(kv, M)
+            self._refresh_startup(kv, M)
             kv.set("Proud", fmt(M.get("i"), 2, "A"))
             kv.set("RBF", "vytažen" if M.get("rbf") else "zasunut", WARN if M.get("rbf") else GOOD)
             kv.set("Breakwire", "přerušen" if M.get("bw") else "celý", WARN if M.get("bw") else GOOD)
