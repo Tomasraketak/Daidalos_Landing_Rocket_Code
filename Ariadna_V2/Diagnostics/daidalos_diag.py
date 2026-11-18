@@ -169,6 +169,7 @@ PARAM_HELP = {
                    "Starší nebo levná baterie bývá níž. Ladění: vybijte ji známým proudem a porovnejte s výdrží, kterou GUI ukazuje.",
     "batt.r25_mohm": "Vnitřní odpor celé baterie včetně kabeláže při 25 °C, mΩ. Slouží k dopočtu poklesu napětí pod zátěží; "
                      "v zimě se sám zvětšuje (≈ 2× při 0 °C).",
+    "batt.learn": "Co se baterie sama naučila: násobek batt.health. Master ho snižuje, když čas do limitu dlouhodobě ubývá rychleji než 1 min za 1 min, a ukládá do flash. Po výměně baterie nastavte 1,00.",
     "batt.cutoff_pct": "Při jakém nabití se počítá „výdrž do limitu“, %. Výchozí 20 %.",
     "mst.servo_check_ma": "Minimální nárůst proudu, při kterém se servo považuje za připojené, mA (1 krok ADC ≈ 16 mA).",
     "pos.lidar_tilt_y_deg": "Statická odchylka montáže lidaru: náklon paprsku kolem tělesové osy Z (osa rakety je Y).",
@@ -510,7 +511,7 @@ class FlightSimBoard(ag.SimBoard):
         i = 0.42
         left = max(0.0, soc - 20.0) * 0.01 * 1980.0
         return [1 if soc > 20.0 else 3, round(soc, 1), round(60.0 * left / 1000.0 / i, 1) if soc > 20.0 else 0.0,
-                round(7.78 - 0.0003 * t, 2), int(min(300, t)), 21.5, 1980, i]
+                round(7.78 - 0.0003 * t, 2), int(min(300, t)), 21.5, 1980, i, 1.0, 0.0, 0]
 
     def _diag(self, which: int, t: float) -> str:
         crc = self.crc()
@@ -1507,7 +1508,7 @@ class DiagWindow(ag.MainWindow):
 
     def _refresh_battery(self, kv, M: dict) -> None:
         """Charge and run time to the limit, from the Master's "bat" field
-        [status, soc %, minutes, V open-circuit, window s, air C, capacity mAh, mean A].
+        [status, soc %, minutes, V open-circuit, window s, air C, capacity mAh, mean A, learn, last k, judged stretches].
         The Master recomputes it once a minute from a 5-minute mean."""
         bat = M.get("bat")
         if not bat or len(bat) < 8:
@@ -1515,21 +1516,24 @@ class DiagWindow(ag.MainWindow):
             kv.set("Výdrž do limitu", "—", DIM)
             return
         st, soc, minutes, voc, win, tair, cap, iavg = bat[:8]
+        learn = bat[8] if len(bat) > 8 else 1.0
         lim = self._pval("batt.cutoff_pct")
         lim = 20.0 if lim is None else lim
         if st == 0:
             kv.set("Nabití baterie", "bez baterie / čeká na data", DIM)
             kv.set("Výdrž do limitu", "—", DIM)
             return
+        extra = f", zdraví se samo snížilo na ×{fmt(learn, 2)}" if learn < 0.995 else ""
         col = BAD if soc <= lim else (WARN if soc <= lim + 15.0 else GOOD)
         kv.set("Nabití baterie",
-               f"{soc:.0f} %   (Voc {fmt(voc, 2, 'V')}, {tair:.0f} °C, využitelná kapacita {cap:.0f} mAh)", col)
+               f"{soc:.0f} %   (Voc {fmt(voc, 2, 'V')}, {tair:.0f} °C, využitelná kapacita {cap:.0f} mAh{extra})", col)
         if st == 3:
             kv.set("Výdrž do limitu", f"POD LIMITEM {lim:.0f} %", BAD)
         elif st == 2:
             kv.set("Výdrž do limitu", f"> {self.fmt_minutes(minutes)}  (zátěž {fmt(iavg, 2, 'A')} je příliš malá na odhad)", GOOD)
         else:
-            col = BAD if minutes < 5 else (WARN if minutes < 15 else GOOD)
+            # time left ABOVE the limit: orange under an hour, red under 20 minutes
+            col = BAD if minutes < 20 else (WARN if minutes < 60 else GOOD)
             kv.set("Výdrž do limitu",
                    f"≈ {self.fmt_minutes(minutes)} do {lim:.0f} %   (při {fmt(iavg, 2, 'A')}, okno {int(win)} z 300 s)", col)
 

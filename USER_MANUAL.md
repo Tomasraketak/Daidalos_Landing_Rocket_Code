@@ -494,10 +494,11 @@ V kartě **Master MCU** na záložce Přehled jsou dva řádky, které počítá
 * **Nabití baterie** — stav nabití v % a čím se k němu došlo (napětí naprázdno, teplota vzduchu,
   kapacita, kterou model počítá jako využitelnou);
 * **Výdrž do limitu** — za jak dlouho při **současné zátěži** klesne nabití na limit (výchozí 20 %,
-  `batt.cutoff_pct`). Zelená > 15 min, žlutá 5–15 min, červená < 5 min nebo už pod limitem.
+  `batt.cutoff_pct`). Zelená nad 60 min, **oranžová pod 60 min**, **červená pod 20 min** (času nad limitem) nebo už pod limitem.
 
 Vstupy jsou napětí z děliče, proud z ACS712 a **teplota** z barometru Position MCU (když Position
-neposílá, počítá se s 20 °C). Master vzorkuje 1×/s do okna 300 s, první odhad je po 10 s dat
+neposílá, počítá se s 20 °C). Proud a napětí se měří **200×/s** (každý průchod smyčky Masteru) a do odhadu jde jejich průměr za sekundu; teplota se čte
+**jednou za 30 s**. Master vzorkuje 1×/s do okna 300 s, první odhad je po 10 s dat
 (v řádku je vidět „okno N z 300 s“), pak se obnovuje každou minutu.
 
 Jak se číslo dělá:
@@ -513,6 +514,13 @@ Jak se číslo dělá:
    `f(proud)` = ztráta při velkém odběru (Peukert 1,05 nad 1C = 2,2 A, nejvýš −20 %) a nikdy bonus pro malý odběr.
 4. **Výdrž** = (nabití − limit) · C / průměrný proud, nejvýš 999 min. Pod 0,1 A je zátěž na odhad příliš malá
    (šum ACS712 je ~0,1 A): řádek ukáže „> 999 min“ a nabití v % platí dál.
+
+5. **Samo-oprava zdraví.** Master počítá náboj, který z baterie skutečně odešel (proud × čas), a porovnává ho s tím, o kolik
+   klesla procenta. Když za ≥ 20 min a ≥ 10 procentních bodů vyjde, že baterie dává méně, než model čeká (čas ubývá rychleji než
+   1 min za 1 min), sníží se `batt.learn` (násobek `batt.health`, 0,6–1,0; v GUI se u nabití objeví „zdraví se samo snížilo na ×0,87“).
+   Když ubývá pomaleji, vrací se zpět k 1,0, nikdy nad zdraví, které jste zadali. Slabé nebo rušené úseky (zátěž pod 0,3 A,
+   nabíjení, změna teploty o víc než 10 °C) se zahazují. Naučená hodnota se po vyhodnocení uloží do flash (jen na zemi v IDLE,
+   nejvýš jednou za 10 min), takže přežije vypnutí. **Po výměně baterie nastavte `batt.learn` = 1,00.**
 
 **Ladění na vaši baterii** (doporučeno, hodnoty jsou obecné): nabijte ji naplno, zapojte stálou zátěž (např. serva
 v TEST režimu) a změřte, za jak dlouho klesne na limit. Poměr skutečné a ukázané výdrže vynásobte do `batt.health`.

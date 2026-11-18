@@ -1171,6 +1171,17 @@ static inline bool link_alive(uint32_t last_us)
 //  7. ANALOGUE MONITORING
 // =====================================================================
 
+static float    s_bacc_i = 0.0f, s_bacc_v = 0.0f;
+static uint16_t s_bacc_n = 0;
+static float    s_learn_stored = 1.0f;         // batt.learn as last seen / written
+
+static inline void batt_accumulate(float volts, float amps)
+{
+    s_bacc_i += amps;
+    s_bacc_v += volts;
+    if (s_bacc_n < 0xFFFF) s_bacc_n++;
+}
+
 static void read_analogue(void)
 {
     // Slow-averaged: these feed telemetry and the arming interlock, not a
@@ -1184,6 +1195,7 @@ static void read_analogue(void)
     float amps  = ((i_adc / ACS712_DIVIDER) - ACS712_ZERO_V) / ACS712_V_PER_A;
 
     s_amps_tick = amps;
+    batt_accumulate(vbat, amps);                     // battery estimate: mean of 200 Hz samples
     vbat_f += 0.02f * (vbat - vbat_f);
     curr_f += 0.02f * (amps - curr_f);
     s_vbat    = vbat_f;
@@ -1245,27 +1257,67 @@ static inline bool pos_status_fresh(void)
 }
 
 /**
- * Battery run-time estimate (common/ariadna_batt.h): one sample per second
- * of the filtered pack voltage, current and the air temperature, a new
- * estimate once a minute from the last five. The air temperature is the
- * Position MCU's barometer; without a fresh status packet the model uses
- * 20 C, not zero.
+ * Battery run-time estimate (common/ariadna_batt.h).
+ *   - current and voltage: every 200 Hz tick of read_analogue() adds its raw
+ *     sample to a sum (batt_accumulate), once a second the mean goes to the
+ *     estimator - 200 samples a second, not one;
+ *   - air temperature: the Position MCU's barometer, read every 30 s and held
+ *     (it changes slowly); without a fresh status packet the model uses 20 C;
+ *   - the estimator turns a 5-minute mean into a new estimate once a minute and,
+ *     from the charge it counts, corrects the battery health (batt.learn).
+ *     A learned value is written to the table - and, on the ground in IDLE, to
+ *     flash - so it survives a power cycle.
  */
+static bool params_save_request(void);       // defined with the flash parameter code (section 9)
+
 static void batt_service(void)
 {
-    static uint32_t next_ms = 0;
+    static uint32_t next_ms = 0, next_t_ms = 0, last_save_ms = 0;
+    static float    t_hold = BATT_T_DEFAULT_C;
+    static uint8_t  seen_events = 0;
     const uint32_t now = millis();
-    if (now < 3000) return;                    // let the ADC filter settle after boot
+    if (now < 3000) { s_bacc_i = s_bacc_v = 0.0f; s_bacc_n = 0; return; }   // ADC filter settling
     if ((int32_t)(now - next_ms) < 0) return;
     next_ms = now + 1000;
+    if (s_bacc_n == 0) return;
+    const float amps  = s_bacc_i / (float)s_bacc_n;
+    const float volts = s_bacc_v / (float)s_bacc_n;
+    s_bacc_i = s_bacc_v = 0.0f; s_bacc_n = 0;
+
+    if ((int32_t)(now - next_t_ms) >= 0) {                 // temperature: every 30 s
+        next_t_ms = now + 30000;
+        if (pos_status_fresh()) t_hold = s_pos_status.temp_c;
+    }
+
+    // batt.learn changed from outside (the GUI, a restored image): take it over
+    if (fabsf(PRM(BATT_LEARN) - s_learn_stored) > 1e-4f) {
+        s_learn_stored = PRM(BATT_LEARN);
+        batt_set_learn(&s_batt, s_learn_stored);
+        batt_learn_drop(&s_batt);
+    }
 
     batt_cfg_t c;
     c.cap_mah    = PRM(BATT_CAP_MAH);
     c.health     = PRM(BATT_HEALTH);
     c.r25_mohm   = PRM(BATT_R25_MOHM);
     c.cutoff_pct = PRM(BATT_CUTOFF_PCT);
-    const float t_air = pos_status_fresh() ? s_pos_status.temp_c : BATT_T_DEFAULT_C;
-    (void)batt_feed_1hz(&s_batt, &c, s_vbat, s_current, t_air);
+    (void)batt_feed_1hz(&s_batt, &c, volts, amps, t_hold);
+
+    // a stretch was judged: keep the result, on the ground, at most every 10 min
+    if (s_batt.learn_events != seen_events) {
+        seen_events = s_batt.learn_events;
+        if (fabsf(s_batt.learn - s_learn_stored) >= 0.01f &&
+            (s_state == ARIADNA_STATE_IDLE) && !s_test &&
+            (last_save_ms == 0 || now - last_save_ms > 600000u)) {
+            if (ariadna_param_set(&s_params, ARIADNA_P_BATT_LEARN, s_batt.learn)) {
+                s_learn_stored = PRM(BATT_LEARN);
+                s_param_crc = ariadna_params_crc(&s_params);     // streamed to the other boards
+                if (params_save_request()) last_save_ms = now;
+            }
+        } else if (fabsf(s_batt.learn - s_learn_stored) >= 0.01f && s_state != ARIADNA_STATE_IDLE) {
+            seen_events = (uint8_t)(seen_events - 1);          // not on the ground: try again at the next minute
+        }
+    }
 }
 
 /** Both other boards report the CRC of the parameter table held here. */
@@ -1688,7 +1740,7 @@ static uint16_t pimg_ids(const ParamImage *im)
     // Layout 5 (fw 3.28): 232 ids, and its CRC covers all 232. The battery model
     // (224..227) did not exist yet and the image holds zeros there - see
     // pimg_trusted_ids(): those start at their defaults.
-    if (im->layout == 5) return ARIADNA_PARAM_ID_MAX;
+    if (im->layout == 5 || im->layout == 6) return ARIADNA_PARAM_ID_MAX;
     // Layout 4 (fw 3.25..3.27): 200 ids. The servo map and limits (ids
     // 200..223) start at their defaults, everything else is kept.
     if (im->layout == 4) return ARIADNA_PARAM_ID_MAX_V4;
@@ -1703,6 +1755,7 @@ static uint16_t pimg_trusted_ids(const ParamImage *im)
 {
     const uint16_t n = pimg_ids(im);
     if (im->layout == 5 && n > ARIADNA_PARAM_ID_MAX_V5) return ARIADNA_PARAM_ID_MAX_V5;
+    if (im->layout == 6 && n > ARIADNA_PARAM_ID_MAX_V6) return ARIADNA_PARAM_ID_MAX_V6;
     return n;
 }
 
@@ -2608,7 +2661,7 @@ static void diag_emit(void)
             "\"rbf\":%d,\"bw\":%d,\"post\":%d,\"servo\":%d,\"flash\":%d,\"lora\":%d,\"log\":%lu,"
             "\"logdrop\":%lu,\"tlm\":[%lu,%lu],\"pos\":[%lu,%lu,%d],\"nav\":[%lu,%lu,%d],"
             "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu,"
-            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.1f]}\n",
+            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.2f,%.3f,%.2f,%u]}\n",
             (unsigned long)millis(), ARIADNA_FW_VERSION, DG_VERSION, s_state, s_flags,
             (unsigned long)s_t_launch_ms, s_vbat, s_current, s_rbf_out ? 1 : 0,
             digitalRead(PIN_BREAKWIRE) == HIGH ? 1 : 0, s_post_pass ? 1 : 0, s_servo_ok ? 1 : 0,
@@ -2621,7 +2674,8 @@ static void diag_emit(void)
             s_param_crc, params_synced() ? 1 : 0, s_params_from_flash ? 1 : 0,
             s_cover_open ? 1 : 0, health_bits(), (unsigned long)s_usb_dropped,
             (unsigned)s_batt.status, s_batt.soc_pct, s_batt.minutes, s_batt.v_oc,
-            (unsigned)s_batt.win_s, s_batt.t_avg, s_batt.cap_eff_mah, s_batt.i_avg);
+            (unsigned)s_batt.win_s, s_batt.t_avg, s_batt.cap_eff_mah, s_batt.i_avg,
+            s_batt.learn, s_batt.last_k, (unsigned)s_batt.learn_events);
         break;
     case 2:         // N: the navigation state
         n = snprintf(b, sizeof(b),
@@ -2726,6 +2780,8 @@ void setup()
     s_flash_ok = flash_begin();
     params_load();
     batt_init(&s_batt);
+    batt_set_learn(&s_batt, PRM(BATT_LEARN));
+    s_learn_stored = PRM(BATT_LEARN);
 
     // 0xFF: the SK6812 is powered from the board's own rail, so there is
     // no LED power-enable pin to drive as there is on the XIAOs.

@@ -29,6 +29,18 @@
 //       BATT_I_MIN_A the load is too small to measure (the ACS712's own
 //       noise is ~0.1 A) and the time is reported as "more than the cap".
 //
+//    6. SELF-CORRECTION of the health. The charge that really leaves the pack
+//       is counted (current x time, exact: the Master gives the 1 s mean of a
+//       200 Hz measurement). Over a stretch of >= 20 min in which the state of
+//       charge fell by >= 10 points, the capacity the pack showed,
+//       Q / dSoC, is compared with the capacity the model assumed. If the
+//       remaining time keeps falling faster than one minute per minute, the
+//       pack is worse than assumed and `learn` (a factor 0.6..1.0 on top of
+//       batt.health) is lowered a little; if it falls slower it is raised back
+//       toward 1.0 - never above the health the owner entered. Weak or
+//       disturbed stretches (light load, charging, temperature swing) are
+//       thrown away, not learned from.
+//
 //  This is an estimate: the voltage table is that of a typical LiPo and the
 //  internal resistance is a typical value. The three parameters (capacity,
 //  health, R25) are there to be tuned against the real pack: discharge it at
@@ -55,6 +67,16 @@
 #define BATT_R_COLD_K       0.030f     // resistance grows by exp(k * (25 - T))
 #define BATT_COLD_LOSS_PER_C 0.010f    // capacity lost per degree below 25 C
 #define BATT_COLD_FLOOR     0.50f
+// self-correction of the health
+#define BATT_LEARN_MIN_S    1200       // shortest stretch that is judged: 20 min
+#define BATT_LEARN_MAX_S    14400      // a stretch that never reaches the SoC drop is dropped after 4 h
+#define BATT_LEARN_MIN_DSOC 10.0f      // points of state of charge the stretch must cover
+#define BATT_LEARN_MIN_A    0.30f      // mean load below this is too weak to learn from
+#define BATT_LEARN_MAX_DT_C 10.0f      // air temperature swing that voids a stretch
+#define BATT_LEARN_GAIN     0.5f       // share of the error corrected per judged stretch
+#define BATT_LEARN_MIN      0.60f
+#define BATT_LEARN_K_LO     0.60f      // ratio measured/assumed is clamped to this range first
+#define BATT_LEARN_K_HI     1.40f
 
 // state of the estimate, as reported to the GUI
 enum {
@@ -87,6 +109,15 @@ typedef struct {
     float    cap_eff_mah;  // capacity the estimate worked with
     float    left_mah;     // charge left above the cut-off
     uint16_t win_s;      // seconds of data the estimate averaged (<= 300)
+    // charge counting and the health self-correction
+    float    q_mah;      // charge drawn since boot, mAh
+    float    learn;      // 0.6..1.0 factor on batt.health, persisted by the Master (batt.learn)
+    bool     a_on;       // a stretch is being measured
+    float    a_q, a_soc, a_cap_sum, a_t_min, a_t_max, a_i_sum;
+    uint16_t a_n;        // minute estimates in the stretch
+    uint32_t a_s;        // seconds the stretch has lasted
+    uint8_t  learn_events;   // how many stretches have been judged since boot
+    float    last_k;     // the last judged ratio real/assumed capacity (0 = none yet)
 } batt_t;
 
 // ---- resting-voltage table of one LiPo cell: volts -> % --------------
@@ -148,10 +179,66 @@ static inline void batt_init(batt_t *b)
     b->v_avg = b->i_avg = b->t_avg = 0.0f;
     b->cap_eff_mah = b->left_mah = 0.0f;
     b->win_s = 0;
+    b->q_mah = 0.0f;
+    b->learn = 1.0f;
+    b->a_on = false;
+    b->a_q = b->a_soc = b->a_cap_sum = b->a_t_min = b->a_t_max = b->a_i_sum = 0.0f;
+    b->a_n = 0;
+    b->a_s = 0;
+    b->learn_events = 0;
+    b->last_k = 0.0f;
+}
+
+/** Start from the stored factor (the batt.learn parameter). */
+static inline void batt_set_learn(batt_t *b, float learn)
+{
+    if (!(learn >= BATT_LEARN_MIN)) learn = BATT_LEARN_MIN;     // also NaN
+    if (learn > 1.0f) learn = 1.0f;
+    b->learn = learn;
+}
+
+static inline void batt_learn_drop(batt_t *b) { b->a_on = false; b->a_n = 0; b->a_s = 0; }
+
+/** One minute estimate has just been made: extend, judge or drop the measuring stretch. */
+static inline void batt_learn_step(batt_t *b)
+{
+    const bool usable = b->status == BATT_OK && b->i_avg >= BATT_LEARN_MIN_A;
+    if (!usable) { batt_learn_drop(b); return; }
+    if (!b->a_on) {
+        b->a_on = true; b->a_q = b->q_mah; b->a_soc = b->soc_pct;
+        b->a_cap_sum = 0.0f; b->a_i_sum = 0.0f; b->a_n = 0; b->a_s = 0;
+        b->a_t_min = b->a_t_max = b->t_avg;
+        return;
+    }
+    if (b->soc_pct > b->a_soc + 2.0f) { batt_learn_drop(b); return; }       // charged: start over
+    b->a_cap_sum += b->cap_eff_mah;
+    b->a_i_sum   += b->i_avg;
+    b->a_n++;
+    b->a_s += BATT_UPDATE_S;
+    if (b->t_avg < b->a_t_min) b->a_t_min = b->t_avg;
+    if (b->t_avg > b->a_t_max) b->a_t_max = b->t_avg;
+    if (b->a_t_max - b->a_t_min > BATT_LEARN_MAX_DT_C) { batt_learn_drop(b); return; }
+    if (b->a_s > BATT_LEARN_MAX_S) { batt_learn_drop(b); return; }
+    const float dsoc = b->a_soc - b->soc_pct;
+    if (b->a_s < BATT_LEARN_MIN_S || dsoc < BATT_LEARN_MIN_DSOC) return;
+
+    // The stretch is long and deep enough: judge it.
+    if (b->a_i_sum / (float)b->a_n >= BATT_LEARN_MIN_A) {
+        const float cap_assumed = b->a_cap_sum / (float)b->a_n;             // mean over the stretch
+        const float cap_real    = (b->q_mah - b->a_q) / (dsoc * 0.01f);
+        float k = cap_real / cap_assumed;
+        if (k < BATT_LEARN_K_LO) k = BATT_LEARN_K_LO;
+        if (k > BATT_LEARN_K_HI) k = BATT_LEARN_K_HI;
+        b->last_k = k;
+        float l = b->learn * powf(k, BATT_LEARN_GAIN);
+        batt_set_learn(b, l);
+        b->learn_events++;
+    }
+    batt_learn_drop(b);                                                      // next stretch starts at the next minute
 }
 
 /** The estimate itself, from the window as it stands. */
-static inline void batt_compute(batt_t *b, const batt_cfg_t *c)
+static inline void batt_compute_inner(batt_t *b, const batt_cfg_t *c)
 {
     float sv = 0.0f, si = 0.0f, st = 0.0f;
     const uint16_t n = b->n;
@@ -173,7 +260,7 @@ static inline void batt_compute(batt_t *b, const batt_cfg_t *c)
     b->v_oc        = b->v_avg + i * batt_r_pack(c, b->t_avg);
     b->soc_pct     = batt_soc_from_cell_v(b->v_oc / (float)BATT_CELLS);
 
-    b->cap_eff_mah = c->cap_mah * c->health * batt_f_temp(b->t_avg) * batt_f_rate(c, i);
+    b->cap_eff_mah = c->cap_mah * c->health * b->learn * batt_f_temp(b->t_avg) * batt_f_rate(c, i);
     const float above = b->soc_pct - c->cutoff_pct;
     if (above <= 0.0f) {
         b->status = BATT_LOW;
@@ -193,8 +280,15 @@ static inline void batt_compute(batt_t *b, const batt_cfg_t *c)
     b->status  = BATT_OK;
 }
 
+static inline void batt_compute(batt_t *b, const batt_cfg_t *c)
+{
+    batt_compute_inner(b, c);
+    batt_learn_step(b);
+}
+
 /**
- * Call once a second with the low-pass-filtered readings. Returns true when a
+ * Call once a second with the MEAN of the last second's readings (the Master
+ * averages the 200 Hz ADC samples: current at 200 Hz, not one sample a second). Returns true when a
  * new estimate was produced (the first one after BATT_MIN_SAMPLES seconds,
  * then every BATT_UPDATE_S).
  */
@@ -203,6 +297,7 @@ static inline bool batt_feed_1hz(batt_t *b, const batt_cfg_t *c, float vbat, flo
     if (!(temp_c > -60.0f && temp_c < 120.0f)) temp_c = BATT_T_DEFAULT_C;   // also NaN
     if (!(vbat >= 0.0f && vbat < 20.0f))       vbat = 0.0f;
     if (!(amps > -50.0f && amps < 50.0f))      amps = 0.0f;
+    if (amps > 0.0f && vbat >= BATT_V_MIN_VALID) b->q_mah += amps * (1000.0f / 3600.0f);
     b->v[b->head] = vbat;
     b->i[b->head] = amps;
     b->t[b->head] = temp_c;

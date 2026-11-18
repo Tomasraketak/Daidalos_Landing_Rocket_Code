@@ -53,6 +53,31 @@ static batt_t steady(const batt_cfg_t &c, float v, float i, float t, int secs = 
     return b;
 }
 
+/** Pack-voltage model: open-circuit volts of a 2S pack at state of charge soc (table inverted). */
+static float pack_voc(float soc)
+{
+    if (soc >= 100.0f) return 2.0f * 4.20f;
+    float vc = 3.27f;
+    for (int k = 1; k < BATT_OCV_N; k++)
+        if (soc <= BATT_OCV_PCT[k]) {
+            const float f = (soc - BATT_OCV_PCT[k - 1]) / (BATT_OCV_PCT[k] - BATT_OCV_PCT[k - 1]);
+            vc = BATT_OCV_V[k - 1] + f * (BATT_OCV_V[k] - BATT_OCV_V[k - 1]);
+            break;
+        }
+    return 2.0f * vc;
+}
+
+/** Drain a pack that REALLY holds real_mah at a constant I, feed the estimator every second. */
+static void drain(batt_t *b, const batt_cfg_t &c, float real_mah, float I, float t_c, int secs, float *used)
+{
+    for (int s = 0; s < secs; s++) {
+        const float soc = 100.0f * (1.0f - *used / real_mah);
+        if (soc < 8.0f) break;
+        batt_feed_1hz(b, &c, pack_voc(soc) - I * batt_r_pack(&c, t_c), I, t_c);
+        *used += I * 1000.0f / 3600.0f;
+    }
+}
+
 int main()
 {
     printf("battery estimate\n");
@@ -269,6 +294,80 @@ int main()
         // with a 1-minute refresh and a 5-minute mean the estimate lags a little
         check(fabsf(est_at_half - truth_at_half) < 0.15f * truth_at_half,
               "tuned health 0.82: estimate within 15 % of the truth half-way");
+    }
+
+
+    // ---- health self-correction ---------------------------------------------
+    {
+        ariadna_params_t p; ariadna_params_default(&p);
+        check(ariadna_param_find(228) && ariadna_param_find(228)->owner == 'M', "batt.learn exists (id 228, Master)");
+        check(near(p.v[ARIADNA_P_BATT_LEARN], 1.0f, 1e-6f), "batt.learn defaults to 1.0 = nothing learned");
+        check(ARIADNA_PARAM_ID_MAX_V6 == 228 && ARIADNA_PARAM_LAYOUT == 7, "layout 7, layout-6 images trusted up to id 227");
+
+        batt_t q; batt_init(&q);
+        batt_set_learn(&q, NAN);  check(near(q.learn, BATT_LEARN_MIN, 1e-6f), "NaN learn -> floor");
+        batt_set_learn(&q, 7.0f); check(near(q.learn, 1.0f, 1e-6f), "learn never above 1.0");
+        batt_set_learn(&q, 0.1f); check(near(q.learn, BATT_LEARN_MIN, 1e-6f), "learn never below 0.6");
+
+        // charge counting: 1 A for an hour = 1000 mAh
+        batt_t qc; batt_init(&qc);
+        for (int k = 0; k < 3600; k++) batt_feed_1hz(&qc, &c, 7.8f, 1.0f, 20.0f);
+        check(near(qc.q_mah, 1000.0f, 1.0f), "1 A for 1 h counts 1000 mAh");
+        batt_t qn; batt_init(&qn);
+        for (int k = 0; k < 600; k++) batt_feed_1hz(&qn, &c, 0.0f, 3.0f, 20.0f);
+        check(qn.q_mah == 0.0f, "no battery volts: nothing counted");
+
+        // a pack that holds only 1500 mAh, model says 2200*0.9 = 1980: health walks down
+        {
+            batt_t b; batt_init(&b); float used = 0.0f;
+            drain(&b, c, 1500.0f, 0.8f, 25.0f, 4 * 3600, &used);
+            check(b.learn_events >= 3, "weak pack: several stretches judged");
+            check(b.learn < 0.95f, "weak pack: health lowered");
+            check(b.learn >= 0.75f, "weak pack: not lowered past the truth (1500/1980 = 0.76)");
+            check(b.learn >= BATT_LEARN_MIN, "learn stays above the floor");
+            check(b.last_k > 0.0f && b.last_k < 1.0f, "the judged ratio was below 1");
+        }
+        // the same pack with the learned health already stored: the time shown matches the truth
+        {
+            batt_t b; batt_init(&b); batt_set_learn(&b, 1500.0f / 1980.0f); float used = 0.0f;
+            drain(&b, c, 1500.0f, 0.8f, 25.0f, 20 * 60, &used);       // 20 min in, SoC ~ 82 %
+            const float soc = 100.0f * (1.0f - used / 1500.0f);
+            const float truth = (soc - 20.0f) * 0.01f * 1500.0f / 0.8f * 0.06f;
+            check(fabsf(b.minutes - truth) < 0.08f * truth, "with the right health the time is right (8 %)");
+        }
+        // a pack that is BETTER than the label: learn stays at 1.0, never above the entered health
+        {
+            batt_t b; batt_init(&b); float used = 0.0f;
+            drain(&b, c, 2150.0f, 0.8f, 25.0f, 4 * 3600, &used);
+            check(near(b.learn, 1.0f, 1e-6f), "good pack: learn does not go above 1.0");
+        }
+        // recovery: learn 0.7 on a pack that is really fine rises back
+        {
+            batt_t b; batt_init(&b); batt_set_learn(&b, 0.7f); float used = 0.0f;
+            drain(&b, c, 2100.0f, 0.8f, 25.0f, 4 * 3600, &used);
+            check(b.learn > 0.8f, "a too-pessimistic learned health recovers");
+        }
+        // light load: nothing is learned
+        {
+            batt_t b; batt_init(&b); float used = 0.0f;
+            drain(&b, c, 1500.0f, 0.2f, 25.0f, 5 * 3600, &used);
+            check(b.learn_events == 0 && near(b.learn, 1.0f, 1e-6f), "0.2 A is too light to learn from");
+        }
+        // temperature swinging more than 10 C voids every stretch
+        {
+            batt_t b; batt_init(&b); float used = 0.0f;
+            for (int blk = 0; blk < 12; blk++)
+                drain(&b, c, 1500.0f, 0.8f, (blk & 1) ? 5.0f : 25.0f, 600, &used);
+            check(b.learn_events == 0, "a 20 C swing: stretches thrown away");
+        }
+        // charging in the middle starts over
+        {
+            batt_t b; batt_init(&b); float used = 0.0f;
+            drain(&b, c, 1500.0f, 0.8f, 25.0f, 15 * 60, &used);
+            used = 0.0f;                                              // "recharged"
+            drain(&b, c, 1500.0f, 0.8f, 25.0f, 10 * 60, &used);
+            check(b.learn_events == 0, "a recharge inside a stretch: not judged");
+        }
     }
 
     printf("%d checks, %d failed\n", g_checks, g_fails);

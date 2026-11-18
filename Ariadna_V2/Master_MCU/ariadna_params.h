@@ -42,10 +42,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ARIADNA_PARAM_LAYOUT   6     // stored with the flash image (6: 232 ids - battery model; 5: servo map and limits; 4: 200 ids)
-// Layout 5 images (fw 3.28, 232 ids) hold zeros at ids 224..231: only the first 224 are trusted,
-// the battery model (ids 224..227, fw 3.29) starts at its defaults.
+#define ARIADNA_PARAM_LAYOUT   7     // stored with the flash image (7: 232 ids - battery learning; 6: battery model; 5: servo map and limits; 4: 200 ids)
+// Layout 5 and 6 images hold 232 ids too (the CRC covers all of them) but zeros above what they
+// knew: only the first 224 (layout 5, fw 3.28) / 228 (layout 6, fw 3.29) are trusted, the rest
+// start at their defaults.
 #define ARIADNA_PARAM_ID_MAX_V5 224
+#define ARIADNA_PARAM_ID_MAX_V6 228
 // Layout 4 images (fw 3.25-3.27, 200 ids) are still read: ids >= 200 keep their defaults.
 #define ARIADNA_PARAM_ID_MAX_V4 200
 // Ids 186..188 (gyro offset, fw 3.27) were added INSIDE layout 4: an image saved
@@ -223,7 +225,10 @@
     X(224, BATT_CAP_MAH,    "batt.cap_mah",      2200.0f, 100.0f, 20000.0f, "mAh", 'M') \
     X(225, BATT_HEALTH,     "batt.health",          0.90f,  0.50f,     1.00f, "-",   'M') \
     X(226, BATT_R25_MOHM,   "batt.r25_mohm",       60.0f,   5.0f,    500.0f, "mOhm", 'M') \
-    X(227, BATT_CUTOFF_PCT, "batt.cutoff_pct",     20.0f,   0.0f,     90.0f, "%",   'M')
+    X(227, BATT_CUTOFF_PCT, "batt.cutoff_pct",     20.0f,   0.0f,     90.0f, "%",   'M') \
+    /* Written by the Master itself (fw 3.30): what the battery's run-time history taught it, a   */ \
+    /* factor on batt.health. 1.00 = nothing learned. Set to 1.00 after changing the battery.    */ \
+    X(228, BATT_LEARN,      "batt.learn",           1.00f,  0.60f,     1.00f, "-",   'M')
 
 // ---- ids --------------------------------------------------------------
 enum {
