@@ -450,6 +450,76 @@ odpálení držením tlačítka 1,2 s, pulz 20–1000 ms, ztráta spojení s GUI
 | Navigation MCU se restartuje ve vzduchu | apogeum odhadne z energie (vždy spíš výš → zážeh spíš výš = bezpečná strana) |
 | USB kabel | žádný vliv: bez připojeného počítače se diagnostika neposílá vůbec |
 
+### LED a bzučák — co která říká
+
+Na rampě není notebook, takže každá deska svítí a **každá odpovídá na jinou otázku**. Čtěte je společně:
+Master říká *co dělá mise*, Position *ví raketa, kde je*, Navigation *je připravena zapálit*.
+Jas je 60/255 (UWB tag 25/255, protože je napájený tenkým kabelem). Fault se nekóduje odstínem, ale
+**počtem záblesků** (n × 120 ms, pauza, celý cyklus 1,6 s — spočítá se i zpoza čáry).
+
+Vzory: **trvale** = svítí pořád · **pomalu** = 1 Hz · **rychle** = 5 Hz · **pulzuje** = plynule 2 s ·
+**n× blik** = n záblesků a pauza.
+
+**Master MCU** (SK6812, GP2) — stav mise, jedna barva na stav:
+
+| LED | stav |
+|---|---|
+| modrá trvale | BOOT |
+| zelená pomalu | IDLE — na zemi, bezpečno |
+| **červená rychle** | **ARMED** — zastrčeno, stát za čárou (bzučák 1× za s: krátké pípnutí 1,8 kHz / 40 ms) |
+| oranžová trvale | ASCENT |
+| žlutá trvale | APOGEE |
+| fialová trvale | DESCENT |
+| **bílá trvale** | GUIDANCE — řízení převzala Navigation MCU |
+| zelená trvale | LANDED |
+| zelená pomalu + bzučák | RECOVERY — maják 2,7 kHz / 150 ms 1× za s, aby se raketa našla v trávě |
+| oranžová rychle | ABORT |
+| modrá pomalu | TEST (pyra zablokovaná) |
+| oranžová rychle + pípání | TEST a Navigation hlásí **ozbrojené** bench pyro |
+| červená trvale | TEST a pyro kanál právě **pálí** |
+| červená trvale | ERROR (nejčastěji POST selhal; také neznámý stav) |
+
+IDLE a RECOVERY svítí stejně (zelená pomalu) — rozliší je bzučák. Za letu bzučák mlčí (zbytečně žere baterii).
+**Master LED nehlásí poruchy spojů, flash, serv ani slabé baterie** — ty jsou v diagnostické konzoli
+(horní lišta, karta Master) a v chybovém kódu telemetrie.
+
+**Position MCU** (vestavěná WS2812 XIAO) — navigační řešení. Platí první splněná řádka shora:
+
+| LED | význam |
+|---|---|
+| modrá trvale | start |
+| červená 1× blik | POST selhal nebo IMU nemluví |
+| červená 2× blik | chybí barometr (vertikální kanál nemá absolutní referenci) |
+| oranžová pomalu | žije, ale **bez reference rampy** — polohy `px/py/pz` zatím nic neznamenají |
+| **žlutá 3× blik** | baro trim na mezi → UWB kotvy špatně zaměřené (opravit **před** startem) |
+| **zelená trvale** | UWB měření **přijímá filtr** — **na tuhle počkat před zastrčením** |
+| zelená pulzuje | navigace na GPS, UWB kotvy žijí, ale filtr je (ještě) nepřijímá |
+| azurová pomalu | navigace na GPS |
+| fialová pomalu | reference rampy je, ale ani GPS, ani UWB — jen mrtvý výpočet |
+
+**Navigation MCU** (vestavěná WS2812 XIAO) — pyro a navedení. Platí první splněná řádka shora:
+
+| LED | význam |
+|---|---|
+| červená trvale | POST selhal — **nezastrkávat** |
+| bílá trvale | pyro kanál právě pálí |
+| oranžová rychle | TEST, bench pyro **ozbrojeno** |
+| fialová rychle | navigační stav zastaral, tryska a křidélka zaparkované |
+| zelená rychle | běží přistávací zážeh |
+| azurová rychle | pád, zážeh ozbrojen (čeká se na zážeh) |
+| **červená 2× blik** | ozbrojeno, ale **PYRO1 bez kontinuity** |
+| **červená 3× blik** | ozbrojeno, ale tabulka parametrů nedorazila celá |
+| modrá pomalu | žije, čeká na navigační stav |
+| zelená pomalu | ozbrojeno, stav chodí, kontinuita v pořádku |
+| oranžová pomalu | stav chodí, neozbrojeno |
+
+**UWB kotvy a tag** (XIAO; kotvy na zemi, tag v raketě): červená trvale = DWM1000 nenaběhl ·
+modrá pomalu = běží, nikdo se neozval · **zelená pulzuje = měří** (takhle mají svítit všechny čtyři při odpočtu) ·
+oranžová rychle = měřilo, ale 5 s ticho. Tag navíc: **žlutá pulzuje** = měří, ale Position MCU ho nečte po I²C.
+
+**Před zastrčením má platit:** Master zelená pomalu · Position **zelená trvale** · Navigation **zelená pomalu**
+(po vytažení RBF) — a žádný červený záblesk.
+
 ---
 
 ## 9. Diagnostická konzole

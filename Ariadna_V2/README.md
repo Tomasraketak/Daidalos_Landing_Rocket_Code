@@ -743,9 +743,15 @@ Solid blue BOOT · slow green IDLE · **fast red ARMED** · solid amber ASCENT �
 yellow APOGEE · solid magenta DESCENT · **solid white GUIDANCE** · solid green LANDED ·
 slow green + beacon RECOVERY · fast amber ABORT · slow blue TEST · solid red ERROR.
 
-The buzzer chirps once a second when ARMED and runs a 1 Hz beacon in RECOVERY. Nothing
-else: a buzzer during flight is battery drain, and the beacon is the thing that finds a
-vehicle in long grass.
+In TEST the LED is slow blue; fast amber (+ the ARMED chirp) when the Navigation MCU
+reports bench pyro armed, solid red while a channel is firing.
+
+The buzzer chirps once a second when ARMED (1.8 kHz, 40 ms) and runs a 1 Hz beacon in
+RECOVERY (2.7 kHz, 150 ms). Nothing else: a buzzer during flight is battery drain, and the
+beacon is the thing that finds a vehicle in long grass. The Master LED does **not** show
+link, flash, servo or low-battery faults - those are in the console and the telemetry
+error code. Brightness is 60/255 on every board (UWB tag 25/255). Czech version with all
+tables: `USER_MANUAL.md`, "LED a bzučák".
 
 ### Position — the navigation solution
 
@@ -776,12 +782,21 @@ powered, surveyed correctly, and agreeing with the rest of the navigation soluti
 | slow green | armed and receiving, continuity on channel 1 |
 | fast green | the landing burn is running |
 | fast magenta | the navigation state has gone stale; the TVC is parked |
+| fast cyan | descending, ignition armed |
+| fast amber | TEST mode, bench pyro arming is live |
+| solid white | a pyro channel is firing |
+| **red, 3 flashes** | armed, but the parameter table did not arrive in full |
+| slow green / slow amber | armed + receiving / receiving, not armed |
+
+(First matching row from the top wins: solid red, white, amber, magenta, green, cyan, then the red flash codes, then blue / green / amber.)
 
 ### Anchor
 
 Solid red = the DWM1000 did not come up. Slow blue = up, but the tag has never called.
 Pulsing green = ranging (what all four should look like during a countdown). Fast amber
-= it *was* ranging and the tag has been quiet for five seconds.
+= it *was* ranging and the tag has been quiet for five seconds. The **tag** (in the rocket)
+uses the same colours, plus pulsing yellow = ranging but the Position MCU is not reading it
+over I²C.
 
 ### Why this is affordable inside a 200 Hz loop
 
