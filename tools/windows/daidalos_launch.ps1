@@ -149,6 +149,19 @@ Say "Spoustim diagnostiku..."
 # recordings and exports - never in the code folder, which updates replace.
 $data = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Daidalos"
 New-Item -ItemType Directory -Force -Path $data | Out-Null
-Start-Process -FilePath $VPyW -ArgumentList "`"$diag`"" -WorkingDirectory $data
+# pythonw has no console, so a crash at start-up would be silent: its stderr
+# goes to gui_error.log and if the GUI dies within the first seconds the
+# window stays open and shows why.
+$errLog = Join-Path $AppDir "gui_error.log"
+$p = Start-Process -FilePath $VPyW -ArgumentList "`"$diag`"" -WorkingDirectory $data `
+        -RedirectStandardError $errLog -PassThru
+Start-Sleep -Seconds 6
+if ($p.HasExited -and $p.ExitCode -ne 0) {
+    Write-Host ""
+    Write-Host "GUI spadlo hned po startu (kod $($p.ExitCode)). Chyba:" -ForegroundColor Red
+    if (Test-Path $errLog) { Get-Content $errLog -Tail 40 | ForEach-Object { Write-Host $_ } }
+    Write-Host ""
+    Write-Host "Ulozeno v: $errLog" -ForegroundColor Yellow
+    Fail "Diagnostika se nespustila."
+}
 try { Stop-Transcript | Out-Null } catch {}
-Start-Sleep -Seconds 2

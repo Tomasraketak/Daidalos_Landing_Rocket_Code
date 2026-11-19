@@ -1084,9 +1084,17 @@ class DiagWindow(ag.MainWindow):
         outer = root.layout()
         act_scroll = outer.itemAt(1).widget()
         outer.removeWidget(act_scroll)
-        act_body = act_scroll.widget()
-        if act_body is not None and act_body.layout() is not None:
-            act_body.layout().insertWidget(0, self._build_polarity_card())
+        # The console's body is laid out with a QGridLayout (no insertWidget),
+        # so the polarity card goes into a new wrapper above the whole body.
+        act_body = act_scroll.takeWidget()
+        act_wrap = QtWidgets.QWidget()
+        act_v = QtWidgets.QVBoxLayout(act_wrap)
+        act_v.setContentsMargins(20, 16, 20, 0)
+        act_v.setSpacing(0)
+        act_v.addWidget(self._build_polarity_card())
+        if act_body is not None:
+            act_v.addWidget(act_body, 1)
+        act_scroll.setWidget(act_wrap)
         outer.addWidget(self._build_diag_bar())
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -1193,11 +1201,15 @@ class DiagWindow(ag.MainWindow):
 
     # ------------------------------------------------------------ polarity test card
     def _build_polarity_card(self) -> QtWidgets.QWidget:
-        c, cl = card(
-            "Test směru TVC a křidélek (polarita)",
+        c = Card("Polarita", "Test směru TVC a křidélek (polarita)")
+        cl = c.lay
+        desc = QtWidgets.QLabel(
             "Čte reálný náklon z IMU Position MCU. TVC se naklání jako při přistání na 0° náklon, "
-            "křidélka jako při startu na 0° náklon (+ tlumení rollu). Pyro je po celou dobu VYPNUTO.",
+            "křidélka jako při startu na 0° náklon (+ tlumení rollu). Pyro je po celou dobu VYPNUTO."
         )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {ag.C['muted']};")
+        cl.addWidget(desc)
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(10)
         self.pol_btn = button(
