@@ -4,9 +4,10 @@
 >
 > * **[`USER_MANUAL.md`](USER_MANUAL.md)** — uživatelský manuál (česky): jak funguje
 >   odhad polohy, navedení, křidélka a jejich adaptace, sekvence aerokrytu, roznětů a
->   nohou, bezpečnostní pojistky, obě GUI, všechny parametry, předletové testy.
+>   nohou, bezpečnostní pojistky, obě GUI, všechny parametry, předletové testy a
+>   **[audit výpočetní vytíženosti všech 3 MCU](USER_MANUAL.md#16-audit-výpočetní-vytíženosti)**.
 > * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position and
->   Navigation MCU, firmware 3.00, flying the
+>   Navigation MCU, firmware 3.32, flying the
 >   [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
 >   (`Ariadna_V2/common/guidance.cpp`).
 > * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`

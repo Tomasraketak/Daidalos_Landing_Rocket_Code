@@ -37,6 +37,7 @@ přeprogramování.
 13. [Sestavení, nahrání, testy na počítači](#13-sestavení-a-testy)
 14. [Co je a co není ověřeno](#14-co-je-ověřeno)
 15. [Řešení problémů](#15-řešení-problémů)
+16. [Audit výpočetní vytíženosti a časování (všechny 3 MCU)](#16-audit-výpočetní-vytíženosti)
 
 ---
 
@@ -957,4 +958,125 @@ náhradní hlavičky neověří vše.
 | záložka Zážeh: „V … není tvc_sim.py“ | cesta ke klonu LandSim_Light; Python s numpy |
 | „Odpor měřený / model“ daleko od 1 | Cd nebo hmotnost v parametrech neodpovídá — opravit a přepočítat pásmo |
 | vizualizace hlásí „DROPPED“ | jiná verze paketu (stará pozemní stanice) — nahrát stejný firmware |
-| po letu: kde je záznam | flash na Masteru (50 Hz), případně CSV z vizualizace / diagnostiky |
+| po letu: kde je záznam | flash na Masteru (200 Hz za letu / 10 Hz na zemi), případně CSV z vizualizace / diagnostiky |
+
+---
+
+## 16. Audit výpočetní vytíženosti
+
+Podrobný rozbor reálného zatížení a časování všech tří palubních mikrokontrolérů
+(**fw 3.32**). Všechny tři desky běží na čipu **RP2350** (dvoujádrový ARM Cortex-M33
+@ **150 MHz**, hardwarová single-precision FPU `FPv5-SP-D16`, 520 KB SRAM, 16kanálové DMA).
+Veškerá matematika v řídicí a odhadové cestě používá nativní `float` (kompilováno s
+`-Wdouble-promotion`), takže se nikde neplatí emulace `double`.
+
+### 16.1 Souhrnná tabulka vytížení
+
+| MCU (deska) | Jádro | Perioda / frekvence | Průměrné vytížení | Špička (WCET) v jednom slotu | Stíhá včas? | Hlavní odběratel času |
+|---|---|---|---:|---:|---|---|
+| **Position MCU** (XIAO RP2350) | **Core 0** | `4 167 µs` (240 Hz) | **18–25 %** *(čisté CPU ~8–12 %)* | **~69 %** (`~2,86 ms`) | **Ano** *(pozor na I2C UWB)* | `s_uwb.poll()` (~1,7 ms I2C @ 25 Hz), INSLIB/TriSense |
+| **Position MCU** (XIAO RP2350) | **Core 1** | průběžně (UART) | **< 2 %** | **< 5 %** | **Ano** (obrovská rezerva) | GPS NMEA 115 200 baud (5 Hz) + RX z Masteru |
+| **Navigation MCU** (XIAO RP2350) | **Core 0** | `5 000 µs` (200 Hz) | **2–4 %** (`~100–200 µs`) | **5–7 %** (`~250–350 µs`) | **Ano** (rezerva > 93 %) | `dg_step_control()`, sekvencer, 3× ADC kontinuity |
+| **Navigation MCU** (XIAO RP2350) | **Core 1** | `100 000 µs` (10 Hz) | **5–10 %** (pád) / **30–55 %** (začátek zážehu) | **~55 %** (`~55 ms`, nominální zážeh) | **Ano** *(Core 0 nikdy neblokuje)* | `dg_solve_plan()` + vnořené replany v `touchdown_time()` |
+| **Master MCU** (Pico 2 W) | **Core 0** | `5 000 µs` (200 Hz) | **18–32 %** *(čisté CPU ~2–3 %)* | **25–40 %** (`~1,2–2,0 ms`, s USB) | **Ano** (rezerva > 60 %) | I2C zápis PCA9685 @ 400 kHz (`~0,8–1,5 ms`) |
+| **Master MCU** (Pico 2 W) | **Core 1** | asynchronní | **2–5 % CPU** *(flash BUSY ~25–35 %)* | neblokující | **Ano** (32 KB RAM ring = 1,7 s) | W25Q128 SPI1 log (19,2 KB/s) + async LoRa SPI0 |
+
+> **Závěr auditu:** **Všechny 3 mikrokontroléry stíhají své výpočty i komunikaci včas s pohodlnou rezervou.**
+> Hlavní zátěží na Core 0 u Position a Master MCU není aritmetika CPU, ale **blokující I2C přenosy** (UWB tag na Position MCU, PCA9685 na Master MCU). Všechny dlouhé operace (plánovač, W25Q128 flash erase/write, LoRa TX, GPS NMEA) jsou správně odsunuty na Core 1 a komunikují přes neblokující seqlocky nebo DMA ring buffery.
+
+---
+
+### 16.2 Position MCU (`Ariadna_V2/Position_MCU/Position_MCU.ino`)
+
+- **Core 0 (`240 Hz`, rozpočet `4 167 µs` na tick):**
+  - *Idle cesta (každý průchod smyčkou):*
+    - `attitude_update()` — TriSense SPI @ 10 MHz (`~20–30 µs`) + INSLIB MEKF epocha (`~150–300 µs` na FPU, 200–240 Hz).
+    - `ariadna_uart_tx_service()` — obsluha DMA ringu (`< 2 µs`, přenos po UART probíhá bez CPU).
+    - `ariadna_rgb_service()` — `0 µs` při neměnné barvě; `~30 µs` (zakázaná IRQ na 1 NeoPixel) jen při změně stavu.
+  - *Periodický 240 Hz krok:*
+    - `s_est.predict()` (3× nezávislý 1D Kalman 3×3, `float`): `~15–25 µs`.
+    - Barometr BMP580 (`50 Hz`): I2C @ 400 kHz `~180–250 µs` + `fuse_baro()` `~10 µs`.
+    - TF-Luna Lidar (`5 Hz` na rampě, `50 Hz` po otevření nohou): I2C @ 400 kHz (9 B) `~250–300 µs` + `fuse_range()` `~15 µs`.
+    - **UWB tag + multilaterace (`25 Hz`, každých 40 ms):**
+      - `s_uwb.poll()` čte celý I2C rámec (`ARIADNA_UWB_LINK_FRAME_SIZE`) při 400 kHz → **`~1 700 µs` blokujícího I2C** (cca 41 % jednoho 240Hz slotu).
+      - `ariadna_uwb_solve()` (max 8 Gauss-Newton iterací 3×3, FPU): `~80–150 µs` + `fuse_uwb()` `~15 µs`.
+    - GPS fúze (`5 Hz`): `fuse_gps()` + `ins.feedGnss()` `~60–120 µs`.
+    - Odeslání `ariadna_nav_state_t` (94 B @ 240 Hz) a `pos_status` (102 B @ 20 Hz) do DMA: `~15–25 µs`.
+  - **Souběh v nejhorším ticku (WCET):** IMU + Baro + Lidar + UWB + GPS v jednom slotu ≈ **`2,86 ms` z `4,17 ms` (~69 %)**.
+- **Core 1 (GPS + RX z Masteru):**
+  - Čtení GPS UART (115 200 baud, 5 Hz, omezeno na max 64 B/průchod) + `link_poll()` z Masteru (10 Hz). Vytížení **< 2 %**.
+- **Identifikované slabé místo / doporučení:**
+  - `s_uwb.poll()` (~1,7 ms I2C) je nejdelší blokující operace na Position MCU. Pokud by UWB tag na I2C držel *clock stretching* nebo došlo k timeoutu sběrnice, může jeden 240Hz tick přetéct. Position MCU navíc na rozdíl od Navigation MCU zatím nepočítá vlastní `loop_max_us` / `overruns` — při dalším ladění na reálném HW se vyplatí sledovat reálné `imu_hz` v diagnostice.
+
+---
+
+### 16.3 Navigation MCU (`Ariadna_V2/Navigation_MCU/Navigation_MCU.ino`, `guidance.cpp`)
+
+- **Core 0 (`200 Hz`, rozpočet `5 000 µs` na tick):**
+  - *Každý průchod:* `ariadna_uart_tx_service()` + `link_poll()` (`~5–15 µs`).
+  - *Periodický 200 Hz krok:*
+    - `nav_from_state()`, `nav_publish()` (seqlock), `phase_logic()`: `~10 µs`.
+    - `dg_step_control()` (navedení, `dg_gimbal_basis()`, dynamická inverze TVC, adaptace křidélek, `dg_fin_mix()`, `dg_terminal_throttle()`): vše fixní `float` bez velkých cyklů → **`~40–90 µs`**.
+    - `ariadna_seq_step()` + `pyro_write()` + `pyro_scan_continuity()` (3× `analogRead`): `~20 µs`.
+    - `link_send(ACTUATOR)` (42 B DMA) + `NAV_STATUS` (20 Hz, 98 B DMA) + RGB: `~15–45 µs`.
+  - **Celkem Core 0:** typicky **`100–200 µs` (2–4 %)**, WCET **`~350 µs` (7 %)** → **rezerva > 93 %**. Deska navíc měří `loop_max_us` a `overruns` přímo v reálném čase a posílá je do diagnostické konzole.
+- **Core 1 (`10 Hz`, rozpočet `100 000 µs` na slot — `dg_step_planner()`):**
+  - **Pád (`DG_PHASE_DESCENT`):**
+    - 10 Hz `dg_ign_compute()` (2D integrace pádu s odporem, typicky 300–1 500 kroků, strop 8 000): `~0,5–3 ms` (WCET ~10 ms).
+    - 1 Hz výpočet odpočtu nohou (`dg_solve_plan()` + `touchdown_time()`): `~25–50 ms` jednou za sekundu.
+  - **Zážeh (`DG_PHASE_IGNITING` / `DG_PHASE_BURN`):**
+    - 10 Hz volání `dg_solve_plan()` (až 34 projekcí po ~150–250 krocích `dt = 0,02 s`) **a následně `touchdown_time()`**, které simuluje zbytek hoření a každých `0,3 s` simulovaného času **znovu volá `dg_solve_plan()`** (~10–13× na začátku hoření).
+    - Na začátku hoření (~3–4 s do dosednutí) to představuje ~30 000–55 000 kroků `project_core()` (včetně `expf` v `ts_forecast()`), tedy **`~30–55 ms` v 100ms slotu (30–55 %)**. S klesající výškou výpočet rychle klesá pod 5 %.
+  - **Bezpečnostní izolace:** I kdyby v extrémním poruchovém scénáři (např. motor nezažehl ve velké výšce) výpočet `touchdown_time()` přetekl 100 ms, Core 1 pouze vynechá další 10Hz slot — **200Hz řídicí smyčka na Core 0 nikdy nečeká** (komunikuje přes neblokující seqlock).
+
+---
+
+### 16.4 Master MCU (`Ariadna_V2/Master_MCU/Master_MCU.ino`)
+
+- **Core 0 (`200 Hz`, rozpočet `5 000 µs` na tick):**
+  - *Každý průchod (nejvyšší priorita, bez čekání na 5ms tick):*
+    - `tx_service_all()` (DMA pro oba UARTy): `< 3 µs`.
+    - `poll_position()` → okamžité přeposlání `nav_state` (94 B) do Navigation přes DMA: `~15 µs`.
+    - `poll_navigation()` → okamžitý zápis serv na **PCA9685 přes I2C @ 400 kHz** (`servos_write()`):
+      - 1 byte po I2C @ 400 kHz trvá `22,5 µs` (9 bitů vč. ACK).
+      - 8 souvislých kanálů (33 B) = **`~0,76 ms`**; 16 kanálů (65 B) = **`~1,48 ms`**.
+      - *(Pozn.: komentář v hlavičce `Master_MCU.ino` odhadoval `~0,3 ms`; reálný čas I2C je `0,8–1,5 ms`, což ale stále zabírá jen 16–30 % z 5 ms periody.)*
+  - *Periodický 200 Hz krok:*
+    - `read_analogue()` (2× `analogRead`), `batt_service()`, `state_machine()`, `params_stream()`, `annunciate()`, `build_telemetry()`, `log_push()` (96 B do RAM ringu): `~50–80 µs`.
+    - `usb_service()` + `diag_emit()`: za letu `0 µs` (bez USB hosta), na zemi s GUI `~80–200 µs`.
+  - **Celkem Core 0:** za letu **18–32 %** (téměř vše je I2C na PCA9685; čisté CPU ~2–3 %), na zemi s USB diagnostikou **25–40 %**.
+- **Core 1 (W25Q128 Flash log + LoRa SX1278):**
+  - **W25Q128 Flash (SPI1 @ 20 MHz):**
+    - Za letu zapisuje `200 Hz × 96 B = 19,2 KB/s` (~75 stránek po 256 B za sekundu).
+    - SPI přenos jedné stránky (256 B @ 20 MHz) trvá jen `~110 µs`; čip následně programuje `~0,7–3 ms` a maže 4 KB sektor (1× za 213 ms, lookahead 64 KB) typicky `~45 ms` (max `400 ms` dle datasheetu).
+    - `flash_drain()` a `flash_erase_ahead()` **nikdy nečekají v blokující smyčce** (pouze polluje `flash_busy()`).
+    - **32 KB RAM ring buffer (`LOG_RING_SZ = 32768`)** absorbuje **1,70 s** nepřetržitého 200Hz záznamu, tedy více než 4× nejhorší dobu mazání sektoru (400 ms) — **žádná data se neztrácí a Core 0 nikdy nečeká**.
+  - **LoRa Ra-02 / SX1278 (SPI0, 10 Hz, 50 B, SF7 / BW 250 kHz / CR 4/5):**
+    - Přenos je **asynchronní** (`LoRa.endPacket(true)`), takže CPU na Core 1 stráví v driveru jen `~100–200 µs` (10×/s).
+    - Samotný čas na vzduchu (*airtime*) je **`48,8 ms`**, tedy **48,8 % duty cycle rádia** (překračuje EU limit 10 % pro 433 MHz ISM — pro legální provoz na 433 MHz je nutné snížit `ARIADNA_TLM_HZ` z 10 Hz na 2 Hz, jak upozorňuje `ariadna_link.h`).
+  - **Celkem Core 1:** čisté CPU **2–5 %**, vytížení flash čipu (BUSY) **25–35 %**.
+
+---
+
+### 16.5 Komunikační sběrnice a celková latence řetězce
+
+Změřené vytížení mezičipových UART linek (`921 600 baud`, DMA TX, ověřeno `make -C test link`):
+
+| Linka | Provoz | Vytížení linky | Rezerva |
+|---|---|---:|---:|
+| Position → Master | `nav_state` (94 B @ 240 Hz) + `pos_status` (102 B @ 20 Hz) | **29,2 %** | 70,8 % |
+| Master → Navigation | `nav_state` (94 B @ 240 Hz) + `master_state` (22 B @ 10 Hz) | **24,5 %** | 75,5 % |
+| Navigation → Master | `actuator` (42 B @ 200 Hz) + `nav_status` (98 B @ 20 Hz) | **11,2 %** | 88,8 % |
+
+**Celková latence řetězce (fyzický pohyb → nová PWM šířka na servu):**
+
+1. Position MCU (240 Hz vzorkování + filtr): `~2,1 ms` průměr (`4,2 ms` max)
+2. UART Position → Master (94 B @ 921 600 baud): `~1,0 ms`
+3. Master přeposlání + UART Master → Navigation: `~1,1 ms`
+4. Navigation MCU (200 Hz tick + `dg_step_control`): `~2,6 ms` průměr (`5,2 ms` max)
+5. UART Navigation → Master (42 B @ 921 600 baud): `~0,46 ms`
+6. Master → PCA9685 I2C zápis (`~0,8–1,5 ms`) + PWM perioda 339 Hz (`~1,5 ms` průměr, `2,95 ms` max)
+
+- **Výsledná latence end-to-end:** **~9–11 ms typicky** (nejhorší souběh **~15 ms**).
+- Při šířce pásma řídicí smyčky TVC `~9 rad/s` (~1,4 Hz) odpovídá 10 ms zpoždění fázovému zpoždění jen **~5°**, což je pro stabilizaci přistání s velkou rezervou vyhovující.
+
