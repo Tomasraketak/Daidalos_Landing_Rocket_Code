@@ -769,23 +769,30 @@ python -m pip install pyserial PyQt6 PyQt6-WebEngine pyqtgraph haversine
 python Ground_Visualizer\ground_visualizer.py
 ```
 
-* **Orientace třikrát**: navball (jako v KSP — špička rakety), **3-D model rakety** v rámci
-  rampy (oranžová = přistávací motor/špička, zelené = křidélko 1, plamen s výchylkou trysky)
-  a **terč náklonu**.
-* Karty: výška, stav mise (česky), rychlosti, zrychlení, **fáze navedení**, tah, klapka,
-  **baterie**, proud, **náklon**, GPS, **další událost s odpočtem** („ZÁŽEH za 2,1 s“ /
-  „DOSEDNUTÍ za 1,3 s“), **čas letu**, **posun od rampy**, **T-0 odpočet startu**
-  (nastavíte sekundy a stisknete START T-0 — raketa čas startu nezná, ten zná operátor),
-  signál, kvalita spoje, **chyba** (česky), UWB.
-* Lišty: zdraví subsystémů, pyro (kontinuita/odpáleno), **události letu** (apogeum,
-  aerokryt, zážeh 1, tah, zážeh 2, nohy, lidar, dosed).
-* **Rozložení:** vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC) přes celou
-  výšku okna, uprostřed karty v mřížce 4 × N s lištami a pod nimi orientace, mapa a TVC;
-  vpravo výškoměr. Záznam CSV (klávesa R).
-* **Grafy** mají popsané osy: vlevo jednotka, dole čas v sekundách před posledním paketem.
+* **Vzhled pro venek** (navrženo na Dell Vostro 7500: 15,6" FHD, matný panel ~300 nitů,
+  Windows 125 %): výchozí světlý kontrastní motiv **VENKU** (černý text na bílé — tmavé UI
+  na slunci splývá s odlesky), tlačítkem **☾ NOC / ☀ VENKU** vpravo nahoře se přepne na
+  tmavý motiv na soumrak; volba se pamatuje. Okno se otevře maximalizované.
+* **„Tmavý kokpit“**: zdravá hodnota = neutrální dlaždice se **zeleným pruhem** vlevo;
+  **varování = celá dlaždice žlutá**, **alarm = celá červená**. Křičí jen to, co je špatně.
+* **Horní řádek:** velký **stav mise**, **hodiny** (T− odpočet ze synchronizovaného odpočtu
+  rakety ⚡ nebo z místního START T-0, za letu T+ čas letu), upozornění SIMULACE / ZTRÁTA
+  SIGNÁLU, port + PŘIPOJIT, ZÁZNAM (klávesa R), MAPA ⭳, přepínač motivu.
+* **Druhý řádek (uplink):** RX okno, stav rampy, ACK; T-0 ZA (s), START T-0 (jen místní),
+  PŘÍPRAVA, ODPOČET → RAMPA, PADREF, RESTART a oddělené, největší tlačítko **ABORT**.
+* **Velké dlaždice:** výška, svislá rychlost, náklon (+ špička nahoru/dolů a směr), další
+  událost s odpočtem (do ZÁŽEHU / do PŘISTÁNÍ). **Menší:** vodorovná rychlost, zrychlení,
+  tah + clamp, baterie + proud, fáze navedení, GPS (satelity + HDOP), UWB (kotvy + fúze),
+  LoRa (kvalita spoje % + RSSI/SNR), poloha vůči rampě, chyba.
+* Lišty: zdraví subsystémů (porucha = červená), pyro (kontinuita/odpáleno), **události
+  letu** (apogeum, aerokryt, zážeh 1, tah, zážeh 2, nohy, lidar, dosed).
+* **Orientace třikrát**: navball (špička rakety), **3-D model rakety** v rámci rampy
+  (oranžová = přistávací motor/špička, zelené = křidélko 1) a **terč náklonu**; vedle mapa a
+  TVC s klapkou. Vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC; dole čas
+  v sekundách před posledním paketem), vpravo výškoměr s čarou zážehu.
 * **Mapa** (fw 3.28): letecký snímek **ČÚZK ortofoto, 15 cm/px** (zoom 20; mimo ČR Google).
   Při startu se stáhne do `Dokumenty/Daidalos/map_cache/aerial` kolem rampy (~60 MB) a pak
-  funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAP ⭳ PAD** stáhne mapu
+  funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAPA ⭳** stáhne mapu
   kolem aktuální rampy znovu. **Rampa** se bere z rakety: GPS poloha minus posun od rampy
   (`px/py`), průměrovaná na zemi (IDLE/ARMED), a ukládá se do `Dokumenty/Daidalos/pad.json`
   — příště se mapa stáhne rovnou tam. V rohu mapy: souřadnice rampy (zdroj), rakety a
