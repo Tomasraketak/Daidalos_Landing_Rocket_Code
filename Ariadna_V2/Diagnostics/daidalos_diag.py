@@ -323,6 +323,7 @@ class FlightSimBoard(ag.SimBoard):
         self.list_queue: list[str] = []
         self.raw = False
         self.next_raw = 0.0
+        self.next_uwb = 0.0
         self.srv_t0 = None
         self.srv_last = -1
 
@@ -771,12 +772,27 @@ class FlightSimBoard(ag.SimBoard):
         if self.raw and now >= self.next_raw:
             self.next_raw = now + 0.04
             return self._raw(now - self.t0)
+        if now >= self.next_uwb:
+            self.next_uwb = now + 0.5
+            return self._uwb_diag(now - self.t0)
         if now >= self.next_diag:
             self.next_diag = now + 0.02
             self.which = (self.which + 1) % 5
             if self.which:
                 return self._diag(self.which, now - self.t0)
         return super().readline(timeout)
+
+    @staticmethod
+    def _uwb_diag(t: float) -> str:
+        """Demo 2 Hz U line: 4 anchors around a 20 m pad square."""
+        anchors = [
+            [1, int(round((28.28 + 0.03 * math.sin(t)) * 100)), 22, -68, 3],
+            [2, int(round((28.31 + 0.03 * math.cos(t * 0.9)) * 100)), 44, -71, 3],
+            [3, int(round((28.25 + 0.02 * math.sin(t * 1.1)) * 100)), 68, -74, 3],
+            [4, int(round((28.29 + 0.02 * math.cos(t * 0.8)) * 100)), 92, -79, 3],
+        ]
+        d = {"t": int(t * 1000), "ok": 1, "fl": 3, "err": 0, "rej": 0, "na": 4, "a": anchors}
+        return "U " + json.dumps(d, separators=(",", ":"))
 
     def _sim_tilt(self, t: float):
         # standing on the pad, nose up, swaying a little
@@ -863,7 +879,7 @@ class FlightSimBoard(ag.SimBoard):
             fl = 0x12 | (8 if self.test else 0)
             if hil_on:
                 fl |= (1 if 2 <= st <= 6 else 0) | (0 if hil_pyro else hs.MST_PYRO_INHIBIT)
-            d = {"t": int(t * 1000), "fw": 332, "gv": 220, "st": st, "fl": fl,
+            d = {"t": int(t * 1000), "fw": 333, "gv": 220, "st": st, "fl": fl,
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
@@ -888,7 +904,7 @@ class FlightSimBoard(ag.SimBoard):
                      "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 333, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
                  "lat": h_lat if pos_hil else 497985411,
                  "lon": h_lon if pos_hil else 166912772,
@@ -903,7 +919,7 @@ class FlightSimBoard(ag.SimBoard):
         if hil_on:
             tvc = out["tvc_deg"]
             fin = out["fin_deg"]
-            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": out["nav_phase"],
+            d = {"ok": 1, "fw": 333, "pcrc": crc, "pseen": len(self.params), "ph": out["nav_phase"],
                  "k": round(out["k_plan"], 2), "thr": round(out["thr_est"], 1),
                  "hign": round(out["h_ign"], 1), "tc": round(out["tilt_cmd"], 3),
                  "te": round(out["tilt_err"], 3), "roll": 0.0,
@@ -925,7 +941,7 @@ class FlightSimBoard(ag.SimBoard):
             self._pol_uz = pol["uz"]
             tvc = pol["tvc_deg"]
             fin = pol["fin_deg"]
-            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0,
+            d = {"ok": 1, "fw": 333, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0,
                  "thr": round(pol["ref_thrust_n"], 1),
                  "hign": 0.0, "tc": 0.0, "te": round(pol["tilt_err"], 3), "roll": round(pol["roll_rate"], 2),
                  "tign": -1.0, "ttd": -1.0, "ts": 1.0, "fg": 1.0, "apo": 0.0, "res": 0.0,
@@ -935,7 +951,7 @@ class FlightSimBoard(ag.SimBoard):
                  "fin": [round(fin[0], 1), round(fin[1], 1), round(fin[2], 1), round(fin[3], 1)],
                  "afl": 3, "drag": 1.0, "blo": 0.0, "bhi": 0.0}
         else:
-            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+            d = {"ok": 1, "fw": 333, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
                  "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
                  "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
                  "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
@@ -1041,8 +1057,8 @@ def fmt(v, nd=1, unit="", sign=False):
 # ---------------------------------------------------------------------------
 class DiagWindow(ag.MainWindow):
     def __init__(self, cfg_path: str, demo: bool, port: str | None):
-        self.d: dict[str, dict] = {"M": {}, "N": {}, "P": {}, "G": {}, "R": {}}
-        self.d_time: dict[str, float] = {"M": 0.0, "N": 0.0, "P": 0.0, "G": 0.0, "R": 0.0}
+        self.d: dict[str, dict] = {"M": {}, "N": {}, "P": {}, "G": {}, "R": {}, "U": {}}
+        self.d_time: dict[str, float] = {"M": 0.0, "N": 0.0, "P": 0.0, "G": 0.0, "R": 0.0, "U": 0.0}
         self.flight_fw = False
         self.fw_info = ""
         self.test_on = False
@@ -1546,6 +1562,7 @@ class DiagWindow(ag.MainWindow):
 
         se = Card("Senzory", "GPS · UWB · lidar · barometr")
         self.sens_kv = KV(["GPS", "Poloha (lat, lon)", "GPS výška", "UWB", "UWB přesnost / reziduál",
+                           "UWB tag", "Kotva 1", "Kotva 2", "Kotva 3", "Kotva 4",
                            "Baro trim", "Pad tlak", "Lidar", "Teplota", "INS (INSLIB)"])
         se.lay.addWidget(self.sens_kv)
         self.sens_flags = Flags(SENS_BITS)
@@ -2049,7 +2066,7 @@ class DiagWindow(ag.MainWindow):
             if hd is not None and hasattr(self, "hil_tab"):
                 self.hil_tab.on_h_line(hd)
             return
-        if len(line) > 2 and line[0] in "MNPGR" and line[1] == " " and line[2] == "{":
+        if len(line) > 2 and line[0] in "MNPGRU" and line[1] == " " and line[2] == "{":
             try:
                 self.d[line[0]] = json.loads(line[2:])
                 self.d_time[line[0]] = time.monotonic()
@@ -2137,7 +2154,8 @@ class DiagWindow(ag.MainWindow):
 
     # ------------------------------------------------------------ refresh
     def _fresh_d(self, k: str) -> bool:
-        return self.link.is_open and time.monotonic() - self.d_time[k] < 1.0
+        limit = 1.5 if k == "U" else 1.0
+        return self.link.is_open and time.monotonic() - self.d_time[k] < limit
 
     def _feed_charts(self, k: str) -> None:
         if k == "R" and self.d["R"] and self.pause_btn.isChecked():
@@ -2509,6 +2527,46 @@ class DiagWindow(ag.MainWindow):
                              f"odmítnuto {u[3]}", GOOD if u[0] >= 3 else WARN)
             us = P.get("uwbs", [0, 0])
             self.sens_kv.set("UWB přesnost / reziduál", f"{us[0]:.2f} m / {us[1]:.2f} m")
+            U = self.d["U"] if self._fresh_d("U") else {}
+            if U:
+                tag_ok = bool(U.get("ok", 0))
+                u_err = U.get("err", 0)
+                u_rej = U.get("rej", 0)
+                if tag_ok:
+                    self.sens_kv.set("UWB tag",
+                                     f"OK · rádio aktivní · I2C chyby {u_err} · odmítnuto {u_rej}",
+                                     GOOD if u_err == 0 else WARN)
+                else:
+                    self.sens_kv.set("UWB tag",
+                                     f"OFFLINE / rádio neběží · I2C chyby {u_err}", WARN)
+                anchors = U.get("a", [])
+                for idx in range(4):
+                    key = f"Kotva {idx + 1}"
+                    if idx >= len(anchors):
+                        self.sens_kv.set(key, "—", DIM)
+                        continue
+                    addr, rcm, age_ms, rxp, afl = anchors[idx]
+                    if age_ms >= 65535 or rcm >= 65535:
+                        self.sens_kv.set(key, f"#{addr} · OFFLINE (nepřijata)", BAD)
+                    elif not (afl & 1):
+                        self.sens_kv.set(key,
+                                         f"#{addr} · OFFLINE (naposled {rcm / 100:.2f} m, {rxp} dBm, před {age_ms / 1000:.1f} s)",
+                                         WARN)
+                    else:
+                        used_s = " · v řešení" if (afl & 2) else ""
+                        if afl & 8:
+                            st_txt, col = "VELMI SLABÝ", WARN
+                        elif afl & 4:
+                            st_txt, col = "SLABÝ", WARN
+                        else:
+                            st_txt, col = "OK", GOOD
+                        self.sens_kv.set(key,
+                                         f"#{addr} · {st_txt} · {rcm / 100:.2f} m · {rxp} dBm · {age_ms} ms{used_s}",
+                                         col)
+            else:
+                self.sens_kv.set("UWB tag", "čeká na diagnostiku (2 Hz)", DIM)
+                for idx in range(4):
+                    self.sens_kv.set(f"Kotva {idx + 1}", "—", DIM)
             self.sens_kv.set("Baro trim", fmt(P.get("trim"), 2, "m"), WARN if abs(P.get("trim", 0)) > 1.4 else None)
             self.sens_kv.set("Pad tlak", fmt(P.get("pp"), 0, "Pa"))
             li = P.get("lidar", [0, 0])

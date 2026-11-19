@@ -624,12 +624,15 @@ public:
         _gen = 0;
         _last_good_ms = 0;
         _flags = 0;
+        _fast_selected = false;
+        _last_sel_ms = 0;
         for (uint8_t i = 0; i < ARIADNA_UWB_MAX_ANCHORS; i++) slot_clear(i);
         for (uint8_t i = 0; i < ARIADNA_UWB_LINK_SLOTS; i++) {
             _seen_addr[i] = 0;
             _seen_count[i] = 0;
         }
 #if ARIADNA_UWB_ENABLED
+        select_fast_mode();
         read_frame();
 #endif
         return present();
@@ -709,6 +712,48 @@ public:
     uint32_t rejected(void)    const { return _rejected; }
     uint32_t link_errors(void) const { return _link_errors; }
 
+    /** Fill the 2 Hz per-anchor diagnostic packet for Master -> GUI. */
+    void fill_diag(ariadna_uwb_diag_t *d, uint32_t now_ms, uint8_t used_mask) const
+    {
+        memset(d, 0, sizeof(*d));
+        d->t_ms        = now_ms;
+        d->link_errors = (uint16_t)(_link_errors > 65535u ? 65535u : _link_errors);
+        d->rejected    = (uint16_t)(_rejected > 65535u ? 65535u : _rejected);
+        d->tag_flags   = _flags;
+        d->tag_present = present() ? 1u : 0u;
+        const uint8_t na = UWB_ANCHOR_COUNT < 4u ? UWB_ANCHOR_COUNT : 4u;
+        d->n_anchors   = na;
+        for (uint8_t i = 0; i < 4u; i++) {
+            ariadna_uwb_anchor_diag_t &a = d->anchor[i];
+            if (i >= na) {
+                a.range_cm = ARIADNA_UWB_RANGE_NONE;
+                a.age_ms   = 0xFFFFu;
+                continue;
+            }
+            a.addr = s_uwb_anchors[i].addr;
+            const Slot &s = _slot[i];
+            if (s.last_ms != 0) {
+                const uint32_t age = (uint32_t)(now_ms - s.last_ms);
+                a.age_ms   = (uint16_t)(age > 65534u ? 65534u : age);
+                a.range_cm = ariadna_uwb_link_cm(s.last_range);
+                a.rxp_dbm  = s.rxp_dbm;
+                uint8_t fl = 0;
+                if (s.have && (uint32_t)(now_ms - s.t_ms) <= UWB_RANGE_MAX_AGE_MS)
+                    fl |= ARIADNA_UWBA_FRESH;
+                if (used_mask & (uint8_t)(1u << i))
+                    fl |= ARIADNA_UWBA_USED;
+                if (s.rxp_dbm < -85)      fl |= (ARIADNA_UWBA_WEAK | ARIADNA_UWBA_VWEAK);
+                else if (s.rxp_dbm < -80) fl |= ARIADNA_UWBA_WEAK;
+                a.flags = fl;
+            } else {
+                a.range_cm = ARIADNA_UWB_RANGE_NONE;
+                a.age_ms   = 0xFFFFu;
+                a.rxp_dbm  = 0;
+                a.flags    = 0;
+            }
+        }
+    }
+
     /** Age out slots. Called once per solve, so `fresh` is never stale. */
     void age(uint32_t now_ms)
     {
@@ -762,6 +807,7 @@ private:
         float    last_range;     // survives a dropout, for the jump test
         uint32_t t_ms;
         uint32_t last_ms;
+        int8_t   rxp_dbm;
         bool     have;
     };
 
@@ -772,13 +818,26 @@ private:
         _slot[i].last_range = 0.0f;
         _slot[i].t_ms       = 0;
         _slot[i].last_ms    = 0;
+        _slot[i].rxp_dbm    = 0;
         _slot[i].have       = false;
     }
 
+    /** Switch the tag into 34-byte fast frame mode (0.79 ms at 400 kHz). */
+    bool select_fast_mode(void)
+    {
+        if (!_wire) return false;
+        _wire->beginTransmission((uint8_t)ARIADNA_UWB_I2C_ADDR);
+        _wire->write((uint8_t)ARIADNA_UWB_REG_FAST);
+        _fast_selected = (_wire->endTransmission() == 0);
+        _last_sel_ms = millis();
+        return _fast_selected;
+    }
+
     /**
-     * One read of the tag's frame. A range is new when its tag slot shows
-     * a different anchor or a different count than the last read did;
-     * the same range read twice is fed in once.
+     * One read of the tag's compact 34-byte fast frame (~0.79 ms at 400 kHz).
+     * A range is new when its tag slot shows a different anchor or a
+     * different count than the last read did; the same range read twice is
+     * fed in once.
      *
      * The range's time is THIS board's clock at the end of the read,
      * minus the age the tag reported. The two boards share no clock, and
@@ -787,7 +846,12 @@ private:
     void read_frame(void)
     {
         if (!_wire) return;
-        uint8_t buf[ARIADNA_UWB_LINK_FRAME_SIZE];
+        const uint32_t now = millis();
+        if (!_fast_selected && (_last_sel_ms == 0 || (uint32_t)(now - _last_sel_ms) >= 1000u)) {
+            select_fast_mode();
+        }
+
+        uint8_t buf[ARIADNA_UWB_FAST_FRAME_SIZE];
         const size_t want = sizeof(buf);
         const size_t got  = _wire->requestFrom((uint8_t)ARIADNA_UWB_I2C_ADDR, want);
         size_t n = 0;
@@ -798,18 +862,28 @@ private:
         const uint32_t t_done = millis();
 
         ariadna_uwb_link_frame_t f;
-        if (got != want || n != want ||
-            ariadna_uwb_link_decode(buf, n, &f) != ARIADNA_UWB_LINK_OK) {
+        const int rc = (got == want && n == want)
+                           ? ariadna_uwb_fast_decode(buf, n, &f)
+                           : ARIADNA_UWB_LINK_E_SHORT;
+        if (rc != ARIADNA_UWB_LINK_OK) {
+            // If the tag power-cycled, it boots back in full-frame mode (0xA7);
+            // re-selecting fast mode recovers on the very next poll.
+            if (got == want && buf[0] == ARIADNA_UWB_LINK_MAGIC) {
+                select_fast_mode();
+            } else if (got == 0) {
+                _fast_selected = false;
+            }
             // Nobody there is a NACK and got == 0. Counted only once the
             // tag has been seen, so an absent tag does not read as a
             // stream of errors.
             if (_last_good_ms != 0 || got != 0) _link_errors++;
             return;
         }
+        _fast_selected = true;
         _last_good_ms = t_done ? t_done : 1;
         _flags = f.flags;
 
-        for (uint8_t i = 0; i < ARIADNA_UWB_LINK_SLOTS; i++) {
+        for (uint8_t i = 0; i < ARIADNA_UWB_FAST_SLOTS; i++) {
             const ariadna_uwb_link_slot_t &s = f.slot[i];
             if (!s.valid) { _seen_addr[i] = 0; continue; }
             if (s.addr == _seen_addr[i] && s.count == _seen_count[i]) continue;
@@ -867,6 +941,8 @@ private:
         s.t_ms       = t_ms;
         s.last_range = range_m;
         s.last_ms    = t_ms;
+        s.rxp_dbm    = (int8_t)(rx_power_dbm < -128.0f ? -128.0f
+                                : (rx_power_dbm > 127.0f ? 127.0f : rx_power_dbm));
         s.have       = true;
         _gen++;
     }
@@ -874,6 +950,8 @@ private:
     TwoWire *_wire = nullptr;
     uint8_t  _flags = 0;
     uint8_t  _fresh = 0;
+    bool     _fast_selected = false;
+    uint32_t _last_sel_ms = 0;
     uint32_t _gen = 0;
     uint32_t _rejected = 0;
     uint32_t _link_errors = 0;
@@ -3607,6 +3685,12 @@ void loop()
     // mistuned — it would end up roughly sqrt(5) times more confident in
     // its altitude than the sensor justifies, and quietly reject the GPS
     // corrections that disagree.
+    // At most one I2C peripheral (Baro 50 Hz, Lidar 50 Hz, UWB 25 Hz) is
+    // polled per 240 Hz tick so their bus transactions never stack inside
+    // the same 4.17 ms budget. Any deferred sensor runs on the very next
+    // tick (4.17 ms later), which is negligible for 25-50 Hz sensors and
+    // cuts Core 0 worst-case tick time roughly in half.
+    bool i2c_used = false;
     bool baro_fresh = false;
     if (s_hil_active) {
         if (s_hil_baro_pending) {
@@ -3627,6 +3711,7 @@ void loop()
         }
     } else if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
+        i2c_used = true;
         float p = sensor.readPressure();
         last_p_pa = p;
         // PROVISIONAL PAD REFERENCE (fw 3.21). Until fw 3.20 the reference
@@ -3809,8 +3894,10 @@ void loop()
         const bool leg_out = legs_ms != 0 &&
                              (uint32_t)(now_ms - legs_ms) >= (uint32_t)PRM(POS_LIDAR_DELAY);
 
-        if (PRM(POS_LIDAR_EN) > 0.5f && (int32_t)(now_ms - next_lidar_ms) >= 0) {
+        if (PRM(POS_LIDAR_EN) > 0.5f && (int32_t)(now_ms - next_lidar_ms) >= 0 &&
+            (s_hil_active || !i2c_used)) {
             next_lidar_ms = now_ms + (legs_ms ? 20 : 200);
+            if (!s_hil_active) i2c_used = true;
             const bool polled = s_hil_active ? s_hil_lidar_fresh : s_lidar.poll(now_ms);
             if (s_hil_active) s_hil_lidar_fresh = false;
             if (polled && leg_out) {
@@ -3902,9 +3989,10 @@ void loop()
                 s_uwb_fix.mask   = 0;
                 s_uwb_fix.residual_rms = 0.0f;
             }
-        } else if ((uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
+        } else if (!i2c_used && (uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
             last_uwb_solve_ms = now_ms;
-            s_uwb.poll();                    // ~1.7 ms of I2C at 400 kHz
+            i2c_used = true;
+            s_uwb.poll();                    // ~0.79 ms of I2C at 400 kHz (34 B fast frame)
             s_uwb.age(now_ms);
 
             if (s_uwb.fresh() == 0) {
@@ -4102,6 +4190,54 @@ void loop()
         }
 
         link_send(ARIADNA_PKT_POS_STATUS, &ps, sizeof(ps));
+    }
+
+    // ---- UWB per-anchor diagnostics, 2 Hz ----------------------------------
+    // Built from values already in memory (no I2C traffic) so the GUI can
+    // display each anchor's status, distance, RSSI and age.
+    {
+        static uint32_t next_uwb_diag_ms = 0;
+        if ((int32_t)(now_ms - next_uwb_diag_ms) >= 0) {
+            next_uwb_diag_ms = now_ms + 1000u / ARIADNA_UWB_DIAG_HZ;
+            ariadna_uwb_diag_t ud;
+            if (s_hil_active) {
+                memset(&ud, 0, sizeof(ud));
+                ud.t_ms        = now_ms;
+                ud.tag_present = 1;
+                ud.tag_flags   = ARIADNA_UWB_LF_RADIO_UP |
+                                 (s_hil_uwb_fresh_n > 0u ? ARIADNA_UWB_LF_RANGING : 0u);
+                const uint8_t na = UWB_ANCHOR_COUNT < 4u ? UWB_ANCHOR_COUNT : 4u;
+                ud.n_anchors   = na;
+                const uint32_t age = (s_hil_uwb_last_ms != 0u)
+                                         ? (uint32_t)(now_ms - s_hil_uwb_last_ms)
+                                         : 0xFFFFu;
+                for (uint8_t i = 0; i < 4u; i++) {
+                    ariadna_uwb_anchor_diag_t &a = ud.anchor[i];
+                    if (i >= na) {
+                        a.range_cm = ARIADNA_UWB_RANGE_NONE;
+                        a.age_ms   = 0xFFFFu;
+                        continue;
+                    }
+                    a.addr = s_uwb_anchors[i].addr;
+                    if ((s_hil_pkt.uwb_mask & (uint8_t)(1u << i)) &&
+                        s_hil_pkt.uwb_range_cm[i] > 0u && s_hil_uwb_last_ms != 0u) {
+                        a.range_cm = s_hil_pkt.uwb_range_cm[i];
+                        a.age_ms   = (uint16_t)(age > 65534u ? 65534u : age);
+                        a.rxp_dbm  = -68;
+                        a.flags    = (age <= UWB_RANGE_MAX_AGE_MS ? ARIADNA_UWBA_FRESH : 0u) |
+                                     ((s_uwb_fix.mask & (uint8_t)(1u << i)) ? ARIADNA_UWBA_USED : 0u);
+                    } else {
+                        a.range_cm = ARIADNA_UWB_RANGE_NONE;
+                        a.age_ms   = 0xFFFFu;
+                        a.rxp_dbm  = 0;
+                        a.flags    = 0;
+                    }
+                }
+            } else {
+                s_uwb.fill_diag(&ud, now_ms, s_uwb_fix.mask);
+            }
+            link_send(ARIADNA_PKT_UWB_DIAG, &ud, sizeof(ud));
+        }
     }
 
     // ---- raw sensor data, on request ---------------------------------------

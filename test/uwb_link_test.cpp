@@ -133,6 +133,71 @@ int main()
     check(ariadna_uwb_link_crc(probe, sizeof(probe)) == 0x29B1,
           "CRC-16/CCITT-FALSE check value, same as ariadna_crc16()");
 
+    // --- compact 34-byte fast frame ------------------------------------
+    printf("fast frame (34 B)\n");
+    check(ARIADNA_UWB_FAST_FRAME_SIZE == 34, "fast frame is 34 bytes");
+    sample(&in);
+    uint8_t fbuf[ARIADNA_UWB_FAST_FRAME_SIZE];
+    ariadna_uwb_fast_encode(&in, fbuf);
+    memset(&out, 0x5A, sizeof(out));
+    check(ariadna_uwb_fast_decode(fbuf, sizeof(fbuf), &out) == ARIADNA_UWB_LINK_OK,
+          "fast frame decodes");
+    check(out.flags == in.flags && out.seq == (in.seq & 0xFFu), "fast header survives");
+    check(out.n_valid == 4, "fast n_valid == 4");
+    for (int i = 0; i < 4; i++) {
+        const ariadna_uwb_link_slot_t &a = in.slot[i], &b = out.slot[i];
+        check(b.valid && b.addr == a.addr, "fast slot address");
+        check(fabsf(b.range_m - a.range_m) <= 0.005f, "fast range within 0.5 cm");
+        check(abs((int)b.age_ms - (int)a.age_ms) <= 1, "fast age within +-1 ms");
+        check(b.rxp_dbm == a.rxp_dbm && b.count == a.count, "fast rxp_dbm and count exact");
+    }
+    for (int i = 4; i < ARIADNA_UWB_LINK_SLOTS; i++)
+        check(!out.slot[i].valid && out.slot[i].addr == 0, "fast slots 4..7 empty");
+
+    // age_ms saturation (> 508 ms saturates to 510 ms > 500 ms expiry)
+    sample(&in);
+    in.slot[0].age_ms = 0;
+    in.slot[1].age_ms = 500;
+    in.slot[2].age_ms = 1200;
+    in.slot[3].valid  = 0;             // empty slot 3 backfilled from slot 5
+    in.slot[5].addr    = 99;
+    in.slot[5].range_m = 25.40f;
+    in.slot[5].age_ms  = 40;
+    in.slot[5].rxp_dbm = -86;
+    in.slot[5].count   = 7;
+    in.slot[5].valid   = 1;
+    ariadna_uwb_fast_encode(&in, fbuf);
+    check(ariadna_uwb_fast_decode(fbuf, sizeof(fbuf), &out) == ARIADNA_UWB_LINK_OK,
+          "fast age/backfill decodes");
+    check(out.slot[0].age_ms == 0 && out.slot[1].age_ms == 500 && out.slot[2].age_ms == 510,
+          "fast age 0, 500, and saturates at 510 ms");
+    check(out.slot[3].valid && out.slot[3].addr == 99 && out.slot[3].rxp_dbm == -86,
+          "empty fast slot backfilled from slot 5");
+
+    // fast frame bus faults
+    out = keep;
+    check(ariadna_uwb_fast_decode(ff, sizeof(fbuf), &out) != ARIADNA_UWB_LINK_OK,
+          "fast all 0xFF rejected");
+    check(ariadna_uwb_fast_decode(zz, sizeof(fbuf), &out) != ARIADNA_UWB_LINK_OK,
+          "fast all 0x00 rejected");
+    check(ariadna_uwb_fast_decode(fbuf, sizeof(fbuf) - 1, &out) == ARIADNA_UWB_LINK_E_SHORT,
+          "fast short read rejected");
+    check(ariadna_uwb_fast_decode(buf, sizeof(fbuf), &out) != ARIADNA_UWB_LINK_OK,
+          "full frame rejected by fast decoder");
+    check(memcmp(&out, &keep, sizeof(out)) == 0, "rejected fast frame leaves output untouched");
+
+    int fflips_caught = 0;
+    for (size_t byte = 0; byte < sizeof(fbuf); byte++) {
+        for (int bit = 0; bit < 8; bit++) {
+            uint8_t bad[sizeof(fbuf)];
+            memcpy(bad, fbuf, sizeof(fbuf));
+            bad[byte] ^= (uint8_t)(1u << bit);
+            if (ariadna_uwb_fast_decode(bad, sizeof(fbuf), &out) != ARIADNA_UWB_LINK_OK)
+                fflips_caught++;
+        }
+    }
+    check(fflips_caught == (int)sizeof(fbuf) * 8, "fast frame catches every single-bit error");
+
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

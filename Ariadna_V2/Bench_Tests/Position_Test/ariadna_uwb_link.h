@@ -88,6 +88,25 @@ extern "C" {
 #define ARIADNA_UWB_LINK_FRAME_SIZE (ARIADNA_UWB_LINK_HDR_SIZE + \
                                      ARIADNA_UWB_LINK_SLOTS * ARIADNA_UWB_LINK_SLOT_SIZE + 2)
 
+/**
+ * Optional 1-byte register write to switch the frame returned on subsequent
+ * reads. The tag boots in ARIADNA_UWB_REG_FULL (74 B) for backward
+ * compatibility with older readers; Position MCU switches to
+ * ARIADNA_UWB_REG_FAST (34 B) once at startup (and on link recovery),
+ * cutting I2C bus time from ~1.69 ms to ~0.79 ms at 400 kHz with zero
+ * loss of positioning accuracy (1 cm range, 1 dBm rxp_dbm, 2 ms age step
+ * up to 510 ms — above UWB_RANGE_MAX_AGE_MS = 500 ms).
+ */
+#define ARIADNA_UWB_REG_FULL        0x00u
+#define ARIADNA_UWB_REG_FAST        0x01u
+
+#define ARIADNA_UWB_FAST_MAGIC      0xA8
+#define ARIADNA_UWB_FAST_SLOTS      4
+#define ARIADNA_UWB_FAST_HDR_SIZE   4
+#define ARIADNA_UWB_FAST_SLOT_SIZE  7
+#define ARIADNA_UWB_FAST_FRAME_SIZE (ARIADNA_UWB_FAST_HDR_SIZE + \
+                                     ARIADNA_UWB_FAST_SLOTS * ARIADNA_UWB_FAST_SLOT_SIZE + 2)
+
 #define ARIADNA_UWB_RANGE_NONE      0xFFFFu
 
 /** The DW1000 answered with the right device ID and ranging is running. */
@@ -229,6 +248,129 @@ static inline int ariadna_uwb_link_decode(const uint8_t *buf, size_t n,
         s->valid   = (addr != 0 && cm != ARIADNA_UWB_RANGE_NONE) ? 1 : 0;
         s->range_m = s->valid ? (float)cm * 0.01f : 0.0f;
         if (s->valid) n_valid++;
+    }
+    f->n_valid = n_valid;
+    return ARIADNA_UWB_LINK_OK;
+}
+
+/**
+ * Encode the compact 34-byte fast frame (4 slots x 7 B + 4 B hdr + 2 B CRC).
+ *
+ * Layout (little-endian):
+ *   0   u8   magic     ARIADNA_UWB_FAST_MAGIC (0xA8)
+ *   1   u8   version   ARIADNA_UWB_LINK_VERSION
+ *   2   u8   flags     ARIADNA_UWB_LF_*
+ *   3   u8   seq_lo    f->seq & 0xFF
+ *   4   slot[4], each 7 bytes:
+ *         u16 addr     anchor short address (0 = empty)
+ *         u16 range_cm centimetres (0xFFFF = no range)
+ *         u8  age_2ms  age in 2 ms steps, saturating at 255 (= 510 ms)
+ *         i8  rxp_dbm  received power, dBm
+ *         u8  count    per-anchor ranging counter (wraps)
+ *  32   u16  crc       CRC-16/CCITT-FALSE over bytes 0..31
+ *
+ * Slots 0..3 are mapped 1-to-1 when valid so anchor indices never shift
+ * during normal 4-anchor operation; any empty fast slot is backfilled from
+ * slots 4..7 if valid.
+ */
+static inline void ariadna_uwb_fast_encode(const ariadna_uwb_link_frame_t *f,
+                                           uint8_t *out)
+{
+    uint8_t pick[ARIADNA_UWB_FAST_SLOTS];
+    uint8_t extra_idx = ARIADNA_UWB_FAST_SLOTS;
+    for (uint8_t i = 0; i < ARIADNA_UWB_FAST_SLOTS; i++) {
+        const ariadna_uwb_link_slot_t *s = &f->slot[i];
+        const uint16_t cm = s->valid ? ariadna_uwb_link_cm(s->range_m)
+                                     : (uint16_t)ARIADNA_UWB_RANGE_NONE;
+        if (s->addr != 0 && cm != ARIADNA_UWB_RANGE_NONE) {
+            pick[i] = i;
+        } else {
+            pick[i] = 0xFFu;
+            while (extra_idx < ARIADNA_UWB_LINK_SLOTS) {
+                const ariadna_uwb_link_slot_t *e = &f->slot[extra_idx];
+                const uint16_t ecm = e->valid ? ariadna_uwb_link_cm(e->range_m)
+                                              : (uint16_t)ARIADNA_UWB_RANGE_NONE;
+                if (e->addr != 0 && ecm != ARIADNA_UWB_RANGE_NONE) {
+                    pick[i] = extra_idx++;
+                    break;
+                }
+                extra_idx++;
+            }
+        }
+    }
+
+    uint8_t *p = out + ARIADNA_UWB_FAST_HDR_SIZE;
+    for (uint8_t i = 0; i < ARIADNA_UWB_FAST_SLOTS; i++, p += ARIADNA_UWB_FAST_SLOT_SIZE) {
+        if (pick[i] == 0xFFu) {
+            ariadna_uwb_link_put16(p + 0, 0);
+            ariadna_uwb_link_put16(p + 2, (uint16_t)ARIADNA_UWB_RANGE_NONE);
+            p[4] = 0;
+            p[5] = 0;
+            p[6] = 0;
+        } else {
+            const ariadna_uwb_link_slot_t *s = &f->slot[pick[i]];
+            const uint16_t cm = ariadna_uwb_link_cm(s->range_m);
+            uint32_t a2 = ((uint32_t)s->age_ms + 1u) >> 1;
+            if (a2 > 255u) a2 = 255u;
+            ariadna_uwb_link_put16(p + 0, s->addr);
+            ariadna_uwb_link_put16(p + 2, cm);
+            p[4] = (uint8_t)a2;
+            p[5] = (uint8_t)s->rxp_dbm;
+            p[6] = s->count;
+        }
+    }
+
+    out[0] = ARIADNA_UWB_FAST_MAGIC;
+    out[1] = ARIADNA_UWB_LINK_VERSION;
+    out[2] = f->flags;
+    out[3] = (uint8_t)(f->seq & 0xFFu);
+    const size_t body = ARIADNA_UWB_FAST_FRAME_SIZE - 2;
+    ariadna_uwb_link_put16(out + body, ariadna_uwb_link_crc(out, body));
+}
+
+/**
+ * Decode a 34-byte fast frame into `f`. Returns ARIADNA_UWB_LINK_OK and
+ * populates slots 0..3 (clearing slots 4..7), or returns a negative error
+ * code and leaves `f` untouched.
+ */
+static inline int ariadna_uwb_fast_decode(const uint8_t *buf, size_t n,
+                                          ariadna_uwb_link_frame_t *f)
+{
+    if (n < ARIADNA_UWB_FAST_FRAME_SIZE) return ARIADNA_UWB_LINK_E_SHORT;
+    const size_t body = ARIADNA_UWB_FAST_FRAME_SIZE - 2;
+    if (ariadna_uwb_link_crc(buf, body) != ariadna_uwb_link_get16(buf + body))
+        return ARIADNA_UWB_LINK_E_CRC;
+    if (buf[0] != ARIADNA_UWB_FAST_MAGIC)   return ARIADNA_UWB_LINK_E_MAGIC;
+    if (buf[1] != ARIADNA_UWB_LINK_VERSION) return ARIADNA_UWB_LINK_E_VERSION;
+
+    f->flags = buf[2];
+    f->seq   = buf[3];
+    f->total = 0;
+    f->_pad  = 0;
+    uint8_t n_valid = 0;
+    const uint8_t *p = buf + ARIADNA_UWB_FAST_HDR_SIZE;
+    for (uint8_t i = 0; i < ARIADNA_UWB_FAST_SLOTS; i++, p += ARIADNA_UWB_FAST_SLOT_SIZE) {
+        ariadna_uwb_link_slot_t *s = &f->slot[i];
+        const uint16_t addr = ariadna_uwb_link_get16(p + 0);
+        const uint16_t cm   = ariadna_uwb_link_get16(p + 2);
+        s->addr    = addr;
+        s->age_ms  = (uint16_t)p[4] * 2u;
+        s->rxp_dbm = (int8_t)p[5];
+        s->count   = p[6];
+        s->_pad    = 0;
+        s->valid   = (addr != 0 && cm != ARIADNA_UWB_RANGE_NONE) ? 1 : 0;
+        s->range_m = s->valid ? (float)cm * 0.01f : 0.0f;
+        if (s->valid) n_valid++;
+    }
+    for (uint8_t i = ARIADNA_UWB_FAST_SLOTS; i < ARIADNA_UWB_LINK_SLOTS; i++) {
+        ariadna_uwb_link_slot_t *s = &f->slot[i];
+        s->addr    = 0;
+        s->age_ms  = 0;
+        s->range_m = 0.0f;
+        s->rxp_dbm = 0;
+        s->count   = 0;
+        s->valid   = 0;
+        s->_pad    = 0;
     }
     f->n_valid = n_valid;
     return ARIADNA_UWB_LINK_OK;

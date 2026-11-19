@@ -345,6 +345,8 @@ static ariadna_pos_status_t  s_pos_status;
 static ariadna_raw_imu_t     s_raw;
 static bool                  s_raw_on  = false;
 static volatile bool         s_raw_new = false;
+static ariadna_uwb_diag_t    s_uwb_diag;
+static volatile bool         s_uwb_diag_new = false;
 
 static uint32_t s_nav_us = 0, s_act_us = 0;
 static bool     s_have_nav = false, s_have_act = false;
@@ -1220,6 +1222,9 @@ static void poll_position(void)
         } else if (type == ARIADNA_PKT_RAW_IMU) {
             // Stored only; printed by diag_emit(), outside the forwarding path.
             if (ariadna_unpack(pl, len, &s_raw, sizeof(s_raw))) s_raw_new = true;
+        } else if (type == ARIADNA_PKT_UWB_DIAG) {
+            // Stored only; printed by diag_emit() as a "U" JSON line at 2 Hz.
+            if (ariadna_unpack(pl, len, &s_uwb_diag, sizeof(s_uwb_diag))) s_uwb_diag_new = true;
         }
     }
 }
@@ -2946,6 +2951,25 @@ static void diag_emit(void)
             r.gyr_dps[0], r.gyr_dps[1], r.gyr_dps[2], r.mag_ut[0], r.mag_ut[1], r.mag_ut[2],
             r.mag_cal_ut[0], r.mag_cal_ut[1], r.mag_cal_ut[2], r.pressure_pa, r.temp_c,
             r.src, r.mag_fresh, r.imu_hz, r.gyr_off_dps[0], r.gyr_off_dps[1], r.gyr_off_dps[2]);
+        if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
+        n = 0;
+    }
+    if (s_uwb_diag_new) {
+        s_uwb_diag_new = false;
+        const ariadna_uwb_diag_t &u = s_uwb_diag;
+        n = snprintf(b, sizeof(b),
+            "U {\"t\":%lu,\"ok\":%u,\"fl\":%u,\"err\":%u,\"rej\":%u,\"na\":%u,\"a\":["
+            "[%u,%u,%u,%d,%u],[%u,%u,%u,%d,%u],[%u,%u,%u,%d,%u],[%u,%u,%u,%d,%u]]}\n",
+            (unsigned long)u.t_ms, (unsigned)u.tag_present, (unsigned)u.tag_flags,
+            (unsigned)u.link_errors, (unsigned)u.rejected, (unsigned)u.n_anchors,
+            (unsigned)u.anchor[0].addr, (unsigned)u.anchor[0].range_cm, (unsigned)u.anchor[0].age_ms,
+            (int)u.anchor[0].rxp_dbm, (unsigned)u.anchor[0].flags,
+            (unsigned)u.anchor[1].addr, (unsigned)u.anchor[1].range_cm, (unsigned)u.anchor[1].age_ms,
+            (int)u.anchor[1].rxp_dbm, (unsigned)u.anchor[1].flags,
+            (unsigned)u.anchor[2].addr, (unsigned)u.anchor[2].range_cm, (unsigned)u.anchor[2].age_ms,
+            (int)u.anchor[2].rxp_dbm, (unsigned)u.anchor[2].flags,
+            (unsigned)u.anchor[3].addr, (unsigned)u.anchor[3].range_cm, (unsigned)u.anchor[3].age_ms,
+            (int)u.anchor[3].rxp_dbm, (unsigned)u.anchor[3].flags);
         if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
         n = 0;
     }

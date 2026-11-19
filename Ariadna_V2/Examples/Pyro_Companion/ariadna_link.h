@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   332   // 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   333   // 3.33: UWB 34 B fast I2C frame (0.79 ms), Position MCU I2C sensor staggering (Core 0 WCET ~30 %), 2 Hz per-anchor UWB health diagnostics (ARIADNA_PKT_UWB_DIAG / USB "U" line). 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -138,6 +138,7 @@ typedef enum {
     ARIADNA_PKT_NAV_STATE    = 0x10,  // Position -> Master -> Navigation
     ARIADNA_PKT_POS_STATUS   = 0x11,  // Position -> Master
     ARIADNA_PKT_RAW_IMU      = 0x12,  // Position -> Master, only on request (diagnostics)
+    ARIADNA_PKT_UWB_DIAG     = 0x13,  // Position -> Master, 2 Hz per-anchor UWB health
     ARIADNA_PKT_ACTUATOR     = 0x20,  // Navigation -> Master
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
@@ -495,6 +496,40 @@ typedef struct {
 } ariadna_raw_imu_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 88, "raw_imu layout changed");
 
+// --- ariadna_uwb_anchor_diag_t.flags ---------------------------------
+#define ARIADNA_UWBA_FRESH   (1u << 0)  // ranged within UWB_RANGE_MAX_AGE_MS
+#define ARIADNA_UWBA_USED    (1u << 1)  // contributed to the last multilateration solve
+#define ARIADNA_UWBA_WEAK    (1u << 2)  // rxp_dbm < -80 dBm (1.4x sigma inflation)
+#define ARIADNA_UWBA_VWEAK   (1u << 3)  // rxp_dbm < -85 dBm (2.0x sigma inflation)
+
+/** Per-anchor health entry inside ariadna_uwb_diag_t. */
+typedef struct {
+    uint16_t addr;       // configured anchor short address (e.g. 1..4)
+    uint16_t range_cm;   // last accepted range, cm (0xFFFF = none)
+    uint16_t age_ms;     // age of last accepted range, ms (0xFFFF = never heard)
+    int8_t   rxp_dbm;    // received power, dBm (0 = unknown)
+    uint8_t  flags;      // ARIADNA_UWBA_*
+} ariadna_uwb_anchor_diag_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_uwb_anchor_diag_t) == 8, "uwb_anchor_diag layout changed");
+
+/**
+ * Per-anchor UWB health diagnostics, Position -> Master at ARIADNA_UWB_DIAG_HZ
+ * (2 Hz). Printed by Master to USB as a "U" JSON line so the diagnostic GUI
+ * shows each anchor's status, distance, RSSI and age without bloating the
+ * 20 Hz status packet or the 25 Hz I2C path.
+ */
+typedef struct {
+    uint32_t t_ms;
+    uint16_t link_errors;   // I2C link errors with tag (saturating)
+    uint16_t rejected;      // jump/range rejections (saturating)
+    ariadna_uwb_anchor_diag_t anchor[4];
+    uint8_t  tag_flags;     // ARIADNA_UWB_LF_* from tag
+    uint8_t  tag_present;   // 1 if tag answered recently with radio up
+    uint8_t  n_anchors;     // configured anchor count (<= 4)
+    uint8_t  _pad;
+} ariadna_uwb_diag_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_uwb_diag_t) == 44, "uwb_diag layout changed");
+
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED        (1u << 0)   // RBF removed and software armed
 #define ARIADNA_MST_RBF_OUT      (1u << 1)   // Remove-Before-Flight pin pulled
@@ -748,6 +783,7 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 52, "gs serial layout chang
 #define ARIADNA_STATUS_HZ       20   // housekeeping both ways
 #define ARIADNA_MASTER_HZ       10   // Master state broadcast
 #define ARIADNA_RAW_IMU_HZ      25   // ariadna_raw_imu_t, only on request
+#define ARIADNA_UWB_DIAG_HZ      2   // ariadna_uwb_diag_t, per-anchor UWB health
 
 // ---------------------------------------------------------------------
 //  LoRa radio

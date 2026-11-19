@@ -188,6 +188,8 @@ static void table_put(uint16_t addr, float range_m, float rxp_dbm)
  * otherwise leave this handler waiting the timeout once per remaining
  * byte, so the first refused byte ends the frame.
  */
+static volatile uint8_t s_i2c_reg = ARIADNA_UWB_REG_FULL;
+
 static void on_request(void)
 {
     static uint16_t seq = 0;
@@ -219,18 +221,32 @@ static void on_request(void)
     }
 
     uint8_t buf[ARIADNA_UWB_LINK_FRAME_SIZE];
-    ariadna_uwb_link_encode(&f, buf);
-    for (size_t i = 0; i < sizeof(buf); i++)
+    size_t len;
+    if (s_i2c_reg == ARIADNA_UWB_REG_FAST) {
+        ariadna_uwb_fast_encode(&f, buf);
+        len = ARIADNA_UWB_FAST_FRAME_SIZE;
+    } else {
+        ariadna_uwb_link_encode(&f, buf);
+        len = ARIADNA_UWB_LINK_FRAME_SIZE;
+    }
+    for (size_t i = 0; i < len; i++)
         if (TAG_I2C.write(buf[i]) != 1) break;
 
     s_last_read_ms = now;
     s_reads = s_reads + 1;
 }
 
-/** Writes from the master carry nothing; drain them so a bus scan's
- *  zero-length write or a stray byte cannot leave anything behind. */
+/** Optional 1-byte register select (0x00 = full 74 B frame, 0x01 = fast
+ *  34 B frame). Zero-length writes from a bus scan leave the mode
+ *  unchanged; any extra bytes are drained. */
 static void on_receive(int n)
 {
+    if (n > 0 && TAG_I2C.available()) {
+        const uint8_t reg = (uint8_t)TAG_I2C.read();
+        n--;
+        if (reg == ARIADNA_UWB_REG_FULL || reg == ARIADNA_UWB_REG_FAST)
+            s_i2c_reg = reg;
+    }
     while (n-- > 0 && TAG_I2C.available()) (void)TAG_I2C.read();
 }
 

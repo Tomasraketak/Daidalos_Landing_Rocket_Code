@@ -965,7 +965,7 @@ náhradní hlavičky neověří vše.
 ## 16. Audit výpočetní vytíženosti
 
 Podrobný rozbor reálného zatížení a časování všech tří palubních mikrokontrolérů
-(**fw 3.32**). Všechny tři desky běží na čipu **RP2350** (dvoujádrový ARM Cortex-M33
+(**fw 3.33**). Všechny tři desky běží na čipu **RP2350** (dvoujádrový ARM Cortex-M33
 @ **150 MHz**, hardwarová single-precision FPU `FPv5-SP-D16`, 520 KB SRAM, 16kanálové DMA).
 Veškerá matematika v řídicí a odhadové cestě používá nativní `float` (kompilováno s
 `-Wdouble-promotion`), takže se nikde neplatí emulace `double`.
@@ -974,15 +974,15 @@ Veškerá matematika v řídicí a odhadové cestě používá nativní `float` 
 
 | MCU (deska) | Jádro | Perioda / frekvence | Průměrné vytížení | Špička (WCET) v jednom slotu | Stíhá včas? | Hlavní odběratel času |
 |---|---|---|---:|---:|---|---|
-| **Position MCU** (XIAO RP2350) | **Core 0** | `4 167 µs` (240 Hz) | **18–25 %** *(čisté CPU ~8–12 %)* | **~69 %** (`~2,86 ms`) | **Ano** *(pozor na I2C UWB)* | `s_uwb.poll()` (~1,7 ms I2C @ 25 Hz), INSLIB/TriSense |
+| **Position MCU** (XIAO RP2350) | **Core 0** | `4 167 µs` (240 Hz) | **13–19 %** *(čisté CPU ~8–12 %)* | **~32 %** (`~1,33 ms`) | **Ano** (rezerva > 65 %) | `s_uwb.poll()` (`~0,79 ms` I2C @ 25 Hz, 34 B fast rámec), INSLIB/TriSense |
 | **Position MCU** (XIAO RP2350) | **Core 1** | průběžně (UART) | **< 2 %** | **< 5 %** | **Ano** (obrovská rezerva) | GPS NMEA 115 200 baud (5 Hz) + RX z Masteru |
 | **Navigation MCU** (XIAO RP2350) | **Core 0** | `5 000 µs` (200 Hz) | **2–4 %** (`~100–200 µs`) | **5–7 %** (`~250–350 µs`) | **Ano** (rezerva > 93 %) | `dg_step_control()`, sekvencer, 3× ADC kontinuity |
 | **Navigation MCU** (XIAO RP2350) | **Core 1** | `100 000 µs` (10 Hz) | **5–10 %** (pád) / **30–55 %** (začátek zážehu) | **~55 %** (`~55 ms`, nominální zážeh) | **Ano** *(Core 0 nikdy neblokuje)* | `dg_solve_plan()` + vnořené replany v `touchdown_time()` |
 | **Master MCU** (Pico 2 W) | **Core 0** | `5 000 µs` (200 Hz) | **18–32 %** *(čisté CPU ~2–3 %)* | **25–40 %** (`~1,2–2,0 ms`, s USB) | **Ano** (rezerva > 60 %) | I2C zápis PCA9685 @ 400 kHz (`~0,8–1,5 ms`) |
 | **Master MCU** (Pico 2 W) | **Core 1** | asynchronní | **2–5 % CPU** *(flash BUSY ~25–35 %)* | neblokující | **Ano** (32 KB RAM ring = 1,7 s) | W25Q128 SPI1 log (19,2 KB/s) + async LoRa SPI0 |
 
-> **Závěr auditu:** **Všechny 3 mikrokontroléry stíhají své výpočty i komunikaci včas s pohodlnou rezervou.**
-> Hlavní zátěží na Core 0 u Position a Master MCU není aritmetika CPU, ale **blokující I2C přenosy** (UWB tag na Position MCU, PCA9685 na Master MCU). Všechny dlouhé operace (plánovač, W25Q128 flash erase/write, LoRa TX, GPS NMEA) jsou správně odsunuty na Core 1 a komunikují přes neblokující seqlocky nebo DMA ring buffery.
+> **Závěr auditu:** **Všechny 3 mikrokontroléry stíhají své výpočty i komunikaci včas s velkou rezervou (> 60 % na všech Core 0 smyčkách).**
+> Hlavní zátěží na Core 0 u Position a Master MCU není aritmetika CPU, ale **blokující I2C přenosy** (UWB tag na Position MCU, PCA9685 na Master MCU). Od **fw 3.33** používá Position MCU kompaktní 34B UWB rámec a prokládání I2C senzorů, čímž špička na Core 0 klesla z ~69 % (`2,86 ms`) na **~32 % (`1,33 ms`)** bez jakéhokoli dopadu na přesnost polohy. Všechny dlouhé operace (plánovač, W25Q128 flash erase/write, LoRa TX, GPS NMEA) běží na Core 1 přes neblokující seqlocky nebo DMA ring buffery.
 
 ---
 
@@ -993,20 +993,22 @@ Veškerá matematika v řídicí a odhadové cestě používá nativní `float` 
     - `attitude_update()` — TriSense SPI @ 10 MHz (`~20–30 µs`) + INSLIB MEKF epocha (`~150–300 µs` na FPU, 200–240 Hz).
     - `ariadna_uart_tx_service()` — obsluha DMA ringu (`< 2 µs`, přenos po UART probíhá bez CPU).
     - `ariadna_rgb_service()` — `0 µs` při neměnné barvě; `~30 µs` (zakázaná IRQ na 1 NeoPixel) jen při změně stavu.
-  - *Periodický 240 Hz krok:*
+  - *Periodický 240 Hz krok (prokládání I2C — max. 1 I2C periferie za tick):*
     - `s_est.predict()` (3× nezávislý 1D Kalman 3×3, `float`): `~15–25 µs`.
     - Barometr BMP580 (`50 Hz`): I2C @ 400 kHz `~180–250 µs` + `fuse_baro()` `~10 µs`.
     - TF-Luna Lidar (`5 Hz` na rampě, `50 Hz` po otevření nohou): I2C @ 400 kHz (9 B) `~250–300 µs` + `fuse_range()` `~15 µs`.
     - **UWB tag + multilaterace (`25 Hz`, každých 40 ms):**
-      - `s_uwb.poll()` čte celý I2C rámec (`ARIADNA_UWB_LINK_FRAME_SIZE`) při 400 kHz → **`~1 700 µs` blokujícího I2C** (cca 41 % jednoho 240Hz slotu).
+      - Od **fw 3.33** přepne Position MCU tag jednobajtovým zápisem (`ARIADNA_UWB_REG_FAST = 0x01`) do **kompaktního 34B rychlého rámce** (`ARIADNA_UWB_FAST_MAGIC = 0xA8`: 4 B hlavička + 4 sloty × 7 B + 2 B CRC-16). Čtení `s_uwb.poll()` při 400 kHz trvá jen **`~790 µs`** (zrychlení 2,15× oproti původnímu 74B rámci za `1,69 ms`).
+      - **Nulový dopad na přesnost polohy:** rychlý rámec zachovává 1 cm rozlišení vzdálenosti (`range_cm`), 1 dBm `rxp_dbm` (pro NLOS škálování sigmy v `accept()`) i stáří měření v krocích 2 ms až do 510 ms (nad limitem `UWB_RANGE_MAX_AGE_MS = 500 ms`; max. kvantizační chyba ±1 ms = 4 cm při 40 m/s oproti šumu UWB 25 cm). Starý 74B rámec (`0xA7` / `0x00`) zůstává na tagu zpětně kompatibilní.
       - `ariadna_uwb_solve()` (max 8 Gauss-Newton iterací 3×3, FPU): `~80–150 µs` + `fuse_uwb()` `~15 µs`.
+    - **Prokládání I2C senzorů (`i2c_used`):** v jednom 240Hz ticku proběhne nejvýše jeden I2C přenos (Baro, Lidar nebo UWB); případný další senzor se obslouží hned v následujícím ticku (+4,17 ms, u 25–50 Hz senzorů zanedbatelné).
     - GPS fúze (`5 Hz`): `fuse_gps()` + `ins.feedGnss()` `~60–120 µs`.
-    - Odeslání `ariadna_nav_state_t` (94 B @ 240 Hz) a `pos_status` (102 B @ 20 Hz) do DMA: `~15–25 µs`.
-  - **Souběh v nejhorším ticku (WCET):** IMU + Baro + Lidar + UWB + GPS v jednom slotu ≈ **`2,86 ms` z `4,17 ms` (~69 %)**.
+    - Odeslání `ariadna_nav_state_t` (94 B @ 240 Hz), `pos_status` (102 B @ 20 Hz) a per-anchor UWB diagnostiky `ariadna_uwb_diag_t` (50 B @ 2 Hz, bez I2C přenosu — čte data z RAM) do DMA: `~15–25 µs`.
+  - **Souběh v nejhorším ticku (WCET):** IMU + UWB fast (34 B) + solve + GPS v jednom slotu ≈ **`1,33 ms` z `4,17 ms` (~32 %)** (sníženo z `2,86 ms` / 69 %).
 - **Core 1 (GPS + RX z Masteru):**
   - Čtení GPS UART (115 200 baud, 5 Hz, omezeno na max 64 B/průchod) + `link_poll()` z Masteru (10 Hz). Vytížení **< 2 %**.
-- **Identifikované slabé místo / doporučení:**
-  - `s_uwb.poll()` (~1,7 ms I2C) je nejdelší blokující operace na Position MCU. Pokud by UWB tag na I2C držel *clock stretching* nebo došlo k timeoutu sběrnice, může jeden 240Hz tick přetéct. Position MCU navíc na rozdíl od Navigation MCU zatím nepočítá vlastní `loop_max_us` / `overruns` — při dalším ladění na reálném HW se vyplatí sledovat reálné `imu_hz` v diagnostice.
+- **Diagnostika UWB kotev v GUI (fw 3.33):**
+  - Position MCU odesílá 2× za sekundu paket `ARIADNA_PKT_UWB_DIAG` (`0x13`, 44 B payload), který Master MCU přeposílá po USB jako JSON řádek `U {...}`. Na záložce **Poloha a senzory** v `daidalos_diag.py` jsou přímo vidět stav UWB tagu (rádio, I2C chyby, odmítnuté rozsahy) a jednotlivé řádky **Kotva 1–4** se stavem (`OK` / `SLABÝ` / `VELMI SLABÝ` / `OFFLINE`), vzdáleností (m), RSSI (dBm), stářím (ms) a účastí v multilateračním řešení.
 
 ---
 
@@ -1064,7 +1066,7 @@ Změřené vytížení mezičipových UART linek (`921 600 baud`, DMA TX, ověř
 
 | Linka | Provoz | Vytížení linky | Rezerva |
 |---|---|---:|---:|
-| Position → Master | `nav_state` (94 B @ 240 Hz) + `pos_status` (102 B @ 20 Hz) | **29,2 %** | 70,8 % |
+| Position → Master | `nav_state` (94 B @ 240 Hz) + `pos_status` (102 B @ 20 Hz) + `uwb_diag` (50 B @ 2 Hz) | **29,3 %** | 70,7 % |
 | Master → Navigation | `nav_state` (94 B @ 240 Hz) + `master_state` (22 B @ 10 Hz) | **24,5 %** | 75,5 % |
 | Navigation → Master | `actuator` (42 B @ 200 Hz) + `nav_status` (98 B @ 20 Hz) | **11,2 %** | 88,8 % |
 
