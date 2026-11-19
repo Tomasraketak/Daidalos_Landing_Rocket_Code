@@ -776,26 +776,44 @@ python Ground_Visualizer\ground_visualizer.py
 * **„Tmavý kokpit“**: zdravá hodnota = neutrální dlaždice se **zeleným pruhem** vlevo;
   **varování = celá dlaždice žlutá**, **alarm = celá červená**. Křičí jen to, co je špatně.
 * **Nahoře vždy vidět** (na všech záložkách): **stav mise**, **hodiny** (T− odpočet ze
-  synchronizovaného odpočtu rakety ⚡ nebo z místního START T-0, za letu T+ čas letu),
-  kvalita spoje LoRa, upozornění SIMULACE / ZTRÁTA SIGNÁLU a tlačítko **ABORT**.
-  Vpravo u záložek ZÁZNAM (klávesa R) a přepínač motivu.
+  synchronizovaného odpočtu rakety ⚡ nebo z místního odpočtu, za letu T+ čas letu),
+  kvalita spoje LoRa (při výpadku „x s bez paketu“), upozornění SIMULACE / ZTRÁTA SIGNÁLU
+  a tlačítko **ABORT**. U záložek ZÁZNAM (klávesa R), **🔊 HLAS** (narátor) a přepínač motivu.
 * **Tři záložky** (F1 / F2 / F3; při vzletu se samo přepne na LET):
-  1. **LET** — jen to podstatné za letu: velké dlaždice výška, svislá rychlost, další
-     událost s odpočtem (do ZÁŽEHU / do PŘISTÁNÍ), náklon, fáze navedení, vodorovná
-     rychlost; lišta událostí letu; **navball**; mapa; graf výšky; výškoměr s čarou zážehu.
+  1. **LET** — velké dlaždice výška, svislá rychlost, další událost s odpočtem (do ZÁŽEHU /
+     do PŘISTÁNÍ), náklon, fáze navedení, vodorovná rychlost; lišta událostí letu;
+     **naklápěcí 3-D model rakety** (oranžová = přistávací motor/špička, zelené = křidélko 1,
+     plamen s výchylkou trysky); pod ním malým písmem **„poslední paket před x s · průměrně
+     každých y ms (z Hz) · doručeno %“** (žlutě > 1 s, červeně > 3 s); mapa, graf výšky a
+     výškoměr s čarou zážehu.
   2. **START** — **kontrola před startem** (spoj, subsystémy, chyba, baterie, GPS, UWB,
-     pyro C1/C2, ARM/RBF, svislost, rampa) s pruhem **GO / GO s výhradou / NO-GO** a
-     důvody (orientační, platí jen v IDLE/ARMED); odpočet a rampa (RX okno, stav rampy, ACK,
-     T-0 ZA, START T-0, PŘÍPRAVA, ODPOČET → RAMPA); 3-D raketa a terč svislosti.
-  3. **DIAGNOSTIKA** — grafy zrychlení / svislé rychlosti / TVC, podrobné dlaždice (tah,
-     clamp, proud, GPS, UWB, LoRa RSSI/SNR, poloha vůči rampě, chyba, pakety), lišty
+     pyro C1/C2, ARM/RBF, svislost, rampa) s pruhem **GO / GO s výhradou / NO-GO**;
+     **předstartovní procedura** (viz níže); RX okno, stav rampy, ACK a terč svislosti.
+  3. **DIAGNOSTIKA** — grafy zrychlení / svislé rychlosti / TVC, podrobné dlaždice, lišty
      subsystémů a pyro, TVC s klapkou; připojení (port, PŘIPOJIT), ladicí příkazy PADREF a
-     RESTART, stažení mapy.
-* **Navball**: koule pevná vůči světu (modrá obloha, hnědá zem) viděná podél **špičky**;
-  střed = kam míří špička. Na rampě (náklon 0°) je ve středu **zenit (bílý křížek)** a
-  koule je celá modrá; při pádu špičkou dolů je celá hnědá a ve středu je **nadir (bílý
-  kroužek)**. Náklon = vzdálenost křížku/kroužku od středu, kroužky = 30° / 60° elevace,
-  písmena S/V/J/Z = světové strany.
+     RESTART, vlastní odpočet (libovolné sekundy, mimo proceduru) a stažení mapy.
+* **Předstartovní procedura — start za 30 s** (záložka START). Tlačítko **▶ ODESLAT: START
+  ZA 30 s** se odemkne, až jsou splněny všechny kroky:
+  1. spojení čerstvé (paket < 1 s, ≥ 90 % doručeno) — automaticky,
+  2. kontrola před startem bez NO-GO a raketa v IDLE/ARMED — automaticky,
+  3. **PŘÍPRAVA** odeslána (tlačítko ODESLAT u kroku) **a potvrzena raketou** (ACK OK),
+  4. rampa READY, klíč zapnut, kontinuita C1 — automaticky z LoRa sync,
+  5. záznam telemetrie běží (tlačítko ZAPNOUT u kroku),
+  6. až 8. ruční zaškrtnutí: prostor vyklizen · RBF vytažen a klíč rampy zapnut · souhlas
+     vedoucího startu.
+
+  Po stisku se otevře potvrzovací okno — **odeslat jde jen po napsání `START`**. Program pak
+  pošle `CMD:CD:30:1` a čeká na **potvrzení od rakety** v nejbližším RX okně (ACK v sync
+  paketu): „✔ POTVRZENO RAKETOU – odpočet běží“, nebo „✖ RAKETA ODMÍTLA: důvod“ (let,
+  stav, rampa, token), nebo po 25 s „⚠ nepotvrdila“. ABORT proceduru zruší; po vzletu se
+  zaškrtnutí vynulují.
+* **Narátor (🔊 HLAS, anglicky)**: odpočet „T minus ten · five · three · Start!“, „Countdown
+  confirmed / rejected“, „Liftoff“, události letu („Apogee. 161 meters“ — výška nad
+  rampou, „Cover released“, „Ignition“, „Thrust confirmed“, „Backup ignition“, „Landing legs
+  deployed“, „Lidar lock“, „Touchdown“), „Abort“, „Signal lost / regained“. Používá hlasy
+  Windows (Qt TextToSpeech, nic se neinstaluje); kvůli angličtině přidejte ve Windows
+  *Nastavení → Čas a jazyk → Řeč* anglický hlas — jinak mluví českým hlasem s přízvukem.
+  Zapnutí se pamatuje.
 * **Mapa** (fw 3.28): letecký snímek **ČÚZK ortofoto, 15 cm/px** (zoom 20; mimo ČR Google).
   Při startu se stáhne do `Dokumenty/Daidalos/map_cache/aerial` kolem rampy (~60 MB) a pak
   funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAPA ⭳** stáhne mapu

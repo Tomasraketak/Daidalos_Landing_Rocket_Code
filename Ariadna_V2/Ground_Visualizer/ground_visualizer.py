@@ -751,6 +751,14 @@ def build_qss() -> str:
                 padding:7px 26px; margin-right:4px; border-top-left-radius:8px; border-top-right-radius:8px; }}
     QTabBar::tab:selected {{ background:{t['accent']}; color:#ffffff; }}
     QTabBar::tab:hover:!selected {{ color:{t['text']}; }}
+    QLabel#LinkInfo {{ color:{t['muted']}; font-size:12px; font-weight:700; padding:2px 6px;
+                border-radius:4px; background:transparent; }}
+    QLabel#LinkInfo[level="warn"] {{ background:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#LinkInfo[level="bad"] {{ background:{t['bad']}; color:{t['bad_text']}; }}
+    QLabel#ProcText, QCheckBox#ProcCheck {{ color:{t['text']}; font-size:14px; font-weight:700;
+                background:transparent; }}
+    QCheckBox#ProcCheck::indicator {{ width:22px; height:22px; }}
+    QLineEdit {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']}; border-radius:6px; }}
     QLabel#Lamp {{ background:{t['idle']}; color:{t['idle_text']}; border:2px solid {t['idle']};
                 border-radius:4px; padding:1px 4px; font-size:12px; font-weight:800; }}
     QLabel#Lamp[kind="ok"] {{ background:{t['ok']}; border-color:{t['ok']}; color:{t['ok_text']}; }}
@@ -1016,193 +1024,6 @@ class TVCWidget(QtWidgets.QWidget):
         p.end()
 
 
-class NavBallWidget(QtWidgets.QWidget):
-    """
-    Navball: a sphere fixed to the world (blue sky above the horizon, brown
-    ground below), seen from inside the rocket along the NOSE. The centre of
-    the ball is where the nose points, so
-
-      * nose straight up (on the pad, 0 deg tilt)  -> the zenith is in the
-        centre and the whole ball is blue,
-      * nose on the horizon                       -> horizon through the centre,
-      * nose straight down (landing burn)          -> the whole ball is brown.
-
-    The tilt is the distance of the zenith (white cross) from the centre;
-    the rings are 30 / 60 deg of elevation. Nose down, the tilt is the
-    distance of the nadir (white ring) from the centre.
-    """
-
-    STEP = 10            # deg, resolution of the ground patches
-
-    def __init__(self):
-        super().__init__()
-        self.pitch = 90.0
-        self.roll = 0.0
-        self.yaw = 0.0
-        self.speed = 0.0
-        self.tilt = None
-        self.tilt_az = None
-        self.setMinimumSize(240, 260)
-        self.COLOR_SKY = QtGui.QColor("#2f86c9")
-        self.COLOR_GROUND = QtGui.QColor("#9a5a2c")
-
-    def update_attitude(self, pitch, roll, yaw=0.0, speed=0.0, tilt=None, tilt_az=None):
-        self.pitch, self.roll = pitch, roll
-        self.yaw = yaw % 360
-        self.speed = speed
-        self.tilt, self.tilt_az = tilt, tilt_az
-        self.update()
-
-    def _project_3d(self, lat, lon):
-        """World direction (elevation lat, compass lon) -> view (x, y, z);
-        z > 0 is the visible hemisphere, (0, 0, 1) is the nose."""
-        lat_r, lon_r = math.radians(lat), math.radians(lon)
-        x = math.cos(lat_r) * math.sin(lon_r)
-        y = math.sin(lat_r)
-        z = math.cos(lat_r) * math.cos(lon_r)
-
-        # turn the nose's compass heading to the front ...
-        yaw_r = math.radians(-self.yaw)
-        cy, sy = math.cos(yaw_r), math.sin(yaw_r)
-        x1, y1, z1 = x * cy + z * sy, y, -x * sy + z * cy
-
-        # ... then tip the nose's elevation to the centre: the point at
-        # elevation `pitch` on the front meridian lands on (0, 0, 1).
-        pitch_r = math.radians(self.pitch)
-        cp, sp = math.cos(pitch_r), math.sin(pitch_r)
-        x2, y2, z2 = x1, y1 * cp - z1 * sp, y1 * sp + z1 * cp
-
-        roll_r = math.radians(-self.roll)
-        cr, sr = math.cos(roll_r), math.sin(roll_r)
-        return x2 * cr - y2 * sr, x2 * sr + y2 * cr, z2
-
-    def _pt(self, p, cx, cy, r):
-        return QtCore.QPointF(cx + p[0] * r, cy - p[1] * r)
-
-    def _polyline(self, painter, pts, cx, cy, r, pen):
-        painter.setPen(pen)
-        for a, b in zip(pts, pts[1:]):
-            if a[2] > 0 and b[2] > 0:
-                painter.drawLine(self._pt(a, cx, cy, r), self._pt(b, cx, cy, r))
-
-    def _label(self, painter, text, lat, lon, cx, cy, r, font):
-        p = self._project_3d(lat, lon)
-        if p[2] < 0.2:
-            return
-        pt = self._pt(p, cx, cy, r)
-        painter.setFont(font)
-        m = painter.fontMetrics()
-        rect = QtCore.QRectF(pt.x() - m.horizontalAdvance(text) / 2 - 3, pt.y() - m.height() / 2,
-                             m.horizontalAdvance(text) + 6, m.height())
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(QtGui.QColor(0, 0, 0, 120))
-        painter.drawRoundedRect(rect, 3, 3)
-        painter.setPen(QtGui.QColor("#ffffff"))
-        painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, text)
-
-    def paintEvent(self, _event):
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        painter.setPen(QtGui.QPen(C("border"), 1))
-        painter.setBrush(C("panel"))
-        painter.drawRoundedRect(QtCore.QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
-
-        painter.setPen(C("muted"))
-        painter.setFont(ui_font(11, QtGui.QFont.Weight.ExtraBold))
-        painter.drawText(QtCore.QRectF(12, 6, rect.width() - 24, 16),
-                         QtCore.Qt.AlignmentFlag.AlignLeft, "ORIENTACE ŠPIČKY")
-
-        foot = 46
-        radius = max(40.0, min(rect.width() - 24, rect.height() - 28 - foot) / 2.0 - 6)
-        cx = rect.width() / 2.0
-        cy = 28 + 6 + radius
-        centre = QtCore.QPointF(cx, cy)
-
-        # sky, then the ground patches on top of it
-        path = QtGui.QPainterPath()
-        path.addEllipse(centre, radius, radius)
-        painter.setClipPath(path)
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(self.COLOR_SKY)
-        painter.drawEllipse(centre, radius, radius)
-        painter.setBrush(self.COLOR_GROUND)
-        painter.setPen(QtGui.QPen(self.COLOR_GROUND, 1))
-        s = self.STEP
-        for lat in range(-90, 0, s):
-            for lon in range(0, 360, s):
-                q = [self._project_3d(lat, lon), self._project_3d(lat + s, lon),
-                     self._project_3d(lat + s, lon + s), self._project_3d(lat, lon + s)]
-                if max(p[2] for p in q) > 0:
-                    painter.drawPolygon(QtGui.QPolygonF([self._pt(p, cx, cy, radius) for p in q]))
-
-        # a sparse grid: elevation rings at +-30/60, meridians every 45 deg,
-        # the horizon thick
-        thin = QtGui.QPen(QtGui.QColor(255, 255, 255, 110), 1.2)
-        for lat in (-60, -30, 30, 60):
-            self._polyline(painter, [self._project_3d(lat, lon) for lon in range(0, 361, 5)],
-                           cx, cy, radius, thin)
-        for lon in range(0, 360, 45):
-            self._polyline(painter, [self._project_3d(lat, lon) for lat in range(-85, 86, 5)],
-                           cx, cy, radius, thin)
-        self._polyline(painter, [self._project_3d(0, lon) for lon in range(0, 361, 3)],
-                       cx, cy, radius, QtGui.QPen(QtGui.QColor("#ffffff"), 3))
-
-        small = ui_font(11, QtGui.QFont.Weight.Bold)
-        for lat in (30, 60, -30, -60):
-            self._label(painter, f"{lat:+d}", lat, 0, cx, cy, radius, small)
-        big = ui_font(13, QtGui.QFont.Weight.ExtraBold)
-        for txt, lon in (("S", 0), ("V", 90), ("J", 180), ("Z", 270)):
-            self._label(painter, txt, 15 if self.pitch >= 0 else -15, lon, cx, cy, radius, big)
-
-        # the zenith: "straight up". Its distance from the centre is the tilt.
-        z = self._project_3d(90, 0)
-        if z[2] > 0:
-            zp = self._pt(z, cx, cy, radius)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 3))
-            painter.drawLine(QtCore.QPointF(zp.x() - 9, zp.y()), QtCore.QPointF(zp.x() + 9, zp.y()))
-            painter.drawLine(QtCore.QPointF(zp.x(), zp.y() - 9), QtCore.QPointF(zp.x(), zp.y() + 9))
-        # the nadir, "straight down" - what the landing burn aims at
-        n = self._project_3d(-90, 0)
-        if n[2] > 0:
-            npt = self._pt(n, cx, cy, radius)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 3))
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(npt, 8.0, 8.0)
-        painter.setClipping(False)
-
-        # bezel
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.setPen(QtGui.QPen(C("text"), 3))
-        painter.drawEllipse(centre, radius, radius)
-
-        # the nose: fixed in the centre
-        painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 6))
-        wing = [QtCore.QPointF(cx - 30, cy), QtCore.QPointF(cx - 11, cy),
-                QtCore.QPointF(cx, cy + 11), QtCore.QPointF(cx + 11, cy), QtCore.QPointF(cx + 30, cy)]
-        painter.drawPolyline(QtGui.QPolygonF(wing))
-        painter.setPen(QtGui.QPen(QtGui.QColor("#ffc400"), 3))
-        painter.drawPolyline(QtGui.QPolygonF(wing))
-        painter.setBrush(QtGui.QColor("#ffc400"))
-        painter.drawEllipse(centre, 4.0, 4.0)
-
-        # read-out under the ball
-        painter.setPen(C("text"))
-        painter.setFont(ui_font(16, QtGui.QFont.Weight.Bold, mono=True))
-        if self.tilt is None:
-            txt = "--"
-        else:
-            txt = f"náklon {self.tilt:.1f}°  směr {self.tilt_az:03.0f}°"
-        painter.drawText(QtCore.QRectF(0, rect.height() - foot + 4, rect.width(), 22),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, txt)
-        painter.setPen(C("muted"))
-        painter.setFont(ui_font(12, QtGui.QFont.Weight.Bold))
-        painter.drawText(QtCore.QRectF(0, rect.height() - foot + 24, rect.width(), 18),
-                         QtCore.Qt.AlignmentFlag.AlignCenter,
-                         f"špička {'NAHORU' if self.pitch >= 0 else 'DOLŮ'} · rychlost {self.speed:.1f} m/s")
-        painter.end()
-
-
 class AltimeterWidget(QtWidgets.QWidget):
     """
     Altitude tape, with the guidance handover altitude marked.
@@ -1278,6 +1099,100 @@ class AltimeterWidget(QtWidgets.QWidget):
         p.end()
 
 
+class Narrator(QtCore.QObject):
+    """
+    Speaks the countdown and the flight events, in English.
+
+    Uses Qt's own speech module (on Windows the SAPI / WinRT voices that come
+    with the system, nothing to install). Where that is missing it falls
+    back to a long-running PowerShell with System.Speech, so a phrase starts
+    in well under a second - a new process per phrase would be too late for
+    "three".
+    """
+
+    PS_SCRIPT = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "try{$s.SelectVoiceByHints('NotSet','NotSet',0,[Globalization.CultureInfo]'en-US')}catch{};"
+        "$s.Rate=1;"
+        "while(($l=[Console]::In.ReadLine()) -ne $null){"
+        "if($l.StartsWith('!')){$s.SpeakAsyncCancelAll();$l=$l.Substring(1)};"
+        "if($l){[void]$s.SpeakAsync($l)}}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.enabled = False
+        self.backend = "žádný"
+        self._tts = None
+        self._ps = None
+        try:
+            from PyQt6.QtTextToSpeech import QTextToSpeech
+            engines = QTextToSpeech.availableEngines()
+            engine = next((e for e in ("winrt", "sapi", "speechd", "flite", "macos") if e in engines),
+                          engines[0] if engines else None)
+            if engine is not None:
+                tts = QTextToSpeech(engine, self)
+                locs = [l for l in tts.availableLocales()
+                        if l.language() == QtCore.QLocale.Language.English]
+                if locs:
+                    us = [l for l in locs if l.territory() == QtCore.QLocale.Country.UnitedStates]
+                    tts.setLocale((us or locs)[0])
+                    self.backend = f"Qt {engine}"
+                else:
+                    # e.g. a Czech Windows with only the Czech voice: it still
+                    # speaks, with an accent. Add an English voice in Windows
+                    # Settings > Time & language > Speech.
+                    self.backend = f"Qt {engine} (bez anglického hlasu)"
+                if tts.availableVoices():
+                    tts.setRate(0.05)
+                    self._tts = tts
+        except Exception:
+            self._tts = None
+        if self._tts is None and sys.platform == "win32":
+            self._ps = QtCore.QProcess(self)
+            self._ps.start("powershell", ["-NoProfile", "-NonInteractive", "-Command", self.PS_SCRIPT])
+            self.backend = "Windows System.Speech"
+
+    @property
+    def available(self) -> bool:
+        return self._tts is not None or self._ps is not None
+
+    def say(self, text: str, urgent: bool = False, force: bool = False) -> None:
+        """urgent: cut off whatever is being said (countdown numbers)."""
+        if not (self.enabled or force) or not text:
+            return
+        if self._tts is not None:
+            if urgent or not hasattr(self._tts, "enqueue"):
+                self._tts.say(text)
+            else:
+                self._tts.enqueue(text)
+        elif self._ps is not None and self._ps.state() == QtCore.QProcess.ProcessState.Running:
+            self._ps.write((("!" if urgent else "") + text.replace("\n", " ") + "\n").encode("utf-8"))
+
+    def close(self) -> None:
+        if self._ps is not None:
+            self._ps.closeWriteChannel()
+            self._ps.waitForFinished(500)
+            self._ps.kill()
+
+
+# What the narrator says when a flight event bit comes up. APOGEE gets the
+# altitude added.
+EVENT_SPEECH = {
+    "APOGEE": "Apogee",
+    "COVER": "Cover released",
+    "IGN 1": "Ignition",
+    "THRUST": "Thrust confirmed",
+    "IGN 2": "Backup ignition",
+    "LEGS": "Landing legs deployed",
+    "LIDAR": "Lidar lock",
+    "DOWN": "Touchdown",
+}
+COUNTDOWN_SPEECH = ((10, "T minus ten"), (5, "five"), (3, "three"), (0, "Start!"))
+LAUNCH_CD_S = 30                       # the countdown the pre-launch procedure sends
+
+
 # ==============================================================================
 #  Main window
 # ==============================================================================
@@ -1295,6 +1210,14 @@ class GroundStation(QtWidgets.QMainWindow):
         self.is_test_mode = False
         self.last_state = None
         self.last_state_seen = None
+        self.rx_hist = []                      # arrival times of the last real packets
+        self._ul_pending = None                # uplink command waiting for the rocket's ACK
+        self._prep_ok = False
+        self._launch_note = None
+        self._cd_last = None
+        self._st_spoken = None
+        self._ev_prev = None
+        self._los_spoken = False
         self._rampa_check = ("idle", "bez spojení s rampou")
 
         self.is_recording = False
@@ -1428,6 +1351,15 @@ class GroundStation(QtWidgets.QMainWindow):
         self.record_btn = kbutton("● ZÁZNAM", "", "Nahrávat telemetrii do CSV v Dokumenty\\Daidalos (klávesa R)")
         self.record_btn.clicked.connect(self.toggle_recording)
         cl.addWidget(self.record_btn)
+        self.narrator = Narrator(self)
+        self.narr_btn = kbutton("🔊 HLAS", "", "Narátor (anglicky): odpočet 10, 5, 3, Start a události letu; "
+                                             "u apogea výška nad zemí")
+        self.narr_btn.setCheckable(True)
+        self.narr_btn.clicked.connect(self.toggle_narrator)
+        if not self.narrator.available:
+            self.narr_btn.setEnabled(False)
+            self.narr_btn.setToolTip("Hlasový výstup není k dispozici (chybí QtTextToSpeech i Windows hlas)")
+        cl.addWidget(self.narr_btn)
         self.theme_btn = kbutton("", "", "Přepnout vzhled: VENKU (světlý, na slunce) / NOC (tmavý)")
         self.theme_btn.setMinimumWidth(92)
         self.theme_btn.clicked.connect(self.toggle_theme)
@@ -1478,8 +1410,15 @@ class GroundStation(QtWidgets.QMainWindow):
         mid = QtWidgets.QVBoxLayout()
         mid.setSpacing(7)
         l1.addLayout(mid, 34)
-        self.navball = NavBallWidget()
-        mid.addWidget(self.navball, 1)
+        self.rocket_main = RocketView()
+        self.rocket_main.setMinimumSize(220, 240)
+        self.rocket_main.show_readout = False      # the NÁKLON tile says it, larger
+        mid.addWidget(self.rocket_main, 1)
+        self.link_info = QtWidgets.QLabel("rádio nepřipojeno")
+        self.link_info.setObjectName("LinkInfo")
+        self.link_info.setProperty("level", "")
+        self.link_info.setToolTip("Jak dávno přišel poslední paket a jak často chodí")
+        mid.addWidget(self.link_info)
 
         right = QtWidgets.QVBoxLayout()
         right.setSpacing(7)
@@ -1530,59 +1469,82 @@ class GroundStation(QtWidgets.QMainWindow):
         s_right.setSpacing(10)
         l2.addLayout(s_right, 44)
 
-        cd, cd_l = panel("Odpočet a rampa")
-        s_right.addWidget(cd)
+        proc, proc_l = panel(f"Předstartovní procedura · start za {LAUNCH_CD_S} s")
+        s_right.addWidget(proc)
+        self.proc_rows = {}
+        # (key, text, manual?, button)
+        steps = (
+            ("link", "Spojení s raketou čerstvé (paket < 1 s, ≥ 90 %)", False, None),
+            ("go", "Kontrola před startem bez NO-GO, raketa IDLE/ARMED", False, None),
+            ("prep", "PŘÍPRAVA odeslána a potvrzena raketou", False, ("ODESLAT", self.send_uplink_prep)),
+            ("rampa", "Rampa READY · klíč zapnut · kontinuita C1", False, None),
+            ("rec", "Záznam telemetrie běží", False, ("ZAPNOUT", self.start_recording)),
+            ("area", "Prostor vyklizen, všichni v bezpečné vzdálenosti", True, None),
+            ("rbf", "RBF vytažen, klíč rampy zapnut", True, None),
+            ("lead", "Vedoucí startu dal souhlas", True, None),
+        )
+        for key, text, manual, btn in steps:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            lamp = QtWidgets.QLabel("—")
+            lamp.setObjectName("Lamp")
+            lamp.setProperty("kind", "idle")
+            lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lamp.setFixedSize(54, 26)
+            row.addWidget(lamp)
+            if manual:
+                w = QtWidgets.QCheckBox(text)
+                w.setObjectName("ProcCheck")
+                w.toggled.connect(self.update_procedure)
+            else:
+                w = QtWidgets.QLabel(text)
+                w.setObjectName("ProcText")
+            row.addWidget(w, 1)
+            if btn:
+                b = kbutton(btn[0], "", "")
+                b.clicked.connect(btn[1])
+                b.setFixedWidth(92)
+                row.addWidget(b)
+            proc_l.addLayout(row)
+            self.proc_rows[key] = (lamp, w if manual else None)
+        self.launch_btn = kbutton(f"▶  ODESLAT: START ZA {LAUNCH_CD_S} s", "warn",
+                                  "Pošle raketě synchronizovaný odpočet. Rampa zažehne v T-0. "
+                                  "Vyžaduje potvrzení napsáním START a potvrzení od rakety.")
+        self.launch_btn.setMinimumHeight(46)
+        self.launch_btn.setStyleSheet("font-size:17px;")
+        self.launch_btn.clicked.connect(self.send_launch)
+        proc_l.addWidget(self.launch_btn)
+        self.launch_state = badge("Procedura nezahájena")
+        self.launch_state.setWordWrap(True)
+        proc_l.addWidget(self.launch_state)
+
+        link, link_l = panel("Uplink, rampa a svislost")
+        s_right.addWidget(link, 1)
+        lh = QtWidgets.QHBoxLayout()
+        lh.setSpacing(10)
+        link_l.addLayout(lh, 1)
+        lv = QtWidgets.QVBoxLayout()
+        lv.setSpacing(6)
+        lh.addLayout(lv, 1)
         self.ul_win_label = badge("RX OKNO: --")
-        cd_l.addWidget(self.ul_win_label)
+        lv.addWidget(self.ul_win_label)
         self.rampa_label = badge("RAMPA: OFFLINE")
-        cd_l.addWidget(self.rampa_label)
+        self.rampa_label.setWordWrap(True)
+        lv.addWidget(self.rampa_label)
         self.ul_ack_label = QtWidgets.QLabel("ACK: —")
         self.ul_ack_label.setObjectName("Ack")
-        cd_l.addWidget(self.ul_ack_label)
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(8)
-        cap = QtWidgets.QLabel("T-0 ZA")
-        cap.setObjectName("Caption")
-        row.addWidget(cap)
-        self.t0_spin = QtWidgets.QSpinBox()
-        self.t0_spin.setRange(5, 3600)
-        self.t0_spin.setValue(60)
-        self.t0_spin.setSuffix(" s")
-        self.t0_spin.setMinimumWidth(96)
-        row.addWidget(self.t0_spin)
-        self.t0_btn = kbutton("START T-0 (jen zde)", "", "Jen místní odpočet na této obrazovce (nic neodesílá)")
-        self.t0_btn.clicked.connect(self.toggle_countdown)
-        row.addWidget(self.t0_btn)
-        row.addStretch(1)
-        cd_l.addLayout(row)
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(8)
-        self.ul_prep_btn = kbutton("PŘÍPRAVA (PREP)", "info",
-                                   "Odešle pokyn Příprava / Start brzy (čerstvý PADREF + kontrola rampy)")
-        self.ul_prep_btn.clicked.connect(self.send_uplink_prep)
-        row.addWidget(self.ul_prep_btn, 1)
-        self.ul_cd_btn = kbutton("ODPOČET → RAMPA", "warn",
-                                 "Odešle synchronizovaný odpočet (dle pole T-0 ZA) raketě a přes pupeční I2C rampě")
-        self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
-        row.addWidget(self.ul_cd_btn, 1)
-        cd_l.addLayout(row)
+        lv.addWidget(self.ul_ack_label)
+        lv.addStretch(1)
+        self.tilt_bubble = TiltBubble()
+        self.tilt_bubble.setFixedSize(150, 150)
+        self.tilt_bubble.setToolTip("Kam se naklání špička: střed = svisle, kroužky 5 / 10 / 20°")
+        lh.addWidget(self.tilt_bubble)
+        self.rocket_view = self.rocket_main        # one 3-D view, on page 1
         self.t0_deadline = None
         self.t0_timer = QtCore.QTimer()
         self.t0_timer.timeout.connect(self.update_countdown)
-        self.t0_timer.start(200)
+        self.t0_timer.start(100)
 
-        vert, vert_l = panel("Raketa na rampě")
-        s_right.addWidget(vert, 1)
-        vr = QtWidgets.QHBoxLayout()
-        vr.setSpacing(8)
-        vert_l.addLayout(vr, 1)
-        self.rocket_view = RocketView()
-        self.rocket_view.setMinimumSize(180, 180)
-        self.rocket_view.show_readout = False      # the check list says it, larger
-        vr.addWidget(self.rocket_view, 1)
-        self.tilt_bubble = TiltBubble()
-        self.tilt_bubble.setMinimumSize(180, 180)
-        vr.addWidget(self.tilt_bubble, 1)
 
         # ---------------- 3. DIAGNOSTIKA: everything else ----------------
         p3, l3 = page()
@@ -1648,6 +1610,25 @@ class GroundStation(QtWidgets.QMainWindow):
         self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
         tools_l.addWidget(self.ul_reboot_btn)
         tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("VLASTNÍ ODPOČET (LADĚNÍ)")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        row = QtWidgets.QHBoxLayout()
+        self.t0_spin = QtWidgets.QSpinBox()
+        self.t0_spin.setRange(5, 3600)
+        self.t0_spin.setValue(60)
+        self.t0_spin.setSuffix(" s")
+        row.addWidget(self.t0_spin)
+        self.t0_btn = kbutton("T-0 jen zde", "", "Jen místní odpočet na této obrazovce (nic neodesílá)")
+        self.t0_btn.clicked.connect(self.toggle_countdown)
+        row.addWidget(self.t0_btn, 1)
+        tools_l.addLayout(row)
+        self.ul_cd_btn = kbutton("ODPOČET → RAMPA", "warn",
+                                 "Odešle synchronizovaný odpočet (dle pole výše) raketě a přes pupeční I2C "
+                                 "rampě - mimo předstartovní proceduru")
+        self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
+        tools_l.addWidget(self.ul_cd_btn)
+        tools_l.addSpacing(8)
         cap = QtWidgets.QLabel("MAPA")
         cap.setObjectName("Caption")
         tools_l.addWidget(cap)
@@ -1656,7 +1637,8 @@ class GroundStation(QtWidgets.QMainWindow):
         self.map_btn.clicked.connect(self.download_map_here)
         tools_l.addWidget(self.map_btn)
         tools_l.addStretch(1)
-        keys = QtWidgets.QLabel("F1 / F2 / F3 – záložky\nR – záznam\nPři startu se samo přepne na LET.")
+        keys = QtWidgets.QLabel("F1 / F2 / F3 – záložky\nR – záznam\nPři startu se samo přepne na LET.\n"
+                                f"Hlas: {self.narrator.backend}")
         keys.setObjectName("Caption")
         tools_l.addWidget(keys)
 
@@ -1685,6 +1667,12 @@ class GroundStation(QtWidgets.QMainWindow):
         self.status.showMessage("ODPOJENO")
         self.flight_t = None
         self.apply_look()
+        if self.narrator.available and str(QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation")
+                                           .value("narrator", "false")).lower() == "true":
+            self.narr_btn.setChecked(True)
+            self.narrator.enabled = True
+            set_level(self.narr_btn, "info", "kind")
+        self.update_procedure()
 
     # ------------------------------------------------------------- the look
     def apply_look(self):
@@ -1719,16 +1707,16 @@ class GroundStation(QtWidgets.QMainWindow):
             legend.setBrush(pg.mkBrush(T["plot_bg"]))
             legend.setPen(pg.mkPen(T["border"]))
 
-        rv = self.rocket_view
-        rv.bg, rv.fg, rv.dim = C("panel"), C("text"), C("dim")
-        rv.accent, rv.good, rv.warn, rv.bad = C("accent"), C("ok"), C("warn"), C("bad")
+        for rv in (self.rocket_main,):
+            rv.bg, rv.fg, rv.dim = C("panel"), C("text"), C("dim")
+            rv.accent, rv.good, rv.warn, rv.bad = C("accent"), C("ok"), C("warn"), C("bad")
         tb = self.tilt_bubble
         tb.bg, tb.ring, tb.label = C("panel"), C("dim"), C("text")
         tb.good, tb.warn, tb.bad = C("ok"), C("warn"), C("bad")
         tb.gate = C("ok", 60)
         self.map_widget.browser.page().setBackgroundColor(C("panel"))
         self.theme_btn.setText("☾ NOC" if T["key"] == "light" else "☀ VENKU")
-        for w in (self.navball, self.rocket_view, self.tilt_bubble, self.altimeter, self.tvc_widget):
+        for w in (self.rocket_main, self.tilt_bubble, self.altimeter, self.tvc_widget):
             w.update()
 
     def toggle_theme(self):
@@ -1780,20 +1768,235 @@ class GroundStation(QtWidgets.QMainWindow):
                 self.ul_win_label.setText(f"RX OKNO za {win_left:.1f} s ({src})")
                 set_level(self.ul_win_label, "info")
         if flying:
+            self._cd_last = None
+            if self.t0_deadline is not None:
+                self.t0_deadline = None
+                self._reset_procedure()
             ft = self.flight_t
             self.clock.setText(f"T+{ft:d} s" if ft is not None else "LET")
             set_level(self.clock, "ok")
             return
+        if self.t0_deadline is not None and time.time() - self.t0_deadline > 60.0:
+            self.t0_deadline = None            # T-0 long gone and no lift-off
+            self._reset_procedure()
         if rocket_rem is not None:
+            # follow the rocket's clock; when it stops reporting at T-0 the
+            # local deadline carries on from exactly there (and says "Start")
+            self.t0_deadline = time.time() + rocket_rem
             left, mark = rocket_rem, " ⚡"
         elif self.t0_deadline is not None:
             left, mark = self.t0_deadline - time.time(), ""
         else:
+            self._cd_last = None
             self.clock.setText("T  --:--")
             set_level(self.clock, "")
             return
+        self._narrate_countdown(left)
         self.clock.setText(self._fmt_t(left) + mark)
         set_level(self.clock, "warn" if left > 10 else "bad")
+
+    # ------------------------------------------------------------ narrator
+    def toggle_narrator(self):
+        on = self.narr_btn.isChecked()
+        self.narrator.enabled = on
+        set_level(self.narr_btn, "info" if on else "", "kind")
+        QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation").setValue("narrator", on)
+        if on:
+            self.narrator.say("Narrator on", urgent=True)
+
+    def _narrate_countdown(self, left):
+        """Say 10 / 5 / 3 / Start as the countdown crosses them. A quarter of
+        a second early, which is about how long a voice takes to start."""
+        lead = 0.25
+        prev = self._cd_last
+        self._cd_last = left
+        if prev is None or left is None:
+            return
+        for th, phrase in COUNTDOWN_SPEECH:
+            if prev > th + lead >= left:
+                self.narrator.say(phrase, urgent=True)
+
+    def _narrate_telemetry(self, d):
+        st = d["STATE"]
+        if self._st_spoken is not None and st != self._st_spoken:
+            if st == 3:
+                self.narrator.say("Liftoff", urgent=True)
+            elif st == 9:
+                self.narrator.say("Abort", urgent=True)
+            elif st == 11:
+                self.narrator.say("Error")
+        self._st_spoken = st
+        ev = d["EVENTS"]
+        if self._ev_prev is None or (st == 2 and ev == 0):
+            self._ev_prev = ev
+            return
+        new = ev & ~self._ev_prev
+        self._ev_prev = ev
+        for bit, name in EVENT_BITS:
+            if new & (1 << bit):
+                phrase = EVENT_SPEECH.get(name, name)
+                if name == "APOGEE":
+                    top = max(self.data_alt) if self.data_alt else d["ALT"]
+                    phrase = f"Apogee. {top:.0f} meters"
+                self.narrator.say(phrase)
+
+    # ------------------------------------------------- pre-launch procedure
+    def start_recording(self):
+        if not self.is_recording:
+            self.toggle_recording()
+
+    def _rampa_ready(self):
+        s = self.last_sync
+        if s is None or time.monotonic() - s["rx_mono"] > 15.0:
+            return False
+        rf = s["rampa_flags"]
+        return s["rampa_state"] == 2 and bool(rf & 0x01) and bool(rf & 0x02) and not s["rampa_fault"]
+
+    def update_procedure(self, *_):
+        if not hasattr(self, "proc_rows"):
+            return
+        age = time.time() - self.last_packet_time
+        auto = {
+            "link": (not self.is_test_mode and age < 1.0 and getattr(self, "_pdr", 0) >= 90),
+            "go": self.go_banner.property("level") in ("ok", "warn"),
+            "prep": self._prep_ok,
+            "rampa": self._rampa_ready(),
+            "rec": self.is_recording,
+        }
+        # a finished attempt (abort / rejected / no ACK) is cleared by starting
+        # to tick the list again
+        if self._launch_note in ("abort", "rejected", "timeout") and any(
+                chk is not None and chk.isChecked() for _l, chk in self.proc_rows.values()):
+            self._launch_note = None
+        all_ok = True
+        for key, (lamp, chk) in self.proc_rows.items():
+            ok = chk.isChecked() if chk is not None else auto.get(key, False)
+            all_ok &= ok
+            lamp.setText("OK" if ok else "—")
+            set_level(lamp, "ok" if ok else "idle", "kind")
+        busy = self._ul_pending is not None and self._ul_pending["kind"] == "cd"
+        counting = self.t0_deadline is not None
+        self.launch_btn.setEnabled(all_ok and not busy and not counting)
+        if not busy and not counting and self._launch_note is None:
+            self.launch_state.setText("Vše splněno – můžeš odeslat start" if all_ok
+                                      else "Čeká se na splnění všech kroků")
+            set_level(self.launch_state, "okline" if all_ok else "")
+
+    def send_launch(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Potvrzení startu")
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.setSpacing(10)
+        head = QtWidgets.QLabel(f"START ZA {LAUNCH_CD_S} s")
+        head.setObjectName("State")
+        head.setProperty("level", "warn")
+        head.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(head)
+        info = QtWidgets.QLabel(
+            f"Raketě se odešle synchronizovaný odpočet T-{LAUNCH_CD_S} s.\n"
+            "• Raketa ho potvrdí v nejbližším RX okně (do ~10 s) a předá čas rampě.\n"
+            "• V T-1 s je poslední nouzové okno pro ABORT.\n"
+            "• V T-0 rampa zažehne motor.\n\n"
+            "Pro potvrzení napiš velkými písmeny START:")
+        info.setStyleSheet("font-size:14px; font-weight:600;")
+        v.addWidget(info)
+        edit = QtWidgets.QLineEdit()
+        edit.setStyleSheet("font-size:20px; font-weight:800; padding:4px;")
+        v.addWidget(edit)
+        row = QtWidgets.QHBoxLayout()
+        cancel = kbutton("ZRUŠIT", "", "")
+        go = kbutton(f"ODESLAT START ZA {LAUNCH_CD_S} s", "warn", "")
+        go.setEnabled(False)
+        edit.textChanged.connect(lambda t: go.setEnabled(t.strip() == "START"))
+        cancel.clicked.connect(dlg.reject)
+        go.clicked.connect(dlg.accept)
+        row.addWidget(cancel)
+        row.addWidget(go, 1)
+        v.addLayout(row)
+        dlg.setMinimumWidth(460)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        if not self._send_ul(f"CMD:CD:{LAUNCH_CD_S}:1", f"START ZA {LAUNCH_CD_S} s", kind="cd"):
+            return
+        self.t0_deadline = time.time() + LAUNCH_CD_S
+        self._launch_note = "sent"
+        self.launch_state.setText("ODESLÁNO – čeká na potvrzení od rakety (nejbližší RX okno)…")
+        set_level(self.launch_state, "warn")
+        self.update_procedure()
+
+    def _resolve_ack(self, s):
+        p = self._ul_pending
+        if p is None:
+            return
+        seq, rc = s["last_cmd_seq"], s["last_cmd_rc"]
+        if (p["seq0"] is None and rc == 0) or seq == p["seq0"]:
+            return
+        self._ul_pending = None
+        ok = rc == 1
+        why = UL_RC_NAMES.get(rc, "?")
+        if p["kind"] == "prep":
+            self._prep_ok = ok
+        elif p["kind"] == "cd":
+            if ok:
+                self._launch_note = "ok"
+                self.launch_state.setText("✔ POTVRZENO RAKETOU – odpočet běží")
+                set_level(self.launch_state, "ok")
+                self.narrator.say("Countdown confirmed")
+            else:
+                self.t0_deadline = None
+                self._launch_note = "rejected"
+                self.launch_state.setText(f"✖ RAKETA ODMÍTLA: {why}")
+                set_level(self.launch_state, "bad")
+                self.narrator.say("Countdown rejected", urgent=True)
+        self.update_procedure()
+
+    def _check_ack_timeout(self):
+        p = self._ul_pending
+        if p is None or time.monotonic() - p["t"] < 25.0:
+            return
+        self._ul_pending = None
+        self.ul_ack_label.setText(f"BEZ POTVRZENÍ: {p['label']} (25 s)")
+        if p["kind"] == "cd":
+            self._launch_note = "timeout"
+            self.launch_state.setText("⚠ Raketa odpočet nepotvrdila do 25 s – zkontroluj spojení, "
+                                      "případně ABORT")
+            set_level(self.launch_state, "bad")
+            self.narrator.say("No confirmation", urgent=True)
+        self.update_procedure()
+
+    def _reset_procedure(self):
+        self._prep_ok = False
+        self._launch_note = None
+        for _lamp, chk in self.proc_rows.values():
+            if chk is not None:
+                chk.setChecked(False)
+        self.update_procedure()
+
+    # --------------------------------------------------- link on page 1
+    def _show_link_info(self):
+        now = time.time()
+        if self.is_test_mode or not getattr(self.serial_thread, "is_running", False):
+            self.link_info.setText("rádio nepřipojeno – zobrazuje se simulace" if self.is_test_mode
+                                   else "rádio nepřipojeno")
+            set_level(self.link_info, "")
+            return
+        if not self.rx_hist:
+            self.link_info.setText("zatím žádný paket")
+            set_level(self.link_info, "bad")
+            return
+        age = now - self.rx_hist[-1]
+        if len(self.rx_hist) >= 2:
+            span = self.rx_hist[-1] - self.rx_hist[0]
+            per = span / (len(self.rx_hist) - 1)
+            rate = f"průměrně každých {per * 1000:.0f} ms ({1.0 / per:.1f} Hz)" if per > 0 else ""
+        else:
+            rate = ""
+        self.link_info.setText(f"poslední paket před {age:.1f} s · {rate} · "
+                               f"doručeno {getattr(self, '_pdr', 0):.0f} %")
+        set_level(self.link_info, "bad" if age > 3.0 else "warn" if age > 1.0 else "")
+        if age > 1.0:
+            self.link_badge.setText(f"LoRa {age:.0f} s bez paketu")
+            set_level(self.link_badge, "bad" if age > 3.0 else "warn")
 
     # ------------------------------------------------- bidirectional LoRa uplink
     def send_utc_sync(self):
@@ -1825,19 +2028,28 @@ class GroundStation(QtWidgets.QMainWindow):
 
         rc_txt = UL_RC_NAMES.get(s["last_cmd_rc"], "?")
         self.ul_ack_label.setText(f"ACK #{s['last_cmd_seq']}: {rc_txt}")
+        self._resolve_ack(s)
         self.update_countdown()
+        self.update_procedure()
 
-    def _send_ul(self, line: str, label: str):
+    def _send_ul(self, line: str, label: str, kind: str = "") -> bool:
         if not getattr(self, "serial_thread", None) or not self.serial_thread.is_running:
             self.status.showMessage("UPLINK: Ground Station není připojená")
-            return
+            QtWidgets.QMessageBox.warning(self, "Uplink", "Pozemní stanice není připojená – příkaz nebyl odeslán.")
+            return False
         self.send_utc_sync()
         self.serial_thread.send_line(line)
         self.ul_ack_label.setText(f"VE FRONTĚ → {label} (čeká na RX okno)")
         self.status.showMessage(f"UPLINK zařazen: {label}")
+        # the rocket's ACK is the next change of last_cmd_seq in its sync packet
+        self._ul_pending = {"kind": kind or "other", "label": label, "t": time.monotonic(),
+                            "seq0": self.last_sync["last_cmd_seq"] if self.last_sync else None}
+        return True
 
     def send_uplink_prep(self):
-        self._send_ul("CMD:PREP", "START BRZY / PREP")
+        if self._send_ul("CMD:PREP", "PŘÍPRAVA (PREP)", kind="prep"):
+            self._prep_ok = False
+            self.update_procedure()
 
     def send_uplink_countdown(self):
         sec = int(self.t0_spin.value())
@@ -1850,12 +2062,18 @@ class GroundStation(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No)
         if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.t0_deadline = time.time() + sec
-            self._send_ul(f"CMD:CD:{sec}:1", f"ODPOČET T-{sec} s")
+            if self._send_ul(f"CMD:CD:{sec}:1", f"ODPOČET T-{sec} s", kind="cd"):
+                self.t0_deadline = time.time() + sec
 
     def send_uplink_abort(self):
         self.t0_deadline = None
-        self._send_ul("CMD:ABORT", "ABORT!")
+        self.narrator.say("Abort", urgent=True)
+        self._send_ul("CMD:ABORT", "ABORT!", kind="abort")
+        self._reset_procedure()
+        self.launch_state.setText("ABORT odeslán")
+        set_level(self.launch_state, "bad")
+        self._launch_note = "abort"
+
 
     def send_uplink_reboot(self):
         reply = QtWidgets.QMessageBox.question(
@@ -1891,6 +2109,7 @@ class GroundStation(QtWidgets.QMainWindow):
             set_level(self.record_btn, "danger", "kind")
             self.last_flush_time = time.time()
             self.status.showMessage(f"NAHRÁVÁM DO {filename}")
+            self.update_procedure()
         else:
             self.is_recording = False
             if self.csv_file:
@@ -1902,6 +2121,7 @@ class GroundStation(QtWidgets.QMainWindow):
             self.record_btn.setText("● ZÁZNAM")
             set_level(self.record_btn, "", "kind")
             self.status.showMessage("ZÁZNAM UKONČEN")
+            self.update_procedure()
 
     # ----------------------------------------------------------- connection
     def refresh_ports(self):
@@ -1949,8 +2169,15 @@ class GroundStation(QtWidgets.QMainWindow):
             self._pdr = pdr
             self._show_link()
 
+        self._show_link_info()
+        self._check_ack_timeout()
+        self.update_procedure()
         if getattr(self.serial_thread, "is_running", False):
-            self.los_label.setVisible(now - self.last_packet_time > 3.0)
+            lost = now - self.last_packet_time > 3.0
+            self.los_label.setVisible(lost)
+            if lost != self._los_spoken:
+                self.narrator.say("Signal lost" if lost else "Signal regained", urgent=lost)
+                self._los_spoken = lost
         else:
             self.los_label.setVisible(False)
             if now - self.boot_time > 5.0 and not self.is_test_mode:
@@ -2106,6 +2333,8 @@ class GroundStation(QtWidgets.QMainWindow):
         if not is_simulated:
             self.last_packet_time = time.time()
             self.rx_timestamps.append(self.last_packet_time)
+            self.rx_hist.append(self.last_packet_time)
+            del self.rx_hist[:-21]
             self.enable_test_mode(False)
 
             if self.is_recording and self.csv_writer:
@@ -2280,13 +2509,10 @@ class GroundStation(QtWidgets.QMainWindow):
         for bit, label in EVENT_BITS:
             self.event_strip.set(label, bool(d["EVENTS"] & (1 << bit)))
 
-        # The navball shows the NOSE: +90 pitch on the pad, -90 falling
-        # nose-first. The 3-D view and the bull's-eye need no convention.
-        self.navball.update_attitude(att["pitch"], 0.0, att["heading"], d["TOTVEL"],
-                                     att["tilt"], att["tilt_az"])
-        self.rocket_view.set_quaternion(*d["QUAT"])
-        self.rocket_view.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]),
-                                       burning=(d["PHASE"] == PHASE_BURN))
+        self._narrate_telemetry(d)
+        for rv in (self.rocket_main,):
+            rv.set_quaternion(*d["QUAT"])
+            rv.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]), burning=(d["PHASE"] == PHASE_BURN))
         self.tilt_bubble.set_tilt(att["tilt"], att["tilt_az"])
         self.altimeter.update_altitude(d["ALT"])
         self.tvc_widget.update_tvc(d["TVC_X"], d["TVC_Y"], d["CLAMP"], d["PHASE"])
@@ -2340,6 +2566,8 @@ class GroundStation(QtWidgets.QMainWindow):
             self.csv_file.close()
         if hasattr(self, "serial_thread"):
             self.serial_thread.disconnect_port()
+        if hasattr(self, "narrator"):
+            self.narrator.close()
         super().closeEvent(event)
 
 
