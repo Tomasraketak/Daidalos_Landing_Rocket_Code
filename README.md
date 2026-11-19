@@ -7,7 +7,7 @@
 >   nohou, bezpečnostní pojistky, obě GUI, všechny parametry, předletové testy a
 >   **[audit výpočetní vytíženosti všech 3 MCU](USER_MANUAL.md#16-audit-výpočetní-vytíženosti)**.
 > * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position and
->   Navigation MCU, firmware 3.32, flying the
+>   Navigation MCU, firmware 3.33, flying the
 >   [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
 >   (`Ariadna_V2/common/guidance.cpp`).
 > * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`
@@ -16,6 +16,12 @@
 >
 > The rest of this file describes `Daidalos_Landing_Guidance/`, the single-board V1
 > computer and its original guidance module, kept for reference.
+
+## Poděkování / Acknowledgements
+
+Vývoj projektu Daidalos byl podpořen fondem **[FOTOS (Filantropický odkaz Toma Schreckera)](https://www.gymtrebon.cz/c-618-fotos.html)** na **Gymnáziu, Třeboň, Na Sadech 308**, který vznikl z odkazu pana Toma Schreckera (jednoho z Wintonových dětí) na podporu vzdělávání, rozvoje nadání a studentských projektů.
+
+*The development of Project Daidalos was supported by the **[FOTOS fund (Philanthropic Legacy of Tom Schrecker)](https://www.gymtrebon.cz/c-618-fotos.html)** at **Gymnázium Třeboň**, established from the bequest of Tom Schrecker (one of the Winton children) to support education and student projects.*
 
 Flight code for a TVC model rocket that lands itself on a solid motor. It answers
 two questions, two hundred times a second:
