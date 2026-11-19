@@ -81,6 +81,10 @@
 #ifdef ARDUINO
 #include <Adafruit_NeoPixel.h>
 #endif
+// Anchor PCB carries an external SK6812 (RGB1) on D3 through R23 (200 ohm),
+// powered directly from 3V3 (Netlist_Anchor-PCB_2026-11-19.enet).
+#define ARIADNA_RGB_PIN        D3
+#define ARIADNA_RGB_POWER_PIN  0xFF
 #include "ariadna_rgb.h"
 #include "ariadna_uwb_link.h"
 

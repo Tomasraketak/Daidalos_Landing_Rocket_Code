@@ -251,11 +251,13 @@ static void test_all_types(void)
     roundtrip_one<ariadna_pos_status_t>(ARIADNA_PKT_POS_STATUS, "POS_STATUS round trip");
     roundtrip_one<ariadna_raw_imu_t>(ARIADNA_PKT_RAW_IMU, "RAW_IMU round trip");
     roundtrip_one<ariadna_uwb_diag_t>(ARIADNA_PKT_UWB_DIAG, "UWB_DIAG round trip");
+    roundtrip_one<ariadna_gps_time_t>(ARIADNA_PKT_GPS_TIME, "GPS_TIME round trip");
     roundtrip_one<ariadna_actuator_t>(ARIADNA_PKT_ACTUATOR,     "ACTUATOR round trip");
     roundtrip_one<ariadna_nav_status_t>(ARIADNA_PKT_NAV_STATUS, "NAV_STATUS round trip");
     roundtrip_one<ariadna_master_state_t>(ARIADNA_PKT_MASTER_STATE, "MASTER_STATE round trip");
     roundtrip_one<ariadna_cmd_t>(ARIADNA_PKT_CMD,               "CMD round trip");
     roundtrip_one<ariadna_gs_serial_t>(ARIADNA_PKT_TELEMETRY,   "GS_SERIAL round trip");
+    roundtrip_one<ariadna_gs_sync_t>(ARIADNA_PKT_GS_SYNC,       "GS_SYNC round trip");
 }
 
 // ---------------------------------------------------------------------

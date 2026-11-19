@@ -62,6 +62,7 @@
 #include "hardware/watchdog.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 
 // =====================================================================
@@ -77,9 +78,9 @@ static const int LORA_DIO0  = 21;
 static const int I2C_SDA    = 4;        // OLED
 static const int I2C_SCL    = 5;
 
-static const int TEST_ON_PIN   = 3;     // active LOW
-static const int TEST_OFF_PIN  = 6;     // active LOW
-static const int RESET_BTN_PIN = 10;    // active HIGH
+static const int TEST_ON_PIN   = 3;     // BL (GP3), 10k pull-down -> active HIGH
+static const int TEST_OFF_PIN  = 6;     // BC (GP6), 10k pull-down -> active HIGH
+static const int RESET_BTN_PIN = 10;    // BR (GP10), 10k pull-down -> active HIGH
 
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
@@ -98,6 +99,8 @@ static const char *STATE_NAME[12] = {
 // =====================================================================
 static ariadna_tlm_t      s_pkt;
 static ariadna_gs_serial_t s_out;
+static ariadna_lora_sync_t s_sync;
+static ariadna_gs_sync_t   s_sync_out;
 
 static bool     s_test_mode      = false;
 static uint32_t s_last_test_ms   = 0;
@@ -108,9 +111,29 @@ static uint32_t s_packet_delta   = 0;
 static uint32_t s_rx_count       = 0;
 static uint32_t s_rx_bad_size    = 0;
 static bool     s_have_packet    = false;
+static bool     s_have_sync      = false;
+static uint32_t s_last_sync_ms   = 0;
 
 static int      s_rssi           = 0;
 static int      s_snr            = 0;
+
+// ---- Time sync & uplink command queue (Core 0) ----------------------
+static uint32_t s_pc_utc_base_ms = 0;
+static uint32_t s_pc_utc_ref_ms  = 0;
+static bool     s_pc_utc_valid   = false;
+
+static bool     s_win_locked     = false;
+static uint32_t s_win_open_ms    = 0;
+static bool     s_win_is_final   = false;
+
+static bool     s_ul_pending     = false;
+static bool     s_ul_tx1_done    = false;
+static bool     s_ul_tx2_done    = false;
+static uint8_t  s_ul_seq         = 0;
+static uint8_t  s_ul_cmd         = ARIADNA_UL_NOP;
+static uint8_t  s_ul_target      = 0;
+static uint16_t s_ul_token       = 0;
+static uint32_t s_ul_t0_target_ms = 0;  // absolute GS millis() of target T-0 for COUNTDOWN
 
 static volatile bool s_setup_done = false;
 
@@ -123,9 +146,12 @@ struct DisplaySnapshot {
     uint32_t last_rx_ms;
     uint32_t packet_delta;
     uint32_t rx_count;
+    int32_t  t_launch_rem_ms;
     int      rssi, snr;
+    uint8_t  rampa_state;
     bool     have_packet;
     bool     test_mode;
+    bool     ul_pending;
 };
 
 static volatile uint32_t s_disp_seq = 0;
@@ -166,6 +192,13 @@ static void usb_send(const ariadna_gs_serial_t *g)
 {
     uint8_t frame[ARIADNA_FRAME_MAX];
     uint16_t n = ariadna_encode(frame, ARIADNA_PKT_TELEMETRY, g, sizeof(*g));
+    if (n) Serial.write(frame, n);
+}
+
+static void usb_send_sync(const ariadna_gs_sync_t *g)
+{
+    uint8_t frame[ARIADNA_FRAME_MAX];
+    uint16_t n = ariadna_encode(frame, ARIADNA_PKT_GS_SYNC, g, sizeof(*g));
     if (n) Serial.write(frame, n);
 }
 
@@ -275,6 +308,10 @@ static void display_flight(const DisplaySnapshot *d)
             // descending: the countdown to the ignition command
             display.print("IGN-");
             display.print(pkt.t_event_ds / 10.0f, 1);
+        } else if (d->t_launch_rem_ms >= 0) {
+            display.print("T-");
+            display.print(d->t_launch_rem_ms / 1000.0f, 1);
+            display.print("s");
         } else {
             display.print(pkt.curr_da / 10.0f, 1);
             display.print("A S:");
@@ -300,6 +337,7 @@ static void display_flight(const DisplaySnapshot *d)
 
     uint8_t err = (uint8_t)((pkt.flags & ARIADNA_TF_ERR_MASK) >> ARIADNA_TF_ERR_SHIFT);
     if (err) { display.print(" E"); display.print(err); }
+    if (d->ul_pending) { display.setCursor(110, 0); display.print("UL"); }
     if (d->test_mode) { display.setCursor(112, 52); display.print("[T]"); }
 
     display.display();
@@ -476,31 +514,160 @@ void setup()
 //  7. LOOP
 // =====================================================================
 // =====================================================================
-//  7. CORE 0 — receive and forward
+//  7. CORE 0 — receive, time-synced uplink TX, and USB forwarding
 //
-//  Nothing in this loop blocks. The OLED, which does, is on core 1.
+//  Nothing in this loop blocks except the ~28 ms uplink TX inside the
+//  Rocket's 300 ms RX window (when Rocket itself is not transmitting).
+//  The OLED, which blocks for 23 ms, is on core 1.
 // =====================================================================
+static uint32_t gs_utc_now_ms(uint32_t now)
+{
+    if (!s_pc_utc_valid) return ARIADNA_UTC_UNKNOWN;
+    return (s_pc_utc_base_ms + (uint32_t)(now - s_pc_utc_ref_ms)) % 86400000u;
+}
+
+static void gs_queue_cmd(uint8_t cmd, uint8_t target, uint16_t token, uint32_t cd_sec, uint32_t now)
+{
+    s_ul_seq = (uint8_t)(s_ul_seq + 1u);
+    if (s_ul_seq == 0u) s_ul_seq = 1u;
+    s_ul_cmd          = cmd;
+    s_ul_target       = target;
+    s_ul_token        = token;
+    s_ul_t0_target_ms = (cmd == ARIADNA_UL_COUNTDOWN) ? (now + cd_sec * 1000u) : 0u;
+    s_ul_pending      = true;
+    s_ul_tx1_done     = false;
+    s_ul_tx2_done     = false;
+}
+
+static void gs_handle_serial_line(const char *cmd, uint32_t now)
+{
+    if (!strcmp(cmd, "T:1")) {
+        s_test_mode_req = true;
+    } else if (!strcmp(cmd, "T:0")) {
+        s_test_mode_req = false;
+    } else if (!strncmp(cmd, "UTC:", 4)) {
+        const uint32_t u = (uint32_t)strtoul(cmd + 4, nullptr, 10);
+        if (u < 86400000u) {
+            s_pc_utc_base_ms = u;
+            s_pc_utc_ref_ms  = now;
+            s_pc_utc_valid   = true;
+        }
+    } else if (!strcmp(cmd, "CMD:PING")) {
+        gs_queue_cmd(ARIADNA_UL_NOP, 0, ARIADNA_UL_TOK_NONE, 0, now);
+    } else if (!strcmp(cmd, "CMD:PREP")) {
+        gs_queue_cmd(ARIADNA_UL_LAUNCH_SOON, 0, ARIADNA_UL_TOK_PREP, 0, now);
+    } else if (!strcmp(cmd, "CMD:ABORT")) {
+        gs_queue_cmd(ARIADNA_UL_ABORT, 0, ARIADNA_UL_TOK_ABORT, 0, now);
+    } else if (!strcmp(cmd, "CMD:PADREF")) {
+        gs_queue_cmd(ARIADNA_UL_PADREF, 0, ARIADNA_UL_TOK_NONE, 0, now);
+    } else if (!strcmp(cmd, "CMD:DISARM")) {
+        gs_queue_cmd(ARIADNA_UL_DISARM, 0, ARIADNA_UL_TOK_NONE, 0, now);
+    } else if (!strncmp(cmd, "CMD:REBOOT", 10)) {
+        uint8_t tgt = 0;
+        if (cmd[10] == ':') tgt = (uint8_t)atoi(cmd + 11);
+        gs_queue_cmd(ARIADNA_UL_REBOOT, tgt, ARIADNA_UL_TOK_REBOOT, 0, now);
+    } else if (!strncmp(cmd, "CMD:CD:", 7)) {
+        const char *p = cmd + 7;
+        const uint32_t sec = (uint32_t)strtoul(p, nullptr, 10);
+        uint8_t ch = 1;
+        const char *colon = strchr(p, ':');
+        if (colon) {
+            const int v = atoi(colon + 1);
+            if (v >= 1 && v <= 3) ch = (uint8_t)v;
+        }
+        if (sec >= 5u && sec <= 3600u) {
+            gs_queue_cmd(ARIADNA_UL_COUNTDOWN, ch, ARIADNA_UL_TOK_COUNTDOWN, sec, now);
+        }
+    }
+}
+
+static void gs_tx_uplink_now(uint32_t now, bool is_retry)
+{
+    ariadna_lora_uplink_t u;
+    memset(&u, 0, sizeof(u));
+    u.seq    = s_ul_seq;
+    u.cmd    = s_ul_cmd;
+    u.utc_ms = gs_utc_now_ms(now);
+    u.token  = s_ul_token;
+    u.target = s_ul_target;
+    u.flags  = (s_win_is_final ? ARIADNA_ULF_FINAL_WIN : 0u) |
+               (is_retry ? ARIADNA_ULF_RETRY : 0u);
+    if (s_ul_cmd == ARIADNA_UL_COUNTDOWN) {
+        const int32_t rem = (int32_t)(s_ul_t0_target_ms - now);
+        if (rem < (int32_t)ARIADNA_COUNTDOWN_MIN_MS) {
+            // Too close to T-0 by the time the window opened; drop safely.
+            s_ul_pending = false;
+            return;
+        }
+        u.arg_ms = (uint32_t)rem;
+    }
+    ariadna_lora_uplink_seal(&u);
+
+    if (LoRa.beginPacket()) {
+        LoRa.write((const uint8_t *)&u, sizeof(u));
+        LoRa.endPacket(false);   // ~28 ms blocking; Rocket is in RX mode
+        LoRa.receive();          // return immediately to RX for ACK beacon
+    }
+}
+
 void loop()
 {
     const uint32_t now = millis();
 
     // ---- commands from the laptop ---------------------------------------
-    // Plain text: it is typed by a human as often as it is sent by the
-    // visualiser, and a human cannot type a binary frame.
-    if (Serial.available()) {
-        static char cmd[16];
+    while (Serial.available()) {
+        static char cmd[64];
         static uint8_t n = 0;
         char c = (char)Serial.read();
         if (c == '\n' || c == '\r') {
-            cmd[n] = '\0';
-            if      (!strcmp(cmd, "T:1")) s_test_mode_req = true;
-            else if (!strcmp(cmd, "T:0")) s_test_mode_req = false;
-            n = 0;
+            if (n > 0) {
+                cmd[n] = '\0';
+                gs_handle_serial_line(cmd, now);
+                n = 0;
+            }
         } else if (n < sizeof(cmd) - 1) {
             cmd[n++] = c;
         }
     }
     s_test_mode = s_test_mode_req;
+
+    // ---- time-synced uplink TX inside Rocket's 300 ms RX window ---------
+    if (s_ul_pending) {
+        bool have_win = s_win_locked && (uint32_t)(now - s_last_sync_ms) < 12000u;
+        uint32_t w_open = s_win_open_ms;
+        if (!have_win && s_pc_utc_valid) {
+            // Fallback when downlink faded: align to UTC 10 s boundary.
+            const uint32_t u = gs_utc_now_ms(now);
+            const uint32_t rem = u % ARIADNA_LORA_WIN_PERIOD_MS;
+            if (rem < ARIADNA_LORA_WIN_DUR_MS) {
+                w_open = now - rem;
+                have_win = true;
+            }
+        }
+        if (have_win) {
+            const int32_t dt = (int32_t)(now - w_open);
+            const bool critical = (s_ul_cmd == ARIADNA_UL_ABORT || s_ul_cmd == ARIADNA_UL_COUNTDOWN);
+            if (!s_ul_tx1_done && dt >= (int32_t)ARIADNA_LORA_UL_OFFSET1_MS &&
+                dt < (int32_t)(ARIADNA_LORA_WIN_DUR_MS - 40u)) {
+                gs_tx_uplink_now(now, false);
+                s_ul_tx1_done = true;
+                if (!critical) s_ul_pending = false;
+            } else if (critical && s_ul_tx1_done && !s_ul_tx2_done &&
+                       dt >= (int32_t)ARIADNA_LORA_UL_OFFSET2_MS &&
+                       dt < (int32_t)(ARIADNA_LORA_WIN_DUR_MS - 35u)) {
+                gs_tx_uplink_now(now, true);
+                s_ul_tx2_done = true;
+                s_ul_pending  = false;
+            } else if (dt >= (int32_t)ARIADNA_LORA_WIN_DUR_MS) {
+                // Window passed; advance predicted window by 10 s so retries land cleanly.
+                if (s_ul_tx1_done) {
+                    s_ul_pending = false;
+                } else if (s_win_locked) {
+                    s_win_open_ms += ARIADNA_LORA_WIN_PERIOD_MS;
+                }
+            }
+        }
+    }
 
     // ---- LoRa reception ---------------------------------------------------
     int size = LoRa.parsePacket();
@@ -511,10 +678,6 @@ void loop()
             s_rssi = LoRa.packetRssi();
             s_snr  = (int)LoRa.packetSnr();
 
-            // A packet whose version we do not understand is dropped rather
-            // than decoded as if it were ours. This is what stops another
-            // team's flight computer on the pad next to yours from painting
-            // nonsense across your display.
             if (s_pkt.version != ARIADNA_TLM_VERSION) {
                 s_rx_bad_size++;
             } else {
@@ -529,6 +692,37 @@ void loop()
                 s_out.rssi = (int8_t)s_rssi;
                 s_out.snr  = (int8_t)s_snr;
                 usb_send(&s_out);
+            }
+        } else if (size == (int)sizeof(ariadna_lora_sync_t)) {
+            uint8_t sbuf[sizeof(ariadna_lora_sync_t)];
+            LoRa.readBytes(sbuf, sizeof(sbuf));
+            ariadna_lora_sync_t sb;
+            if (ariadna_lora_sync_decode(sbuf, sizeof(sbuf), &sb)) {
+                s_rssi = LoRa.packetRssi();
+                s_snr  = (int)LoRa.packetSnr();
+                s_sync = sb;
+                s_have_sync = true;
+                s_last_sync_ms = now;
+
+                // Lock Ground Station's RX-window clock to Rocket to <= 2 ms:
+                // packet left Rocket at `now - sync_air_ms`, and Rocket opens
+                // its next RX window `sb.next_rx_in_ms` after TX start.
+                const uint32_t sync_air_ms =
+                    ariadna_lora_airtime_us(sizeof(ariadna_lora_sync_t)) / 1000u;
+                s_win_open_ms  = (uint32_t)(now + (int32_t)sb.next_rx_in_ms - (int32_t)sync_air_ms);
+                s_win_is_final = (sb.sync_flags & ARIADNA_SYNCF_FINAL_WIN) != 0u;
+                s_win_locked   = true;
+
+                // Cancel pending retries if Rocket already ACKed this seq.
+                if (s_ul_pending && sb.last_cmd_seq == s_ul_seq && s_ul_tx1_done)
+                    s_ul_pending = false;
+
+                s_sync_out.sync = sb;
+                s_sync_out.rssi = (int8_t)s_rssi;
+                s_sync_out.snr  = (int8_t)s_snr;
+                usb_send_sync(&s_sync_out);
+            } else {
+                s_rx_bad_size++;
             }
         } else {
             // Wrong length: drain it so the radio is ready for the next.
@@ -559,10 +753,16 @@ void loop()
         d.last_rx_ms   = s_last_rx_ms;
         d.packet_delta = s_packet_delta;
         d.rx_count     = s_rx_count;
+        d.t_launch_rem_ms = (s_have_sync && (uint32_t)(now - s_last_sync_ms) < 2500u &&
+                             s_sync.t_launch_rem_ms >= 0)
+                                ? (s_sync.t_launch_rem_ms - (int32_t)(now - s_last_sync_ms))
+                                : -1;
         d.rssi         = s_rssi;
         d.snr          = s_snr;
+        d.rampa_state  = s_have_sync ? s_sync.rampa_state : 0;
         d.have_packet  = s_have_packet;
         d.test_mode    = s_test_mode;
+        d.ul_pending   = s_ul_pending;
         disp_publish(&d);
     }
 }
@@ -584,6 +784,9 @@ void loop1()
     const  uint32_t now = millis();
 
     // ---- buttons, ignored for the first 5 s while the lines settle --------
+    // Per Netlist_PCBGroundStation_2026-11-19.enet: BL (GP3), BC (GP6) and
+    // BR (GP10) all switch to 3V3 with 10 kOhm pull-downs (R31/R32/R33) ->
+    // all three buttons are ACTIVE HIGH.
     if (now > 5000) {
         if (digitalRead(RESET_BTN_PIN) == HIGH) {
             display_banner("RESETTING", "");
@@ -591,11 +794,11 @@ void loop1()
             watchdog_enable(1, 1);
             while (1) { }
         }
-        if (digitalRead(TEST_ON_PIN) == LOW && !s_test_mode_req) {
+        if (digitalRead(TEST_ON_PIN) == HIGH && !s_test_mode_req) {
             s_test_mode_req = true;
             display_test_status(true);
         }
-        if (digitalRead(TEST_OFF_PIN) == LOW && s_test_mode_req) {
+        if (digitalRead(TEST_OFF_PIN) == HIGH && s_test_mode_req) {
             s_test_mode_req = false;
             display_test_status(false);
         }

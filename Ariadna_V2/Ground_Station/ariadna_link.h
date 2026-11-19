@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   333   // 3.33: UWB 34 B fast I2C frame (0.79 ms), Position MCU I2C sensor staggering (Core 0 WCET ~30 %), 2 Hz per-anchor UWB health diagnostics (ARIADNA_PKT_UWB_DIAG / USB "U" line). 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   334   // 3.34: Bidirectional time-synced LoRa uplink (10 s + T-1 s final abort RX windows, <= 5 ms sync), Rampa umbilical I2C protocol + pre-liftoff detach, GPS UTC sync, Anchor D3 RGB & GS active-HIGH buttons. 3.33: UWB 34 B fast I2C frame (0.79 ms), Position MCU I2C sensor staggering (Core 0 WCET ~30 %), 2 Hz per-anchor UWB health diagnostics (ARIADNA_PKT_UWB_DIAG / USB "U" line). 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -139,12 +139,14 @@ typedef enum {
     ARIADNA_PKT_POS_STATUS   = 0x11,  // Position -> Master
     ARIADNA_PKT_RAW_IMU      = 0x12,  // Position -> Master, only on request (diagnostics)
     ARIADNA_PKT_UWB_DIAG     = 0x13,  // Position -> Master, 2 Hz per-anchor UWB health
+    ARIADNA_PKT_GPS_TIME     = 0x14,  // Position -> Master, 1 Hz GPS UTC time sync
     ARIADNA_PKT_ACTUATOR     = 0x20,  // Navigation -> Master
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
     ARIADNA_PKT_CMD          = 0x31,  // Master -> Position, Navigation
     ARIADNA_PKT_PARAM        = 0x32,  // Master -> Position, Navigation (ground only)
-    ARIADNA_PKT_TELEMETRY    = 0x40,  // Master -> LoRa -> Ground Station
+    ARIADNA_PKT_TELEMETRY    = 0x40,  // Master -> LoRa -> Ground Station -> PC
+    ARIADNA_PKT_GS_SYNC      = 0x41,  // Master -> LoRa -> Ground Station -> PC (sync/Rampa/ACK)
     ARIADNA_PKT_HIL_IN       = 0x50   // PC -> Position MCU (USB CDC HIL sensor frame)
 } ariadna_pkt_t;
 
@@ -530,6 +532,19 @@ typedef struct {
 } ariadna_uwb_diag_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_uwb_diag_t) == 44, "uwb_diag layout changed");
 
+/**
+ * GPS UTC time snapshot, Position -> Master at 1 Hz (ARIADNA_PKT_GPS_TIME).
+ * Used to align the 10-second LoRa uplink receive windows to UTC boundaries.
+ */
+typedef struct {
+    uint32_t t_ms;          // Position MCU millis() when utc_ms was valid
+    uint32_t utc_ms;        // UTC milliseconds since midnight (0..86399999)
+    uint16_t utc_date;      // packed DDMMYY? or day-of-year (DD*100 + MM)
+    uint8_t  valid;         // 1 = UTC time parsed from valid NMEA sentence
+    uint8_t  _pad;
+} ariadna_gps_time_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_gps_time_t) == 12, "gps_time layout changed");
+
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED        (1u << 0)   // RBF removed and software armed
 #define ARIADNA_MST_RBF_OUT      (1u << 1)   // Remove-Before-Flight pin pulled
@@ -645,7 +660,8 @@ typedef enum {
     ARIADNA_CMD_DISARM     = 4,
     ARIADNA_CMD_ABORT      = 5,   // park actuators, inhibit pyros, latch
     ARIADNA_CMD_TEST_MODE  = 6,   // arg: 1 enter, 0 leave
-    ARIADNA_CMD_ZERO_CLOCK = 7    // align mission clocks at launch detect
+    ARIADNA_CMD_ZERO_CLOCK = 7,   // align mission clocks at launch detect
+    ARIADNA_CMD_REBOOT     = 8    // ground-only watchdog reset (arg: 0 all, 1 pos, 2 nav)
 } ariadna_cmd_id_t;
 
 // ---------------------------------------------------------------------
@@ -1201,6 +1217,211 @@ static inline int ariadna_unpack(const uint8_t *payload, uint8_t len,
     if (len != expect) return 0;
     memcpy(dst, payload, expect);
     return 1;
+}
+
+// =====================================================================
+//  Bidirectional LoRa TDMA (Sync Beacon + Uplink Commands, fw 3.34)
+//
+//  Every ARIADNA_LORA_WIN_PERIOD_MS (10 s) — aligned to UTC 10 s boundaries
+//  when GPS UTC is available, or monotonic 10 s otherwise — the Rocket
+//  pauses downlink TX and opens a 300 ms RX window. During an active
+//  launch countdown, an extra mandatory 300 ms final-abort window ALWAYS
+//  opens centered at T - 1.000 s (T - 1150 ms .. T - 850 ms).
+//
+//  How <= 5 ms time sync is achieved (works WITH or WITHOUT GPS):
+//    1. Master MCU transmits a compact 28-byte ariadna_lora_sync_t beacon
+//       at 1 Hz (and immediately after every RX window as an ACK, plus at
+//       T-3 s / T-2 s), stamped with the exact `next_rx_in_ms` from TX start.
+//    2. Ground Station receives it at local `gs_rx_ms` and computes:
+//         gs_win_open_ms = gs_rx_ms + next_rx_in_ms - (airtime_us / 1000)
+//       giving ~2 ms phase lock independent of absolute clock offsets.
+//    3. If downlink fades, Ground Station falls back to PC UTC 10 s
+//       boundaries matching Rocket's GPS UTC 10 s boundaries.
+// =====================================================================
+#define ARIADNA_LORA_WIN_PERIOD_MS   10000u   // periodic RX window interval
+#define ARIADNA_LORA_WIN_DUR_MS        300u   // RX window duration (ms)
+#define ARIADNA_LORA_FINAL_WIN_MS     1000u   // mandatory T-1 s final abort window center
+#define ARIADNA_LORA_FINAL_HALF_MS     150u   // opens at T-1150 ms, closes at T-850 ms
+#define ARIADNA_LORA_TX_GUARD_MS        70u   // stop downlink TX this far before RX window
+#define ARIADNA_LORA_UL_OFFSET1_MS      55u   // GS 1st uplink TX offset inside 300 ms window
+#define ARIADNA_LORA_UL_OFFSET2_MS     165u   // GS 2nd (redundant) TX offset for ABORT/CD
+#define ARIADNA_UTC_UNKNOWN      0xFFFFFFFFu
+
+#define ARIADNA_LORA_SYNC_MAGIC       0xA6u
+#define ARIADNA_LORA_UPLINK_MAGIC     0xA9u
+#define ARIADNA_LORA_PROTO_VER           1u
+
+/** Ground Station -> Rocket uplink command IDs. */
+typedef enum {
+    ARIADNA_UL_NOP         = 0,  // ping / UTC time sync only
+    ARIADNA_UL_LAUNCH_SOON = 1,  // "start je blizko": fresh PADREF + ready Rampa + alert
+    ARIADNA_UL_COUNTDOWN   = 2,  // schedule launch in arg_ms (5 s .. 3600 s) via Rampa
+    ARIADNA_UL_ABORT       = 3,  // immediate launch abort & Rampa disarm (highest priority)
+    ARIADNA_UL_REBOOT      = 4,  // ground-only reboot (target: 0=all, 1=pos, 2=nav)
+    ARIADNA_UL_PADREF      = 5,  // re-capture baro/GPS pad reference
+    ARIADNA_UL_DISARM      = 6   // software disarm & cancel prepare
+} ariadna_ul_cmd_t;
+
+/** Safety confirmation tokens required for sensitive uplink commands. */
+#define ARIADNA_UL_TOK_NONE      0x0000u
+#define ARIADNA_UL_TOK_PREP      0x5052u
+#define ARIADNA_UL_TOK_COUNTDOWN 0xD41Du
+#define ARIADNA_UL_TOK_ABORT     0xAB07u
+#define ARIADNA_UL_TOK_REBOOT    0x5E5Eu
+
+/** Uplink command result codes echoed back in ariadna_lora_sync_t.last_cmd_rc. */
+typedef enum {
+    ARIADNA_ULRC_NONE          = 0,  // no command received yet
+    ARIADNA_ULRC_OK            = 1,  // accepted and applied
+    ARIADNA_ULRC_REJECT_FLIGHT = 2,  // refused: vehicle is in flight
+    ARIADNA_ULRC_REJECT_STATE  = 3,  // refused: wrong mission state or Rocket fault
+    ARIADNA_ULRC_REJECT_RAMPA  = 4,  // refused: Rampa offline / key off / no continuity / fault
+    ARIADNA_ULRC_REJECT_TOKEN  = 5,  // refused: bad safety token or out-of-range arg
+    ARIADNA_ULRC_ABORTED       = 6   // ABORT executed (countdown cancelled, Rampa disarmed)
+} ariadna_ul_rc_t;
+
+// --- ariadna_lora_sync_t.sync_flags ----------------------------------
+#define ARIADNA_SYNCF_GPS_UTC      (1u << 0)  // Rocket has valid GPS UTC clock
+#define ARIADNA_SYNCF_FINAL_WIN    (1u << 1)  // next_rx_in_ms points to T-1 s final abort window
+#define ARIADNA_SYNCF_RAMPA_DETACH (1u << 2)  // Rampa I2C cleanly detached for liftoff
+#define ARIADNA_SYNCF_LAUNCH_SOON  (1u << 3)  // PREPARE / launch-soon posture active
+#define ARIADNA_SYNCF_CD_ACTIVE    (1u << 4)  // synchronized T-0 countdown active
+#define ARIADNA_SYNCF_ROCKET_READY (1u << 5)  // Rocket Go/No-Go passes (POST+links+NAV_VALID)
+
+// --- ariadna_lora_uplink_t.flags -------------------------------------
+#define ARIADNA_ULF_FINAL_WIN      (1u << 0)  // sent inside the T-1 s final abort window
+#define ARIADNA_ULF_RETRY          (1u << 1)  // redundant 2nd copy inside same window
+
+#pragma pack(push, 1)
+/** Rocket -> Ground Station LoRa sync/ACK/Rampa status packet (28 bytes). */
+typedef struct {
+    uint8_t  magic;            //  0  ARIADNA_LORA_SYNC_MAGIC (0xA6)
+    uint8_t  version;          //  1  ARIADNA_LORA_PROTO_VER (1)
+    uint16_t crc;              //  2  CRC-16 over bytes 4..27
+    uint32_t rocket_t_ms;      //  4  Master MCU millis() at TX start
+    uint32_t utc_ms;           //  8  UTC ms-of-day (ARIADNA_UTC_UNKNOWN if none)
+    uint16_t next_rx_in_ms;    // 12  exact ms from TX start until next RX window opens
+    uint16_t rx_dur_ms;        // 14  duration of that RX window (ms)
+    int32_t  t_launch_rem_ms;  // 16  ms remaining until T-0 (-1 if no countdown)
+    uint8_t  last_cmd_seq;     // 20  seq of last processed uplink command
+    uint8_t  last_cmd_rc;      // 21  ariadna_ul_rc_t
+    uint8_t  rampa_state;      // 22  ariadna_rampa_state_t (0=OFFLINE..7=FAULT)
+    uint8_t  rampa_flags;      // 23  ARIADNA_RMP_*
+    uint8_t  rampa_fault;      // 24  ARIADNA_RMPF_*
+    uint8_t  sync_flags;       // 25  ARIADNA_SYNCF_*
+    uint16_t rampa_vbat_mv;    // 26  Rampa battery voltage, mV
+} ariadna_lora_sync_t;
+
+/** Ground Station -> PC USB framed sync wrapper (30 bytes, ARIADNA_PKT_GS_SYNC). */
+typedef struct {
+    ariadna_lora_sync_t sync;
+    int8_t              rssi;  // dBm
+    int8_t              snr;   // dB
+} ariadna_gs_sync_t;
+
+/** Ground Station -> Rocket LoRa uplink command packet (20 bytes). */
+typedef struct {
+    uint8_t  magic;            //  0  ARIADNA_LORA_UPLINK_MAGIC (0xA9)
+    uint8_t  version;          //  1  ARIADNA_LORA_PROTO_VER (1)
+    uint8_t  seq;              //  2  command sequence number (1..255, wraps)
+    uint8_t  cmd;              //  3  ariadna_ul_cmd_t
+    uint32_t utc_ms;           //  4  GS UTC ms-of-day (ARIADNA_UTC_UNKNOWN if none)
+    uint32_t arg_ms;           //  8  countdown remaining ms at TX start (or 0)
+    uint16_t token;            // 12  ARIADNA_UL_TOK_*
+    uint8_t  target;           // 14  reboot target (0..2) or Rampa pyro ch (1..3)
+    uint8_t  flags;            // 15  ARIADNA_ULF_*
+    uint16_t _pad;             // 16  0
+    uint16_t crc;              // 18  CRC-16 over bytes 0..17
+} ariadna_lora_uplink_t;
+#pragma pack(pop)
+
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_lora_sync_t) == 28, "lora_sync layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_sync_t) == 30, "gs_sync layout changed");
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_lora_uplink_t) == 20, "lora_uplink layout changed");
+
+static inline void ariadna_lora_sync_seal(ariadna_lora_sync_t *s)
+{
+    s->magic   = ARIADNA_LORA_SYNC_MAGIC;
+    s->version = ARIADNA_LORA_PROTO_VER;
+    s->crc     = ariadna_crc16(((const uint8_t *)s) + 4u, (uint16_t)(sizeof(*s) - 4u));
+}
+
+static inline int ariadna_lora_sync_decode(const uint8_t *buf, size_t n,
+                                           ariadna_lora_sync_t *out)
+{
+    if (n != sizeof(*out)) return 0;
+    ariadna_lora_sync_t tmp;
+    memcpy(&tmp, buf, sizeof(tmp));
+    if (tmp.magic != ARIADNA_LORA_SYNC_MAGIC || tmp.version != ARIADNA_LORA_PROTO_VER)
+        return 0;
+    if (ariadna_crc16(buf + 4u, (uint16_t)(sizeof(tmp) - 4u)) != tmp.crc)
+        return 0;
+    *out = tmp;
+    return 1;
+}
+
+static inline void ariadna_lora_uplink_seal(ariadna_lora_uplink_t *u)
+{
+    u->magic   = ARIADNA_LORA_UPLINK_MAGIC;
+    u->version = ARIADNA_LORA_PROTO_VER;
+    u->_pad    = 0;
+    u->crc     = ariadna_crc16((const uint8_t *)u, (uint16_t)(sizeof(*u) - 2u));
+}
+
+static inline int ariadna_lora_uplink_decode(const uint8_t *buf, size_t n,
+                                             ariadna_lora_uplink_t *out)
+{
+    if (n != sizeof(*out)) return 0;
+    ariadna_lora_uplink_t tmp;
+    memcpy(&tmp, buf, sizeof(tmp));
+    if (tmp.magic != ARIADNA_LORA_UPLINK_MAGIC || tmp.version != ARIADNA_LORA_PROTO_VER)
+        return 0;
+    if (ariadna_crc16(buf, (uint16_t)(sizeof(tmp) - 2u)) != tmp.crc)
+        return 0;
+    *out = tmp;
+    return 1;
+}
+
+/**
+ * Compute ms until the next LoRa RX window opens.
+ *
+ * Uses UTC 10 s boundaries when `utc_valid`, otherwise `now_ms` 10 s
+ * boundaries. When a launch countdown is active (`t_rem_ms > 0`), also
+ * considers the mandatory final abort window opening at
+ * `T - (ARIADNA_LORA_FINAL_WIN_MS + ARIADNA_LORA_FINAL_HALF_MS)` = T - 1150 ms
+ * (centered at T - 1.000 s, closing at T - 850 ms), returning whichever
+ * window comes first and setting `*is_final_win`.
+ */
+static inline uint32_t ariadna_lora_next_window_ms(uint32_t now_ms,
+                                                   uint32_t utc_ms,
+                                                   int utc_valid,
+                                                   int32_t t_rem_ms,
+                                                   int *is_final_win)
+{
+    const uint32_t base = utc_valid ? utc_ms : now_ms;
+    const uint32_t rem  = base % ARIADNA_LORA_WIN_PERIOD_MS;
+    uint32_t next_reg   = (rem == 0u) ? ARIADNA_LORA_WIN_PERIOD_MS
+                                      : (ARIADNA_LORA_WIN_PERIOD_MS - rem);
+    // Avoid scheduling a regular 10 s window overlapping the T-1 s final window
+    // or within 800 ms of liftoff (when Rampa detaches).
+    if (t_rem_ms > 0) {
+        const int32_t reg_at_rem = t_rem_ms - (int32_t)next_reg;
+        if (reg_at_rem < 1500 && reg_at_rem > -500)
+            next_reg += ARIADNA_LORA_WIN_PERIOD_MS;
+    }
+
+    int final_w = 0;
+    uint32_t best = next_reg;
+    const int32_t final_open_rem = (int32_t)(ARIADNA_LORA_FINAL_WIN_MS + ARIADNA_LORA_FINAL_HALF_MS);
+    if (t_rem_ms > final_open_rem) {
+        const uint32_t to_final = (uint32_t)(t_rem_ms - final_open_rem);
+        if (to_final < best) {
+            best = to_final;
+            final_w = 1;
+        }
+    }
+    if (is_final_win) *is_final_win = final_w;
+    return best;
 }
 
 #endif // ARIADNA_LINK_H

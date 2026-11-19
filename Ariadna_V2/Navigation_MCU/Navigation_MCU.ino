@@ -71,6 +71,7 @@
 #include "ariadna_rgb.h"
 
 #include <Arduino.h>
+#include "hardware/watchdog.h"
 #include <string.h>
 #include <math.h>
 
@@ -580,6 +581,15 @@ static void handle_command(const ariadna_cmd_t *c)
             ariadna_seq_init(&s_seq);
             s_h_max = 0.0f;
             s_fired_mask = 0;
+        }
+        break;
+    case ARIADNA_CMD_REBOOT:
+        if (on_ground() && (c->arg == 0 || c->arg == 2)) {
+            pyro_write(0);
+            actcon_pyro_disarm(&s_test_sm);
+            delay(20);
+            watchdog_enable(1, 1);
+            while (1) { }
         }
         break;
     default:

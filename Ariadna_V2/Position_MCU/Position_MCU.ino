@@ -109,6 +109,7 @@
 #include "ariadna_rgb.h"
 
 #include <Arduino.h>
+#include "hardware/watchdog.h"
 #include <SPI.h>
 #include <Wire.h>
 #include <TriSense.h>
@@ -993,6 +994,10 @@ struct GpsFix {
     float    alt_msl;      // m
     float    vel_e;        // m/s, East
     float    vel_n;        // m/s, North
+    uint32_t utc_ms;       // UTC ms since midnight (0..86399999)
+    uint32_t utc_t_ms;     // local millis() when utc_ms was parsed
+    uint16_t utc_date;     // DD*100 + MM from RMC (0 if unknown)
+    uint8_t  utc_valid;    // 1 if utc_ms is valid
     uint8_t  sats;
     uint8_t  fix;          // 0 none, 2 2D, 3 3D
     uint8_t  hdop_x10;
@@ -1047,6 +1052,28 @@ private:
         return n;
     }
 
+    // Parse NMEA UTC time field "hhmmss.sss" -> ms since midnight.
+    static bool parse_utc_ms(const char *s, uint32_t *out_ms)
+    {
+        if (!s || strlen(s) < 6) return false;
+        for (int i = 0; i < 6; i++)
+            if (s[i] < '0' || s[i] > '9') return false;
+        const uint32_t hh = (uint32_t)((s[0] - '0') * 10 + (s[1] - '0'));
+        const uint32_t mm = (uint32_t)((s[2] - '0') * 10 + (s[3] - '0'));
+        const uint32_t ss = (uint32_t)((s[4] - '0') * 10 + (s[5] - '0'));
+        if (hh > 23u || mm > 59u || ss > 60u) return false;
+        uint32_t ms = 0;
+        if (s[6] == '.') {
+            uint32_t mul = 100u;
+            for (const char *p = s + 7; *p >= '0' && *p <= '9' && mul > 0u; p++) {
+                ms += (uint32_t)(*p - '0') * mul;
+                mul /= 10u;
+            }
+        }
+        *out_ms = ((hh * 60u + mm) * 60u + (ss % 60u)) * 1000u + ms;
+        return true;
+    }
+
     // NMEA latitude is ddmm.mmmm and longitude dddmm.mmmm. Degrees and
     // minutes are separated by position, not by a delimiter, which is why
     // this cannot just be an atof.
@@ -1078,6 +1105,13 @@ private:
         if (!strncmp(type, "GGA", 3)) {
             nf = split(f, 24);
             if (nf < 10) return false;
+            const uint32_t now = millis();
+            uint32_t u_ms = 0;
+            if (parse_utc_ms(f[1], &u_ms)) {
+                _fix.utc_ms    = u_ms;
+                _fix.utc_t_ms  = now;
+                _fix.utc_valid = 1;
+            }
             _fix.lat_1e7  = parse_coord(f[2], f[3][0], 2);
             _fix.lon_1e7  = parse_coord(f[4], f[5][0], 3);
             uint8_t q     = (uint8_t)atoi(f[6]);
@@ -1089,13 +1123,27 @@ private:
             if (q == 0) _fix.fix = 0;
             else if (_fix.fix < 2) _fix.fix = 2;
             _fix.valid = (q != 0);
-            _fix.t_ms  = millis();
+            _fix.t_ms  = now;
             return true;
         }
 
         if (!strncmp(type, "RMC", 3)) {
             nf = split(f, 24);
             if (nf < 9) return false;
+            const uint32_t now = millis();
+            uint32_t u_ms = 0;
+            if (parse_utc_ms(f[1], &u_ms)) {
+                _fix.utc_ms    = u_ms;
+                _fix.utc_t_ms  = now;
+                _fix.utc_valid = 1;
+            }
+            if (nf >= 10 && strlen(f[9]) >= 4 &&
+                f[9][0] >= '0' && f[9][0] <= '9' && f[9][1] >= '0' && f[9][1] <= '9' &&
+                f[9][2] >= '0' && f[9][2] <= '9' && f[9][3] >= '0' && f[9][3] <= '9') {
+                const uint16_t dd = (uint16_t)((f[9][0] - '0') * 10 + (f[9][1] - '0'));
+                const uint16_t mo = (uint16_t)((f[9][2] - '0') * 10 + (f[9][3] - '0'));
+                _fix.utc_date = (uint16_t)(dd * 100u + mo);
+            }
             if (f[2][0] != 'A') { _fix.valid = false; return true; }
 
             _fix.lat_1e7 = parse_coord(f[3], f[4][0], 2);
@@ -1112,7 +1160,7 @@ private:
 
             _fix.valid = true;
             if (_fix.fix < 3) _fix.fix = 3;
-            _fix.t_ms  = millis();
+            _fix.t_ms  = now;
             return true;
         }
 
@@ -2644,6 +2692,15 @@ static void handle_command(const ariadna_cmd_t *c)
     switch (c->cmd) {
     case ARIADNA_CMD_SET_PAD_REF: s_req_pad_ref  = true; break;
     case ARIADNA_CMD_CAL_GYRO:    s_req_cal_gyro = true; break;
+    case ARIADNA_CMD_REBOOT:
+        if ((c->arg == 0 || c->arg == 1) &&
+            (!s_have_master || s_master.state < ARIADNA_STATE_ASCENT ||
+             s_master.state > ARIADNA_STATE_GUIDANCE)) {
+            delay(20);
+            watchdog_enable(1, 1);
+            while (1) { }
+        }
+        break;
     default: break;
     }
 }
@@ -4237,6 +4294,28 @@ void loop()
                 s_uwb.fill_diag(&ud, now_ms, s_uwb_fix.mask);
             }
             link_send(ARIADNA_PKT_UWB_DIAG, &ud, sizeof(ud));
+        }
+    }
+
+    // ---- GPS UTC time sync, 1 Hz -------------------------------------------
+    // Feeds Master MCU an accurate UTC time-of-day (compensated for NMEA age
+    // and receiver latency) to align the 10-second LoRa uplink RX windows.
+    {
+        static uint32_t next_gps_time_ms = 0;
+        if ((int32_t)(now_ms - next_gps_time_ms) >= 0) {
+            next_gps_time_ms = now_ms + 1000u;
+            ariadna_gps_time_t gt;
+            memset(&gt, 0, sizeof(gt));
+            gt.t_ms = now_ms;
+            if (!s_hil_active && have_gps && gps.utc_valid &&
+                (uint32_t)(now_ms - gps.utc_t_ms) < 5000u) {
+                const uint32_t elapsed = (uint32_t)(now_ms - gps.utc_t_ms) +
+                                         (uint32_t)(PRM(POS_GPS_LATENCY) > 0.0f ? PRM(POS_GPS_LATENCY) : 0.0f);
+                gt.utc_ms   = (gps.utc_ms + elapsed) % 86400000u;
+                gt.utc_date = gps.utc_date;
+                gt.valid    = 1;
+            }
+            link_send(ARIADNA_PKT_GPS_TIME, &gt, sizeof(gt));
         }
     }
 

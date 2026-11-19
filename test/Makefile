@@ -134,6 +134,14 @@ uwblink: uwb_link_test
 uwb_link_test: uwb_link_test.cpp $(UWBL_H)
 	$(CXX) $(CXXFLAGS) -o uwb_link_test uwb_link_test.cpp -lm
 
+RAMPA_H = $(V2)/common/ariadna_rampa_link.h
+
+rampa: rampa_link_test
+	./rampa_link_test
+
+rampa_link_test: rampa_link_test.cpp $(RAMPA_H) $(LINK_H)
+	$(CXX) $(CXXFLAGS) -o rampa_link_test rampa_link_test.cpp -lm
+
 # ---------------------------------------------------------------------
 # The Arduino builder compiles a sketch from a copy of its own folder, so
 # nothing outside that folder can be reached — not a .cpp, and not a
@@ -165,9 +173,12 @@ SYNC_PAIRS = \
   $(V2)/common/actcon_pyro.h:$(NAV_DIR)/actcon_pyro.h \
   $(V2)/common/actcon_pyro.h:$(V2)/Master_MCU/actcon_pyro.h \
   $(V2)/common/ariadna_link.h:$(V2)/Master_MCU/ariadna_link.h \
+  $(V2)/common/ariadna_rampa_link.h:$(V2)/Master_MCU/ariadna_rampa_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Master_MCU/ariadna_uart_dma.h \
   $(V2)/common/ariadna_batt.h:$(V2)/Master_MCU/ariadna_batt.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Master_MCU/ariadna_rgb.h \
+  $(V2)/common/ariadna_rampa_link.h:$(V2)/Rampa_MCU/ariadna_rampa_link.h \
+  $(V2)/common/ariadna_rgb.h:$(V2)/Rampa_MCU/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Position_MCU/ariadna_link.h \
   $(V2)/common/ariadna_hil.h:$(V2)/Position_MCU/ariadna_hil.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
@@ -240,6 +251,8 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(NAV_DIR)/Navigation_MCU.ino
 	$(CXX) $(CXXFLAGS) -DARDUINO=100 -Ifull_stub -I$(V2)/Master_MCU \
 	    -x c++ -fsyntax-only $(V2)/Master_MCU/Master_MCU.ino
+	$(CXX) $(CXXFLAGS) -DARDUINO=100 -Ifull_stub -I$(V2)/Rampa_MCU \
+	    -x c++ -fsyntax-only $(V2)/Rampa_MCU/Rampa_MCU.ino
 	@if [ -d "$(TRISENSE)/src" ] && [ -d "$(INSLIB)/src" ] && [ -d "$(TFLUNA)/src" ]; then \
 	  for ins in 1 0; do \
 	    $(CXX) -O2 -Wall -Wextra -std=c++17 -DARDUINO=100 -DARDUINO_ARCH_RP2350 -D__ARM_FP=4 \
@@ -296,7 +309,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink rampa link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -304,5 +317,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test actcon_test batt_test bench_test
-.PHONY: all guid seq tables est uwb uwblink link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix
+	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test rampa_link_test actcon_test batt_test bench_test
+.PHONY: all guid seq tables est uwb uwblink rampa link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix

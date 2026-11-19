@@ -167,6 +167,21 @@ ERROR_NAMES = {
     4: "flash", 5: "servo bus", 6: "battery low", 7: "params not synced",
 }
 
+# Bidirectional LoRa sync/Rampa/ACK packet (ARIADNA_PKT_GS_SYNC, fw 3.34).
+PKT_GS_SYNC = 0x41
+GS_SYNC_FORMAT = "<BBHIIHHiBBBBBBHbb"
+GS_SYNC_SIZE = struct.calcsize(GS_SYNC_FORMAT)
+assert GS_SYNC_SIZE == 30, f"sync packet layout drift: {GS_SYNC_SIZE} != 30"
+
+RAMPA_STATE_NAMES = {
+    0: "OFFLINE", 1: "IDLE", 2: "READY", 3: "COUNTDOWN",
+    4: "COMMITTED", 5: "FIRED", 6: "ABORT", 7: "FAULT",
+}
+UL_RC_NAMES = {
+    0: "—", 1: "OK", 2: "ODMÍTNUTO (LET)", 3: "ODMÍTNUTO (RAKETA)",
+    4: "ODMÍTNUTO (RAMPA)", 5: "CHYBA TOKENU", 6: "ABORT POTVRZEN",
+}
+
 # Aerial imagery, cached for offline use at the field. The sharpest source
 # for the Czech Republic is the CUZK orthophoto (Czech Office for Surveying,
 # open data): 0.15 m per pixel at zoom 20, where Esri has no imagery at all
@@ -444,6 +459,7 @@ class SerialWorker(QtCore.QThread):
     """
 
     data_received = QtCore.pyqtSignal(dict)
+    sync_received = QtCore.pyqtSignal(dict)
     link_stats = QtCore.pyqtSignal(int, int)      # good, bad
     connection_error = QtCore.pyqtSignal(str)
 
@@ -523,6 +539,8 @@ class SerialWorker(QtCore.QThread):
                     self.rx_good += 1
                     if ptype == PKT_TELEMETRY and plen == GS_SIZE:
                         self._emit(payload)
+                    elif ptype == PKT_GS_SYNC and plen == GS_SYNC_SIZE:
+                        self._emit_sync(payload)
 
                 self.link_stats.emit(self.rx_good, self.rx_bad)
 
@@ -530,6 +548,30 @@ class SerialWorker(QtCore.QThread):
                 # A disconnected adapter raises here; stop cleanly rather
                 # than spinning on a dead handle.
                 self.is_running = False
+
+    def _emit_sync(self, payload):
+        (magic, ver, _crc, rocket_t_ms, utc_ms, next_rx_in_ms, rx_dur_ms,
+         t_launch_rem_ms, last_cmd_seq, last_cmd_rc, rampa_state, rampa_flags,
+         rampa_fault, sync_flags, rampa_vbat_mv, rssi, snr) = struct.unpack(GS_SYNC_FORMAT, payload)
+        if magic != 0xA6 or ver != 1:
+            return
+        self.sync_received.emit({
+            "rocket_t_ms": rocket_t_ms,
+            "utc_ms": None if utc_ms == 0xFFFFFFFF else utc_ms,
+            "next_rx_in_ms": next_rx_in_ms,
+            "rx_dur_ms": rx_dur_ms,
+            "t_launch_rem_ms": t_launch_rem_ms,
+            "last_cmd_seq": last_cmd_seq,
+            "last_cmd_rc": last_cmd_rc,
+            "rampa_state": rampa_state,
+            "rampa_flags": rampa_flags,
+            "rampa_fault": rampa_fault,
+            "sync_flags": sync_flags,
+            "rampa_vbat_v": rampa_vbat_mv / 1000.0,
+            "rssi": rssi,
+            "snr": snr,
+            "rx_mono": time.monotonic(),
+        })
 
     def _emit(self, payload):
         u = struct.unpack(GS_FORMAT, payload)
@@ -1054,13 +1096,19 @@ class GroundStation(QtWidgets.QMainWindow):
 
         self.serial_thread = SerialWorker()
         self.serial_thread.data_received.connect(self.process_telemetry)
+        self.serial_thread.sync_received.connect(self.process_sync)
         self.serial_thread.link_stats.connect(self.update_link_stats)
 
+        self.last_sync = None
         self.setup_ui()
 
         self.watchdog_timer = QtCore.QTimer()
         self.watchdog_timer.timeout.connect(self.check_watchdog)
         self.watchdog_timer.start(100)
+
+        self.utc_timer = QtCore.QTimer()
+        self.utc_timer.timeout.connect(self.send_utc_sync)
+        self.utc_timer.start(5000)
 
         self.test_data_timer = QtCore.QTimer()
         self.test_data_timer.timeout.connect(self.generate_test_data)
@@ -1150,6 +1198,58 @@ class GroundStation(QtWidgets.QMainWindow):
         self.connect_btn = QtWidgets.QPushButton("CONNECT")
         self.connect_btn.clicked.connect(self.toggle_connection)
         bar.addWidget(self.connect_btn)
+
+        # ---------------- uplink & Rampa control bar (fw 3.34) ----------------
+        ul = QtWidgets.QHBoxLayout()
+        root.addLayout(ul)
+
+        self.ul_win_label = QtWidgets.QLabel("RX OKNO: --")
+        self.ul_win_label.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #cccccc;"
+            "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
+        ul.addWidget(self.ul_win_label)
+
+        self.rampa_label = QtWidgets.QLabel("RAMPA: OFFLINE")
+        self.rampa_label.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #aaaaaa;"
+            "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
+        ul.addWidget(self.rampa_label)
+
+        self.ul_ack_label = QtWidgets.QLabel("ACK: —")
+        self.ul_ack_label.setStyleSheet(
+            "font-size: 12px; color: #aaaaaa; padding: 4px 8px;")
+        ul.addWidget(self.ul_ack_label)
+
+        ul.addStretch()
+
+        self.ul_prep_btn = QtWidgets.QPushButton("START BRZY (PREP)")
+        self.ul_prep_btn.setStyleSheet("background-color: #2b6cb0; color: white;")
+        self.ul_prep_btn.setToolTip("Odešle pokyn Příprava / Start brzy (čerstvý PADREF + kontrola rampy)")
+        self.ul_prep_btn.clicked.connect(self.send_uplink_prep)
+        ul.addWidget(self.ul_prep_btn)
+
+        self.ul_cd_btn = QtWidgets.QPushButton("START ODPOČET → RAMPA")
+        self.ul_cd_btn.setStyleSheet("background-color: #d97706; color: white;")
+        self.ul_cd_btn.setToolTip("Odešle synchronizovaný odpočet (dle pole s) raketě a přes pupeční I2C rampě")
+        self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
+        ul.addWidget(self.ul_cd_btn)
+
+        self.ul_abort_btn = QtWidgets.QPushButton("✖ ABORT")
+        self.ul_abort_btn.setStyleSheet("background-color: #cc0000; color: white; font-size: 14px;")
+        self.ul_abort_btn.setToolTip("Okamžitě zařadí ABORT do nejbližšího RX okna (včetně nouzového okna T-1 s)")
+        self.ul_abort_btn.clicked.connect(self.send_uplink_abort)
+        ul.addWidget(self.ul_abort_btn)
+
+        self.ul_padref_btn = QtWidgets.QPushButton("PADREF")
+        self.ul_padref_btn.setStyleSheet("background-color: #444444; color: white;")
+        self.ul_padref_btn.clicked.connect(lambda: self._send_ul("CMD:PADREF", "PADREF"))
+        ul.addWidget(self.ul_padref_btn)
+
+        self.ul_reboot_btn = QtWidgets.QPushButton("RESTART")
+        self.ul_reboot_btn.setStyleSheet("background-color: #6b21a8; color: white;")
+        self.ul_reboot_btn.setToolTip("Vzdálený restart rakety (povoleno pouze na zemi)")
+        self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
+        ul.addWidget(self.ul_reboot_btn)
 
         # ---------------- body ----------------
         body = QtWidgets.QHBoxLayout()
@@ -1277,9 +1377,42 @@ class GroundStation(QtWidgets.QMainWindow):
     def update_countdown(self):
         card = self.cards["T-0 COUNTDOWN"]
         flying = self.last_state is not None and 3 <= self.last_state <= 8
+        # Prefer rocket-synchronized countdown when active.
+        rocket_rem = None
+        if self.last_sync is not None:
+            age_s = time.monotonic() - self.last_sync["rx_mono"]
+            if age_s < 3.0 and self.last_sync["t_launch_rem_ms"] >= 0:
+                rocket_rem = self.last_sync["t_launch_rem_ms"] / 1000.0 - age_s
+            # Update RX window countdown badge
+            win_left = (self.last_sync["next_rx_in_ms"] / 1000.0) - age_s
+            while win_left < -0.35:
+                win_left += 10.0
+            is_final = bool(self.last_sync["sync_flags"] & 0x02)
+            gps_utc = bool(self.last_sync["sync_flags"] & 0x01)
+            src = "GPS+UTC" if gps_utc else "SYNC"
+            if is_final and win_left >= -0.3:
+                self.ul_win_label.setText(f"⚠ T-1s ABORT OKNO: {max(0.0, win_left):.1f} s ({src})")
+                self.ul_win_label.setStyleSheet(
+                    "font-size: 13px; font-weight: bold; color: white;"
+                    "background-color: #cc0000; border: 1px solid #ff5555; padding: 4px 10px; border-radius: 4px;")
+            elif win_left <= 0.0:
+                self.ul_win_label.setText(f"RX OKNO OTEVŘENO ({src})")
+                self.ul_win_label.setStyleSheet(
+                    "font-size: 13px; font-weight: bold; color: #121212;"
+                    "background-color: #00ff88; border: 1px solid #00ff88; padding: 4px 10px; border-radius: 4px;")
+            else:
+                self.ul_win_label.setText(f"RX OKNO za {win_left:.1f} s ({src})")
+                self.ul_win_label.setStyleSheet(
+                    "font-size: 13px; font-weight: bold; color: #00d4ff;"
+                    "background-color: #1e1e1e; border: 1px solid #0088aa; padding: 4px 10px; border-radius: 4px;")
         if flying:
             card.set_value("LIFT-OFF")
             card.set_status("#00ff88")
+        elif rocket_rem is not None:
+            sign = "-" if rocket_rem >= 0 else "+"
+            left = abs(rocket_rem)
+            card.set_value(f"T{sign}{int(left // 60):02d}:{left % 60:04.1f} ⚡")
+            card.set_status("#ffaa00" if sign == "-" and left > 10 else "#ff2222")
         elif self.t0_deadline is None:
             card.set_value("--")
             card.set_status("#444444")
@@ -1289,6 +1422,79 @@ class GroundStation(QtWidgets.QMainWindow):
             left = abs(left)
             card.set_value(f"T{sign}{int(left // 60):02d}:{left % 60:04.1f}")
             card.set_status("#ffaa00" if sign == "-" and left > 10 else "#ff2222")
+
+    # ------------------------------------------------- bidirectional LoRa uplink
+    def send_utc_sync(self):
+        """Send PC UTC ms-of-day to Ground Station for <= 10 ms TDMA sync."""
+        if not getattr(self, "serial_thread", None) or not self.serial_thread.is_running:
+            return
+        utc_ms = int((time.time() % 86400.0) * 1000.0)
+        self.serial_thread.send_line(f"UTC:{utc_ms}")
+
+    def process_sync(self, s: dict):
+        self.last_sync = s
+        rstate = RAMPA_STATE_NAMES.get(s["rampa_state"], "?")
+        rf = s["rampa_flags"]
+        key_s = "KLÍČ:OK" if (rf & 0x01) else "KLÍČ:OFF"
+        c_s = "".join(str(i + 1) if (rf & (1 << (i + 1))) else "-" for i in range(3))
+        det_s = " · ODPOJENO" if (s["sync_flags"] & 0x04) else ""
+        if s["rampa_state"] == 0:
+            self.rampa_label.setText("RAMPA: OFFLINE")
+            self.rampa_label.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #aaaaaa;"
+                "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
+        else:
+            self.rampa_label.setText(
+                f"RAMPA: {rstate} · {key_s} · C:{c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
+            col = "#00ff88" if s["rampa_state"] in (2, 3, 4) and s["rampa_fault"] == 0 else (
+                "#ff4444" if s["rampa_state"] in (6, 7) or s["rampa_fault"] else "#ffaa00")
+            self.rampa_label.setStyleSheet(
+                f"font-size: 13px; font-weight: bold; color: {col};"
+                f"background-color: #1e1e1e; border: 1px solid {col}; padding: 4px 10px; border-radius: 4px;")
+
+        rc_txt = UL_RC_NAMES.get(s["last_cmd_rc"], "?")
+        self.ul_ack_label.setText(f"ACK #{s['last_cmd_seq']}: {rc_txt}")
+        self.update_countdown()
+
+    def _send_ul(self, line: str, label: str):
+        if not getattr(self, "serial_thread", None) or not self.serial_thread.is_running:
+            self.status.showMessage("UPLINK: Ground Station není připojená")
+            return
+        self.send_utc_sync()
+        self.serial_thread.send_line(line)
+        self.ul_ack_label.setText(f"VE FRONTĚ → {label} (čeká na RX okno)")
+        self.status.showMessage(f"UPLINK zařazen: {label}")
+
+    def send_uplink_prep(self):
+        self._send_ul("CMD:PREP", "START BRZY / PREP")
+
+    def send_uplink_countdown(self):
+        sec = int(self.t0_spin.value())
+        reply = QtWidgets.QMessageBox.question(
+            self, "Spustit odpočet startu?",
+            f"Opravdu odeslat pokyn ke startu za T-{sec} s raketě a rampě?\n\n"
+            f"• Raketa předá přesný čas rampě po pupeční I2C šňůře.\n"
+            f"• V čase T-1 s proběhne poslední nouzové RX okno pro ABORT.\n"
+            f"• V čase T-0,1 s se I2C softwarově odpojí a v T-0 rampa zažehne palník.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No)
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.t0_deadline = time.time() + sec
+            self._send_ul(f"CMD:CD:{sec}:1", f"ODPOČET T-{sec} s")
+
+    def send_uplink_abort(self):
+        self.t0_deadline = None
+        self._send_ul("CMD:ABORT", "ABORT!")
+
+    def send_uplink_reboot(self):
+        reply = QtWidgets.QMessageBox.question(
+            self, "Restartovat raketu?",
+            "Opravdu odeslat vzdálený RESTART všech MCU rakety?\n"
+            "(Raketa příkaz přijme pouze na zemi, za letu je blokován.)",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No)
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._send_ul("CMD:REBOOT:0", "RESTART RAKETY")
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key.Key_R:
@@ -1353,6 +1559,7 @@ class GroundStation(QtWidgets.QMainWindow):
                     self.last_packet_time = time.time()
                     self.rx_timestamps.clear()
                     self.enable_test_mode(False)
+                    self.send_utc_sync()
 
     def update_link_stats(self, good, bad):
         self._link_good, self._link_bad = good, bad

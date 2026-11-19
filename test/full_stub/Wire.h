@@ -6,6 +6,10 @@ public:
     void    setSDA(uint8_t) {}
     void    setSCL(uint8_t) {}
     void    begin(void) {}
+    void    begin(uint8_t) {}
+    void    end(void) {}
+    void    onReceive(void (*)(int)) {}
+    void    onRequest(void (*)(void)) {}
     void    setClock(uint32_t) {}
     void    setTimeout(uint32_t, bool = false) {}
     void    beginTransmission(uint8_t) {}

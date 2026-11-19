@@ -6,12 +6,15 @@
 >   odhad polohy, navedení, křidélka a jejich adaptace, sekvence aerokrytu, roznětů a
 >   nohou, bezpečnostní pojistky, obě GUI, všechny parametry, předletové testy a
 >   **[audit výpočetní vytíženosti všech 3 MCU](USER_MANUAL.md#16-audit-výpočetní-vytíženosti)**.
-> * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position and
->   Navigation MCU, firmware 3.33, flying the
->   [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
+> * **Hardware & Pinouts (all 4 PCBs, human + AI quick-ref):** [`Ariadna_V2/PINOUT.md`](Ariadna_V2/PINOUT.md) —
+>   netlist-verified pinouts for Ariadna V2, UWB Anchor/Tag, Ground Station, and **Rampa PCB1**,
+>   plus the bidirectional LoRa TDMA & umbilical I²C protocol.
+> * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position,
+>   Navigation, Ground Station, UWB Tag/Anchors, and **Rampa MCU** (`Rampa_MCU/`), firmware 3.34,
+>   flying the [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
 >   (`Ariadna_V2/common/guidance.cpp`).
 > * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`
-> * **Flight display** (LoRa ground station): `python Ariadna_V2/Ground_Visualizer/ground_visualizer.py`
+> * **Flight display** (LoRa ground station + uplink & Rampa control): `python Ariadna_V2/Ground_Visualizer/ground_visualizer.py`
 > * **Tests:** `cd test && make check`
 >
 > The rest of this file describes `Daidalos_Landing_Guidance/`, the single-board V1

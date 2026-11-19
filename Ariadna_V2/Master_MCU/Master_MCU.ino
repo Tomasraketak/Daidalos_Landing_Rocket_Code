@@ -72,8 +72,10 @@
 #include "ariadna_seq.h"        // ARIADNA_EV_* event bits, for the downlink
 #include "ariadna_batt.h"       // battery state of charge and time to 20 % (fw 3.29)
 #include "actcon_pyro.h"        // bench pyro bridge, TEST mode only
+#include "ariadna_rampa_link.h" // Rocket <-> Rampa umbilical I2C protocol (fw 3.34)
 
 #include <Arduino.h>
+#include "hardware/watchdog.h"
 #include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
@@ -347,6 +349,10 @@ static bool                  s_raw_on  = false;
 static volatile bool         s_raw_new = false;
 static ariadna_uwb_diag_t    s_uwb_diag;
 static volatile bool         s_uwb_diag_new = false;
+static uint32_t              s_utc_base_ms  = 0;
+static uint32_t              s_utc_ref_ms   = 0;
+static bool                  s_utc_valid    = false;
+static bool                  s_utc_from_gps = false;
 
 static uint32_t s_nav_us = 0, s_act_us = 0;
 static bool     s_have_nav = false, s_have_act = false;
@@ -1225,6 +1231,14 @@ static void poll_position(void)
         } else if (type == ARIADNA_PKT_UWB_DIAG) {
             // Stored only; printed by diag_emit() as a "U" JSON line at 2 Hz.
             if (ariadna_unpack(pl, len, &s_uwb_diag, sizeof(s_uwb_diag))) s_uwb_diag_new = true;
+        } else if (type == ARIADNA_PKT_GPS_TIME) {
+            ariadna_gps_time_t gt;
+            if (ariadna_unpack(pl, len, &gt, sizeof(gt)) && gt.valid) {
+                s_utc_base_ms  = gt.utc_ms % 86400000u;
+                s_utc_ref_ms   = millis();
+                s_utc_valid    = true;
+                s_utc_from_gps = true;
+            }
         }
     }
 }
@@ -3127,6 +3141,452 @@ static void diag_emit(void)
 }
 
 // =====================================================================
+//  10b. RAMPA UMBILICAL I2C (0x2B) & BIDIRECTIONAL LORA UPLINK (fw 3.34)
+//
+//  Rampa sits on Master's I2C0 bus (I2C1/I2C2 uSup -> magnetic pogo ->
+//  Rampa J3 GP0/GP1). Master polls Rampa at 20 Hz while on the ground,
+//  synchronizing the exact T-0 countdown (< 1 ms) and cross-checking
+//  interlocks. At T - ARIADNA_UMB_DETACH_MS (100 ms), after the mandatory
+//  T - 1 s LoRa final-abort window has closed, Master sends
+//  RAMPA_CMD_COMMIT, confirms RAMPA_STATE_COMMITTED, and stops addressing
+//  0x2B while Rampa disables its I2C0 slave (Hi-Z) before liftoff.
+// =====================================================================
+struct LoRaSyncSnap {
+    uint32_t utc_base_ms;
+    uint32_t utc_ref_ms;
+    uint32_t cd_t0_ms;
+    uint16_t rampa_vbat_mv;
+    uint8_t  utc_valid;
+    uint8_t  utc_from_gps;
+    uint8_t  cd_active;
+    uint8_t  in_flight;
+    uint8_t  last_cmd_seq;
+    uint8_t  last_cmd_rc;
+    uint8_t  rampa_state;
+    uint8_t  rampa_flags;
+    uint8_t  rampa_fault;
+    uint8_t  rampa_detached;
+    uint8_t  launch_soon;
+    uint8_t  rocket_ready;
+};
+
+static volatile uint32_t s_sync_seq = 0;
+static LoRaSyncSnap      s_sync_shared;
+
+// Core 1 -> Core 0 uplink mailbox (single-slot lock-free handoff).
+static ariadna_lora_uplink_t s_ul_box;
+static uint32_t              s_ul_rx_ms = 0;
+static volatile uint32_t     s_ul_rx_seq = 0;   // bumped by Core 1 on new packet
+static uint32_t              s_ul_seen_seq = 0; // consumed by Core 0
+static volatile uint32_t     s_ul_ack_req = 0;  // bumped by Core 0 to trigger immediate ACK beacon
+
+// Core 0 Rampa & countdown state.
+static ariadna_rampa_status_t s_rampa_stat;
+static bool     s_rampa_connected = false;
+static bool     s_rampa_detached  = false;
+static uint32_t s_rampa_last_ok_ms = 0;
+static uint32_t s_rampa_detach_ms  = 0;
+static uint8_t  s_rampa_seq        = 0;
+
+static bool     s_launch_soon      = false;
+static bool     s_cd_active        = false;
+static bool     s_cd_committed     = false;
+static uint32_t s_cd_t0_ms         = 0;
+static uint8_t  s_cd_pyro_ch       = 1;
+static uint8_t  s_ul_last_seq      = 0;
+static uint8_t  s_ul_last_rc       = ARIADNA_ULRC_NONE;
+static bool     s_reboot_pending   = false;
+static uint32_t s_reboot_at_ms     = 0;
+
+static uint32_t rocket_utc_now_ms(uint32_t now_ms)
+{
+    if (!s_utc_valid) return ARIADNA_UTC_UNKNOWN;
+    return (s_utc_base_ms + (uint32_t)(now_ms - s_utc_ref_ms)) % 86400000u;
+}
+
+static bool rocket_ready_for_launch(void)
+{
+    return s_post_pass &&
+           s_have_nav && link_alive(s_nav_us) &&
+           s_have_act && link_alive(s_act_us) &&
+           (s_nav.flags & ARIADNA_NAV_VALID) != 0u &&
+           s_servo_ok &&
+           !(s_flags & ARIADNA_MST_ABORT) &&
+           !s_test && !s_hil && !s_polarity;
+}
+
+static uint8_t rocket_flags_for_rampa(void)
+{
+    uint8_t f = 0;
+    if (s_post_pass)                           f |= ARIADNA_RK_POST_OK;
+    if (s_nav.flags & ARIADNA_NAV_VALID)       f |= ARIADNA_RK_NAV_VALID;
+    if (s_flags & ARIADNA_MST_ARMED)           f |= ARIADNA_RK_ARMED;
+    if (s_rbf_out)                             f |= ARIADNA_RK_RBF_OUT;
+    if (s_have_nav && link_alive(s_nav_us))    f |= ARIADNA_RK_POS_OK;
+    if (s_have_act && link_alive(s_act_us))    f |= ARIADNA_RK_NAV_OK;
+    if (!(s_flags & ARIADNA_MST_ABORT))        f |= ARIADNA_RK_NO_ABORT;
+    if (s_utc_valid && s_utc_from_gps)         f |= ARIADNA_RK_GPS_UTC;
+    return f;
+}
+
+static void sync_publish(uint32_t now_ms)
+{
+    LoRaSyncSnap sn;
+    memset(&sn, 0, sizeof(sn));
+    sn.utc_base_ms    = s_utc_base_ms;
+    sn.utc_ref_ms     = s_utc_ref_ms;
+    sn.cd_t0_ms       = s_cd_t0_ms;
+    sn.rampa_vbat_mv  = s_rampa_connected ? s_rampa_stat.vbat_mv : 0u;
+    sn.utc_valid      = s_utc_valid ? 1u : 0u;
+    sn.utc_from_gps   = s_utc_from_gps ? 1u : 0u;
+    sn.cd_active      = s_cd_active ? 1u : 0u;
+    sn.in_flight      = (s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_LANDED) ? 1u : 0u;
+    sn.last_cmd_seq   = s_ul_last_seq;
+    sn.last_cmd_rc    = s_ul_last_rc;
+    sn.rampa_state    = s_rampa_connected ? s_rampa_stat.state
+                        : (s_cd_committed ? (uint8_t)RAMPA_STATE_COMMITTED : (uint8_t)RAMPA_STATE_OFFLINE);
+    sn.rampa_flags    = s_rampa_connected ? s_rampa_stat.flags : 0u;
+    sn.rampa_fault    = s_rampa_connected ? s_rampa_stat.fault_mask : 0u;
+    sn.rampa_detached = s_rampa_detached ? 1u : 0u;
+    sn.launch_soon    = s_launch_soon ? 1u : 0u;
+    sn.rocket_ready   = rocket_ready_for_launch() ? 1u : 0u;
+    (void)now_ms;
+
+    s_sync_seq++;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_sync_shared = sn;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_sync_seq++;
+}
+
+static bool sync_acquire(LoRaSyncSnap *sn)
+{
+    uint32_t a = s_sync_seq;
+    if (a & 1u) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    *sn = s_sync_shared;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return s_sync_seq == a;
+}
+
+/** 9-clock I2C bus clear in case pogo hot-separation glitches SDA/SCL. */
+static void i2c0_recover_if_stuck(void)
+{
+    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+    if (digitalRead(PIN_I2C_SDA) == LOW) {
+        Wire.end();
+        pinMode(PIN_I2C_SCL, OUTPUT);
+        for (uint8_t i = 0; i < 9; i++) {
+            digitalWrite(PIN_I2C_SCL, LOW);
+            delayMicroseconds(5);
+            digitalWrite(PIN_I2C_SCL, HIGH);
+            delayMicroseconds(5);
+        }
+        Wire.setSDA(PIN_I2C_SDA);
+        Wire.setSCL(PIN_I2C_SCL);
+        Wire.begin();
+        Wire.setClock(400000);
+        Wire.setTimeout(3);
+    }
+}
+
+/** One Rocket -> Rampa command write + status read over I2C0 (0x2B). */
+static bool rampa_exchange(uint8_t cmd_id, int32_t t_rem_ms, uint32_t now_ms)
+{
+    if (s_rampa_detached) return false;
+
+    ariadna_rampa_cmd_t c;
+    memset(&c, 0, sizeof(c));
+    c.cmd          = cmd_id;
+    c.seq          = ++s_rampa_seq;
+    c.t_rem_ms     = t_rem_ms;
+    c.utc_ms       = rocket_utc_now_ms(now_ms);
+    c.rocket_flags = rocket_flags_for_rampa();
+    c.pyro_ch      = s_cd_pyro_ch;
+    ariadna_rampa_cmd_seal(&c);
+
+    Wire.beginTransmission((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
+    Wire.write((const uint8_t *)&c, sizeof(c));
+    if (Wire.endTransmission(true) != 0) {
+        return false;
+    }
+
+    uint8_t buf[ARIADNA_RAMPA_STAT_SIZE];
+    const int got = Wire.requestFrom((int)ARIADNA_RAMPA_I2C_ADDR, (int)sizeof(buf));
+    size_t n = 0;
+    while (Wire.available()) {
+        const int ch = Wire.read();
+        if (n < sizeof(buf)) buf[n++] = (uint8_t)ch;
+    }
+    ariadna_rampa_status_t st;
+    if (got != (int)sizeof(buf) || n != sizeof(buf) ||
+        ariadna_rampa_status_decode(buf, n, &st) != ARIADNA_RAMPA_OK) {
+        return false;
+    }
+
+    s_rampa_stat       = st;
+    s_rampa_connected  = true;
+    s_rampa_last_ok_ms = now_ms ? now_ms : 1u;
+    return true;
+}
+
+static void launch_abort_now(uint32_t now_ms, const char *reason)
+{
+    s_cd_active    = false;
+    s_cd_committed = false;
+    s_launch_soon  = false;
+    if (!s_rampa_detached && s_rampa_connected) {
+        (void)rampa_exchange(RAMPA_CMD_ABORT, -1, now_ms);
+    }
+    MASTER_PRINT("# LAUNCH ABORT (%s)\n", reason);
+    s_ul_ack_req = s_ul_ack_req + 1u;
+}
+
+/** Process one verified LoRa uplink command handed off from Core 1. */
+static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
+{
+    const uint32_t now = millis();
+    const bool in_flight = (s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_LANDED);
+
+    // Deduplicate retries of the same command (ABORT is always idempotent).
+    if (u.seq != 0 && u.seq == s_ul_last_seq && u.cmd != ARIADNA_UL_ABORT) {
+        s_ul_ack_req = s_ul_ack_req + 1u;
+        return;
+    }
+
+    // If GPS has not yet locked UTC, accept GS PC UTC so windows align cleanly.
+    if (!s_utc_from_gps && u.utc_ms != ARIADNA_UTC_UNKNOWN && u.utc_ms < 86400000u) {
+        const uint32_t air_ms = ariadna_lora_airtime_us(sizeof(ariadna_lora_uplink_t)) / 1000u;
+        s_utc_base_ms = (u.utc_ms + air_ms) % 86400000u;
+        s_utc_ref_ms  = rx_ms;
+        s_utc_valid   = true;
+    }
+
+    s_ul_last_seq = u.seq;
+    s_ul_last_rc  = ARIADNA_ULRC_OK;
+
+    switch (u.cmd) {
+    case ARIADNA_UL_NOP:
+        s_ul_last_rc = ARIADNA_ULRC_OK;
+        break;
+
+    case ARIADNA_UL_PADREF:
+        if (in_flight) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
+        } else {
+            broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
+            s_ul_last_rc = ARIADNA_ULRC_OK;
+        }
+        break;
+
+    case ARIADNA_UL_LAUNCH_SOON:
+        if (in_flight) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
+        } else if (u.token != ARIADNA_UL_TOK_PREP) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
+        } else {
+            s_launch_soon    = true;
+            s_rampa_detached = false;
+            broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
+            if (!s_rampa_detached) (void)rampa_exchange(RAMPA_CMD_PREPARE, -1, now);
+            s_ul_last_rc = ARIADNA_ULRC_OK;
+        }
+        break;
+
+    case ARIADNA_UL_COUNTDOWN: {
+        const uint8_t ch = (u.target >= 1u && u.target <= 3u) ? u.target : 1u;
+        const uint8_t cont_bit = (uint8_t)(ARIADNA_RMP_CONT1 << (ch - 1u));
+        if (in_flight) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
+        } else if (u.token != ARIADNA_UL_TOK_COUNTDOWN ||
+                   u.arg_ms < ARIADNA_COUNTDOWN_MIN_MS ||
+                   u.arg_ms > ARIADNA_COUNTDOWN_MAX_MS) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
+        } else if (!rocket_ready_for_launch() ||
+                   (s_state != ARIADNA_STATE_IDLE && s_state != ARIADNA_STATE_ARMED)) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_STATE;
+        } else if (!s_rampa_connected || s_rampa_detached ||
+                   !(s_rampa_stat.flags & ARIADNA_RMP_KEY_ARMED) ||
+                   !(s_rampa_stat.flags & cont_bit) ||
+                   s_rampa_stat.fault_mask != 0u) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_RAMPA;
+        } else {
+            // Compensate for uplink LoRa airtime + cross-core latency (~28 ms)
+            // so Rocket, Rampa, and Ground Station hit T-0 within <= 5 ms.
+            const uint32_t air_ms = ariadna_lora_airtime_us(sizeof(ariadna_lora_uplink_t)) / 1000u;
+            const uint32_t elapsed = (uint32_t)(now - rx_ms) + air_ms;
+            const uint32_t rem = (u.arg_ms > elapsed) ? (u.arg_ms - elapsed) : 0u;
+            s_cd_pyro_ch   = ch;
+            s_cd_t0_ms     = now + rem;
+            s_cd_active    = true;
+            s_cd_committed = false;
+            s_launch_soon  = true;
+            (void)rampa_exchange(RAMPA_CMD_COUNTDOWN, (int32_t)rem, now);
+            MASTER_PRINT("# LORA COUNTDOWN T-%lu ms (ch %u)\n", (unsigned long)rem, (unsigned)ch);
+            s_ul_last_rc = ARIADNA_ULRC_OK;
+        }
+        break;
+    }
+
+    case ARIADNA_UL_ABORT:
+        if (u.token != ARIADNA_UL_TOK_ABORT) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
+        } else {
+            launch_abort_now(now, "LoRa ABORT");
+            if (s_state == ARIADNA_STATE_ARMED) {
+                s_flags |= ARIADNA_MST_ABORT;
+                broadcast_cmd(ARIADNA_CMD_ABORT, 0, 0);
+            }
+            s_ul_last_rc = ARIADNA_ULRC_ABORTED;
+        }
+        break;
+
+    case ARIADNA_UL_DISARM:
+        if (in_flight) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
+        } else {
+            s_cd_active    = false;
+            s_cd_committed = false;
+            s_launch_soon  = false;
+            s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_ABORT);
+            broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+            if (!s_rampa_detached && s_rampa_connected)
+                (void)rampa_exchange(RAMPA_CMD_PING, -1, now);
+            s_ul_last_rc = ARIADNA_ULRC_OK;
+        }
+        break;
+
+    case ARIADNA_UL_REBOOT:
+        if (in_flight) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
+        } else if (u.token != ARIADNA_UL_TOK_REBOOT) {
+            s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
+        } else {
+            s_cd_active = false;
+            s_launch_soon = false;
+            if (!s_rampa_detached && s_rampa_connected)
+                (void)rampa_exchange(RAMPA_CMD_ABORT, -1, now);
+            broadcast_cmd(ARIADNA_CMD_REBOOT, u.target, 0);
+            if (u.target == 0u) {
+                s_reboot_pending = true;
+                s_reboot_at_ms   = now + 200u; // let ACK beacon & UART commands flush
+            }
+            s_ul_last_rc = ARIADNA_ULRC_OK;
+        }
+        break;
+
+    default:
+        s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
+        break;
+    }
+    s_ul_ack_req = s_ul_ack_req + 1u;
+}
+
+/** Called at 200 Hz from Core 0 loop(). Handles uplink inbox, Rampa I2C @ 20 Hz,
+ *  pre-liftoff commit/detach at T - 100 ms, and publishes sync snapshot to Core 1. */
+static void rampa_and_uplink_service(void)
+{
+    static uint32_t next_rampa_ms = 0;
+    const uint32_t now = millis();
+    const bool in_flight = (s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_LANDED);
+
+    // 1. Deferred ground-only reboot after ACK flush.
+    if (s_reboot_pending && !in_flight && (int32_t)(now - s_reboot_at_ms) >= 0) {
+        digitalWrite(PIN_PCA_OE, HIGH);
+        watchdog_enable(1, 1);
+        while (1) { }
+    }
+
+    // 2. Consume any uplink packet received by Core 1.
+    const uint32_t rx_seq = s_ul_rx_seq;
+    if (rx_seq != s_ul_seen_seq) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        const ariadna_lora_uplink_t u = s_ul_box;
+        const uint32_t rx_ms = s_ul_rx_ms;
+        s_ul_seen_seq = rx_seq;
+        handle_lora_uplink(u, rx_ms);
+    }
+
+    // 3. Liftoff detected -> immediately freeze umbilical & clear countdown.
+    if (in_flight) {
+        s_cd_active      = false;
+        s_cd_committed   = false;
+        s_launch_soon    = false;
+        s_rampa_detached = true;
+        s_rampa_connected = false;
+        sync_publish(now);
+        return;
+    }
+
+    // 4. If we detached for liftoff, check for no-liftoff timeout (T + 5 s).
+    if (s_rampa_detached && s_cd_committed && (uint32_t)(now - s_rampa_detach_ms) > 5000u) {
+        s_cd_active    = false;
+        s_cd_committed = false;
+        s_launch_soon  = false;
+        s_rampa_detached = false;
+        i2c0_recover_if_stuck();
+        MASTER_PRINT("# RAMPA: no liftoff within 5 s after commit -> re-enabled umbilical\n");
+    }
+
+    // 5. Active countdown checks & T - 100 ms commit / hot-detach.
+    int32_t t_rem_ms = -1;
+    if (s_cd_active) {
+        t_rem_ms = (int32_t)(s_cd_t0_ms - now);
+        if (!s_cd_committed) {
+            if (!rocket_ready_for_launch()) {
+                launch_abort_now(now, "Rocket not ready");
+                t_rem_ms = -1;
+            } else if (!s_rampa_connected) {
+                launch_abort_now(now, "Rampa link lost");
+                t_rem_ms = -1;
+            } else if (t_rem_ms <= (int32_t)ARIADNA_UMB_DETACH_MS) {
+                // Final T - 100 ms handoff: send COMMIT and cleanly detach I2C
+                // before motor ignition so magnetic pogo rip-away cannot hang I2C0.
+                const int32_t send_rem = t_rem_ms > 10 ? t_rem_ms : 10;
+                if (rampa_exchange(RAMPA_CMD_COMMIT, send_rem, now) &&
+                    s_rampa_stat.state == RAMPA_STATE_COMMITTED) {
+                    s_cd_committed    = true;
+                    s_rampa_detached  = true;
+                    s_rampa_connected = false;
+                    s_rampa_detach_ms = now;
+                    MASTER_PRINT("# RAMPA COMMITTED (T-%ld ms), I2C umbilical detached\n",
+                                 (long)send_rem);
+                } else {
+                    launch_abort_now(now, "Rampa COMMIT refused");
+                    t_rem_ms = -1;
+                }
+            }
+        }
+    }
+
+    // 6. Periodic 20 Hz Rampa I2C exchange while connected & not detached.
+    if (!s_rampa_detached && !s_test && !s_hil && (int32_t)(now - next_rampa_ms) >= 0) {
+        next_rampa_ms = now + 1000u / ARIADNA_RAMPA_POLL_HZ;
+        const uint8_t cmd = s_cd_active   ? (uint8_t)RAMPA_CMD_COUNTDOWN
+                          : s_launch_soon ? (uint8_t)RAMPA_CMD_PREPARE
+                                          : (uint8_t)RAMPA_CMD_PING;
+        if (rampa_exchange(cmd, t_rem_ms, now)) {
+            if (s_cd_active && !s_cd_committed) {
+                const uint8_t cont_bit = (uint8_t)(ARIADNA_RMP_CONT1 << (s_cd_pyro_ch - 1u));
+                if (s_rampa_stat.state == RAMPA_STATE_ABORT ||
+                    s_rampa_stat.state == RAMPA_STATE_FAULT ||
+                    s_rampa_stat.fault_mask != 0u ||
+                    !(s_rampa_stat.flags & ARIADNA_RMP_KEY_ARMED) ||
+                    !(s_rampa_stat.flags & cont_bit)) {
+                    launch_abort_now(now, "Rampa interlock/abort");
+                }
+            }
+        } else if (s_rampa_connected && (uint32_t)(now - s_rampa_last_ok_ms) > ARIADNA_RAMPA_TIMEOUT_MS) {
+            s_rampa_connected = false;
+            if (s_cd_active && !s_cd_committed)
+                launch_abort_now(now, "Rampa I2C timeout");
+        }
+    }
+
+    sync_publish(now);
+}
+
+// =====================================================================
 //  11. CORE 0 — routing, servos, state machine
 // =====================================================================
 static void send_master_state(void)
@@ -3190,6 +3650,7 @@ void setup()
     Wire.setSCL(PIN_I2C_SCL);
     Wire.begin();
     Wire.setClock(400000);
+    Wire.setTimeout(3);
     s_servo_ok = pca_begin();
     for (uint8_t ch = 0; ch < PCA_N_CH; ch++) s_pca[ch] = PCA_FULL_OFF;
     s_ch[0] = 0xFF;                      // force servo_map_update() to build the map
@@ -3267,6 +3728,7 @@ void loop()
     batt_service();       // battery run-time estimate, 1 Hz feed (section 7)
     srvchk_service();     // servo connection check, when one is running (section 3b)
     state_machine();
+    rampa_and_uplink_service();
     params_stream();
     usb_service();        // diagnostic GUI: a no-op unless a host has the port open
     params_request_poll();
@@ -3456,7 +3918,15 @@ void setup1()
 
 void loop1()
 {
-    static uint32_t next_tlm_ms = 0;
+    static uint32_t next_tlm_ms   = 0;
+    static uint32_t next_sync_ms  = 0;
+    static uint32_t win_open_ms   = 0;
+    static uint32_t rx_end_ms     = 0;
+    static bool     win_armed     = false;
+    static bool     win_is_final  = false;
+    static bool     rx_active     = false;
+    static uint32_t last_ack_seen = 0;
+    static LoRaSyncSnap sn        = {};
 
     // Flash first: the log is the only record that survives a lost link.
     if (s_flash_ok) {
@@ -3465,32 +3935,138 @@ void loop1()
         flash_drain();
     }
 
-    // ---- LoRa downlink ---------------------------------------------------
-    //
-    // ASYNCHRONOUS. endPacket(true) returns as soon as the packet is handed
-    // to the radio, and beginPacket() refuses — returns 0 — while the
-    // previous packet is still on air. (isTransmitting() would say the
-    // same thing more directly, but the LoRa library keeps it private.)
-    //
-    // At 10 Hz a 46-byte packet is 46 ms on air inside a 100 ms slot, so a
-    // blocking endPacket() would put this core in the radio driver for
-    // nearly half its life — and the flash log is the other thing this core
-    // does. Blocking would not lose telemetry, but it would make the log
-    // bursty for no reason.
-    //
-    // A slot whose predecessor is still on air is SKIPPED, never queued.
-    // Queuing is how a downlink degrades from "occasionally late" to
-    // "permanently a second behind": each late packet delays the next, and
-    // the backlog only grows. Skipping keeps every packet that does arrive
-    // fresh, which is what a ground station needs.
-    if (s_lora_ok && millis() >= next_tlm_ms) {
+    if (!s_lora_ok) return;
+
+    (void)sync_acquire(&sn);
+    const uint32_t now = millis();
+    const uint32_t utc_ms = sn.utc_valid
+        ? (sn.utc_base_ms + (uint32_t)(now - sn.utc_ref_ms)) % 86400000u
+        : ARIADNA_UTC_UNKNOWN;
+    const int32_t t_rem_ms = sn.cd_active ? (int32_t)(sn.cd_t0_ms - now) : -1;
+
+    // ---- 1. Active LoRa RX window (300 ms every 10 s, plus T - 1 s) -------
+    if (rx_active) {
+        if (sn.in_flight) {
+            rx_active = false;
+            LoRa.idle();
+        } else {
+            const int sz = LoRa.parsePacket();
+            if (sz == (int)sizeof(ariadna_lora_uplink_t)) {
+                uint8_t buf[sizeof(ariadna_lora_uplink_t)];
+                LoRa.readBytes(buf, sizeof(buf));
+                ariadna_lora_uplink_t ul;
+                if (ariadna_lora_uplink_decode(buf, sizeof(buf), &ul)) {
+                    s_ul_box   = ul;
+                    s_ul_rx_ms = now;
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
+                    s_ul_rx_seq = s_ul_rx_seq + 1u;
+                }
+            } else if (sz > 0) {
+                while (LoRa.available()) LoRa.read();
+            }
+            if ((int32_t)(now - rx_end_ms) >= 0) {
+                rx_active    = false;
+                LoRa.idle();
+                // Schedule an ACK/sync beacon 25 ms later once Core 0 has
+                // processed any received command and updated Rampa state.
+                next_sync_ms = now + 25u;
+            }
+            return;
+        }
+    }
+
+    // ---- 2. Schedule next RX window (ground / countdown only) --------------
+    if (!sn.in_flight) {
+        int is_fin = 0;
+        const uint32_t to_win = ariadna_lora_next_window_ms(
+            now, utc_ms, sn.utc_valid ? 1 : 0, t_rem_ms, &is_fin);
+        if (!win_armed) {
+            win_open_ms  = now + to_win;
+            win_is_final = (is_fin != 0);
+            win_armed    = true;
+        } else {
+            // Pull the scheduled window forward if a T-1 s final abort window
+            // or a fresh UTC lock requires an earlier opening.
+            const uint32_t cand = now + to_win;
+            if ((int32_t)(cand - win_open_ms) < -150) {
+                win_open_ms  = cand;
+                win_is_final = (is_fin != 0);
+            }
+        }
+
+        const int32_t until_win = (int32_t)(win_open_ms - now);
+        if (until_win <= 0) {
+            rx_active = true;
+            rx_end_ms = now + ARIADNA_LORA_WIN_DUR_MS;
+            win_armed = false;
+            LoRa.receive();
+            return;
+        }
+        // Guard band: do not start a new TX that would collide with RX open.
+        if (until_win <= (int32_t)ARIADNA_LORA_TX_GUARD_MS) {
+            return;
+        }
+    } else {
+        win_armed = false;
+    }
+
+    // ---- 3. 1 Hz sync/ACK/Rampa beacon on ground & countdown ---------------
+    const bool ack_due = (s_ul_ack_req != last_ack_seen);
+    const bool sync_due = !sn.in_flight && (ack_due || (int32_t)(now - next_sync_ms) >= 0);
+    if (sync_due) {
+        if (!LoRa.beginPacket()) {
+            // Previous packet still on air; retry next pass.
+            return;
+        }
+        const uint32_t tx_now = millis();
+        const uint32_t tx_utc = sn.utc_valid
+            ? (sn.utc_base_ms + (uint32_t)(tx_now - sn.utc_ref_ms)) % 86400000u
+            : ARIADNA_UTC_UNKNOWN;
+        const int32_t tx_rem = sn.cd_active ? (int32_t)(sn.cd_t0_ms - tx_now) : -1;
+        uint32_t to_next = (win_armed && (int32_t)(win_open_ms - tx_now) > 0)
+                               ? (uint32_t)(win_open_ms - tx_now)
+                               : ARIADNA_LORA_WIN_PERIOD_MS;
+        if (to_next > 65535u) to_next = 65535u;
+
+        ariadna_lora_sync_t sb;
+        memset(&sb, 0, sizeof(sb));
+        sb.rocket_t_ms     = tx_now;
+        sb.utc_ms          = tx_utc;
+        sb.next_rx_in_ms   = (uint16_t)to_next;
+        sb.rx_dur_ms       = ARIADNA_LORA_WIN_DUR_MS;
+        sb.t_launch_rem_ms = tx_rem;
+        sb.last_cmd_seq    = sn.last_cmd_seq;
+        sb.last_cmd_rc     = sn.last_cmd_rc;
+        sb.rampa_state     = sn.rampa_state;
+        sb.rampa_flags     = sn.rampa_flags;
+        sb.rampa_fault     = sn.rampa_fault;
+        sb.rampa_vbat_mv   = sn.rampa_vbat_mv;
+        sb.sync_flags      = 0;
+        if (sn.utc_valid && sn.utc_from_gps) sb.sync_flags |= ARIADNA_SYNCF_GPS_UTC;
+        if (win_is_final)                    sb.sync_flags |= ARIADNA_SYNCF_FINAL_WIN;
+        if (sn.rampa_detached)               sb.sync_flags |= ARIADNA_SYNCF_RAMPA_DETACH;
+        if (sn.launch_soon)                  sb.sync_flags |= ARIADNA_SYNCF_LAUNCH_SOON;
+        if (sn.cd_active)                    sb.sync_flags |= ARIADNA_SYNCF_CD_ACTIVE;
+        if (sn.rocket_ready)                 sb.sync_flags |= ARIADNA_SYNCF_ROCKET_READY;
+        ariadna_lora_sync_seal(&sb);
+
+        LoRa.write((const uint8_t *)&sb, sizeof(sb));
+        LoRa.endPacket(true);
+        last_ack_seen = s_ul_ack_req;
+        next_sync_ms  = tx_now + (sn.cd_active ? 500u : 1000u);
+        next_tlm_ms   = tx_now + 1000u / ARIADNA_TLM_HZ;
+        return;
+    }
+
+    // ---- 4. Standard 10 Hz flight telemetry downlink -----------------------
+    if (now >= next_tlm_ms) {
         ariadna_tlm_t t;
         if (!tlm_acquire(&t)) {
             // Torn snapshot: core 0 was mid-publish. Try again next pass.
         } else if (!LoRa.beginPacket()) {
             s_tlm_skipped++;                   // previous packet still on air
         } else {
-            next_tlm_ms = millis() + 1000 / ARIADNA_TLM_HZ;
+            next_tlm_ms = now + 1000 / ARIADNA_TLM_HZ;
             LoRa.write((const uint8_t *)&t, sizeof(t));
             LoRa.endPacket(true);              // async
             s_tlm_sent++;
