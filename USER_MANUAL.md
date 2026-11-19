@@ -775,21 +775,27 @@ python Ground_Visualizer\ground_visualizer.py
   tmavý motiv na soumrak; volba se pamatuje. Okno se otevře maximalizované.
 * **„Tmavý kokpit“**: zdravá hodnota = neutrální dlaždice se **zeleným pruhem** vlevo;
   **varování = celá dlaždice žlutá**, **alarm = celá červená**. Křičí jen to, co je špatně.
-* **Horní řádek:** velký **stav mise**, **hodiny** (T− odpočet ze synchronizovaného odpočtu
-  rakety ⚡ nebo z místního START T-0, za letu T+ čas letu), upozornění SIMULACE / ZTRÁTA
-  SIGNÁLU, port + PŘIPOJIT, ZÁZNAM (klávesa R), MAPA ⭳, přepínač motivu.
-* **Druhý řádek (uplink):** RX okno, stav rampy, ACK; T-0 ZA (s), START T-0 (jen místní),
-  PŘÍPRAVA, ODPOČET → RAMPA, PADREF, RESTART a oddělené, největší tlačítko **ABORT**.
-* **Velké dlaždice:** výška, svislá rychlost, náklon (+ špička nahoru/dolů a směr), další
-  událost s odpočtem (do ZÁŽEHU / do PŘISTÁNÍ). **Menší:** vodorovná rychlost, zrychlení,
-  tah + clamp, baterie + proud, fáze navedení, GPS (satelity + HDOP), UWB (kotvy + fúze),
-  LoRa (kvalita spoje % + RSSI/SNR), poloha vůči rampě, chyba.
-* Lišty: zdraví subsystémů (porucha = červená), pyro (kontinuita/odpáleno), **události
-  letu** (apogeum, aerokryt, zážeh 1, tah, zážeh 2, nohy, lidar, dosed).
-* **Orientace třikrát**: navball (špička rakety), **3-D model rakety** v rámci rampy
-  (oranžová = přistávací motor/špička, zelené = křidélko 1) a **terč náklonu**; vedle mapa a
-  TVC s klapkou. Vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC; dole čas
-  v sekundách před posledním paketem), vpravo výškoměr s čarou zážehu.
+* **Nahoře vždy vidět** (na všech záložkách): **stav mise**, **hodiny** (T− odpočet ze
+  synchronizovaného odpočtu rakety ⚡ nebo z místního START T-0, za letu T+ čas letu),
+  kvalita spoje LoRa, upozornění SIMULACE / ZTRÁTA SIGNÁLU a tlačítko **ABORT**.
+  Vpravo u záložek ZÁZNAM (klávesa R) a přepínač motivu.
+* **Tři záložky** (F1 / F2 / F3; při vzletu se samo přepne na LET):
+  1. **LET** — jen to podstatné za letu: velké dlaždice výška, svislá rychlost, další
+     událost s odpočtem (do ZÁŽEHU / do PŘISTÁNÍ), náklon, fáze navedení, vodorovná
+     rychlost; lišta událostí letu; **navball**; mapa; graf výšky; výškoměr s čarou zážehu.
+  2. **START** — **kontrola před startem** (spoj, subsystémy, chyba, baterie, GPS, UWB,
+     pyro C1/C2, ARM/RBF, svislost, rampa) s pruhem **GO / GO s výhradou / NO-GO** a
+     důvody (orientační, platí jen v IDLE/ARMED); odpočet a rampa (RX okno, stav rampy, ACK,
+     T-0 ZA, START T-0, PŘÍPRAVA, ODPOČET → RAMPA); 3-D raketa a terč svislosti.
+  3. **DIAGNOSTIKA** — grafy zrychlení / svislé rychlosti / TVC, podrobné dlaždice (tah,
+     clamp, proud, GPS, UWB, LoRa RSSI/SNR, poloha vůči rampě, chyba, pakety), lišty
+     subsystémů a pyro, TVC s klapkou; připojení (port, PŘIPOJIT), ladicí příkazy PADREF a
+     RESTART, stažení mapy.
+* **Navball**: koule pevná vůči světu (modrá obloha, hnědá zem) viděná podél **špičky**;
+  střed = kam míří špička. Na rampě (náklon 0°) je ve středu **zenit (bílý křížek)** a
+  koule je celá modrá; při pádu špičkou dolů je celá hnědá a ve středu je **nadir (bílý
+  kroužek)**. Náklon = vzdálenost křížku/kroužku od středu, kroužky = 30° / 60° elevace,
+  písmena S/V/J/Z = světové strany.
 * **Mapa** (fw 3.28): letecký snímek **ČÚZK ortofoto, 15 cm/px** (zoom 20; mimo ČR Google).
   Při startu se stáhne do `Dokumenty/Daidalos/map_cache/aerial` kolem rampy (~60 MB) a pak
   funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAPA ⭳** stáhne mapu

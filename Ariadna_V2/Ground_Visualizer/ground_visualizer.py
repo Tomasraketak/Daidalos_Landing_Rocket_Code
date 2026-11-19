@@ -742,6 +742,15 @@ def build_qss() -> str:
     QLabel#Clock[level="bad"] {{ background:{t['bad']}; border-color:{t['bad']}; color:{t['bad_text']}; }}
     QLabel#Clock[level="ok"] {{ border-color:{t['ok']}; color:{t['ok']}; }}
 
+    QFrame#CheckRow {{ background:transparent; border:none; border-bottom:1px solid {t['panel2']}; }}
+    QLabel#CheckName {{ color:{t['text']}; font-size:15px; font-weight:800; background:transparent; }}
+    QLabel#CheckDetail {{ color:{t['text']}; font-family:"{MONO_FONT}"; font-size:15px; font-weight:600;
+                background:transparent; }}
+    QTabWidget::pane {{ border:none; border-top:3px solid {t['accent']}; }}
+    QTabBar::tab {{ background:{t['idle']}; color:{t['idle_text']}; font-size:15px; font-weight:900;
+                padding:7px 26px; margin-right:4px; border-top-left-radius:8px; border-top-right-radius:8px; }}
+    QTabBar::tab:selected {{ background:{t['accent']}; color:#ffffff; }}
+    QTabBar::tab:hover:!selected {{ color:{t['text']}; }}
     QLabel#Lamp {{ background:{t['idle']}; color:{t['idle_text']}; border:2px solid {t['idle']};
                 border-radius:4px; padding:1px 4px; font-size:12px; font-weight:800; }}
     QLabel#Lamp[kind="ok"] {{ background:{t['ok']}; border-color:{t['ok']}; color:{t['ok_text']}; }}
@@ -841,7 +850,7 @@ class IndicatorStrip(QtWidgets.QFrame):
     pick what "set" and "not set" look like (see the Lamp styles).
     """
 
-    def __init__(self, title, labels, on_kind="ok", off_kind="idle"):
+    def __init__(self, title, labels, on_kind="ok", off_kind="idle", cols=0):
         super().__init__()
         self.setObjectName("Panel")
         self.on_kind, self.off_kind = on_kind, off_kind
@@ -853,12 +862,14 @@ class IndicatorStrip(QtWidgets.QFrame):
         cap.setObjectName("Caption")
         outer.addWidget(cap)
 
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(4)
+        row = QtWidgets.QGridLayout()
+        row.setHorizontalSpacing(4)
+        row.setVerticalSpacing(4)
         outer.addLayout(row)
+        cols = cols or len(labels)
 
         self.lamps = {}
-        for name in labels:
+        for idx, name in enumerate(labels):
             lamp = QtWidgets.QLabel(name)
             lamp.setObjectName("Lamp")
             lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -868,13 +879,51 @@ class IndicatorStrip(QtWidgets.QFrame):
                                QtWidgets.QSizePolicy.Policy.Fixed)
             lamp.setProperty("kind", off_kind)
             self.lamps[name] = lamp
-            row.addWidget(lamp)
+            row.addWidget(lamp, idx // cols, idx % cols)
 
     def set(self, name, on, warn=False):
         lamp = self.lamps.get(name)
         if lamp is None:
             return
         set_level(lamp, "warn" if warn else (self.on_kind if on else self.off_kind), "kind")
+
+
+class CheckRow(QtWidgets.QFrame):
+    """One line of the pre-launch check: a status lamp, what is checked and
+    the value it was judged on."""
+
+    WORDS = {"ok": "OK", "warn": "POZOR", "bad": "NO-GO", "idle": "—", "info": "INFO"}
+
+    def __init__(self, name, hint=""):
+        super().__init__()
+        self.setObjectName("CheckRow")
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(6, 3, 10, 3)
+        lay.setSpacing(12)
+        self.lamp = QtWidgets.QLabel("—")
+        self.lamp.setObjectName("Lamp")
+        self.lamp.setProperty("kind", "idle")
+        self.lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.lamp.setFixedSize(84, 30)
+        self.name = QtWidgets.QLabel(name)
+        self.name.setObjectName("CheckName")
+        self.name.setMinimumWidth(190)
+        if hint:
+            self.name.setToolTip(hint)
+        self.detail = QtWidgets.QLabel("bez dat")
+        self.detail.setObjectName("CheckDetail")
+        self.detail.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
+        lay.addWidget(self.lamp)
+        lay.addWidget(self.name)
+        lay.addWidget(self.detail, 1)
+        self.level = "idle"
+
+    def set(self, level, detail):
+        self.level = level
+        self.lamp.setText(self.WORDS.get(level, "—"))
+        set_level(self.lamp, level, "kind")
+        self.detail.setText(detail)
 
 
 class TVCWidget(QtWidgets.QWidget):
@@ -968,41 +1017,58 @@ class TVCWidget(QtWidgets.QWidget):
 
 
 class NavBallWidget(QtWidgets.QWidget):
-    """Native PyQt6 3D navball. Carried over from the V1 visualiser."""
+    """
+    Navball: a sphere fixed to the world (blue sky above the horizon, brown
+    ground below), seen from inside the rocket along the NOSE. The centre of
+    the ball is where the nose points, so
+
+      * nose straight up (on the pad, 0 deg tilt)  -> the zenith is in the
+        centre and the whole ball is blue,
+      * nose on the horizon                       -> horizon through the centre,
+      * nose straight down (landing burn)          -> the whole ball is brown.
+
+    The tilt is the distance of the zenith (white cross) from the centre;
+    the rings are 30 / 60 deg of elevation. Nose down, the tilt is the
+    distance of the nadir (white ring) from the centre.
+    """
+
+    STEP = 10            # deg, resolution of the ground patches
 
     def __init__(self):
         super().__init__()
-        self.pitch = self.roll = self.yaw = 0.0
+        self.pitch = 90.0
+        self.roll = 0.0
+        self.yaw = 0.0
         self.speed = 0.0
-        self.setMinimumSize(260, 280)
+        self.tilt = None
+        self.tilt_az = None
+        self.setMinimumSize(240, 260)
+        self.COLOR_SKY = QtGui.QColor("#2f86c9")
+        self.COLOR_GROUND = QtGui.QColor("#9a5a2c")
 
-        self.COLOR_SKY = QtGui.QColor(50, 130, 168)
-        self.COLOR_GROUND = QtGui.QColor(168, 92, 50)
-        self.COLOR_UI_BG = QtGui.QColor(30, 30, 30, 230)
-        self.COLOR_GREEN = QtGui.QColor(50, 255, 50)
-        self.COLOR_WHITE = QtGui.QColor(255, 255, 255)
-        self.COLOR_BLACK = QtGui.QColor(0, 0, 0)
-        self.COLOR_GREY = QtGui.QColor(150, 150, 150)
-        self.COLOR_ORANGE = QtGui.QColor(255, 140, 0)
-        self.COLOR_CHEVRON = QtGui.QColor(255, 180, 0)
-
-    def update_attitude(self, pitch, roll, yaw=0.0, speed=0.0):
+    def update_attitude(self, pitch, roll, yaw=0.0, speed=0.0, tilt=None, tilt_az=None):
         self.pitch, self.roll = pitch, roll
         self.yaw = yaw % 360
         self.speed = speed
+        self.tilt, self.tilt_az = tilt, tilt_az
         self.update()
 
     def _project_3d(self, lat, lon):
+        """World direction (elevation lat, compass lon) -> view (x, y, z);
+        z > 0 is the visible hemisphere, (0, 0, 1) is the nose."""
         lat_r, lon_r = math.radians(lat), math.radians(lon)
         x = math.cos(lat_r) * math.sin(lon_r)
         y = math.sin(lat_r)
         z = math.cos(lat_r) * math.cos(lon_r)
 
+        # turn the nose's compass heading to the front ...
         yaw_r = math.radians(-self.yaw)
         cy, sy = math.cos(yaw_r), math.sin(yaw_r)
         x1, y1, z1 = x * cy + z * sy, y, -x * sy + z * cy
 
-        pitch_r = math.radians(90 - self.pitch)
+        # ... then tip the nose's elevation to the centre: the point at
+        # elevation `pitch` on the front meridian lands on (0, 0, 1).
+        pitch_r = math.radians(self.pitch)
         cp, sp = math.cos(pitch_r), math.sin(pitch_r)
         x2, y2, z2 = x1, y1 * cp - z1 * sp, y1 * sp + z1 * cp
 
@@ -1010,38 +1076,29 @@ class NavBallWidget(QtWidgets.QWidget):
         cr, sr = math.cos(roll_r), math.sin(roll_r)
         return x2 * cr - y2 * sr, x2 * sr + y2 * cr, z2
 
-    def _draw_3d_line(self, painter, cx, cy, radius, pts, color, width=1):
-        painter.setPen(QtGui.QPen(color, width))
-        for i in range(len(pts) - 1):
-            p1, p2 = pts[i], pts[i + 1]
-            if p1[2] > 0 and p2[2] > 0:
-                painter.drawLine(
-                    QtCore.QPointF(float(cx + p1[0] * radius), float(cy - p1[1] * radius)),
-                    QtCore.QPointF(float(cx + p2[0] * radius), float(cy - p2[1] * radius)))
+    def _pt(self, p, cx, cy, r):
+        return QtCore.QPointF(cx + p[0] * r, cy - p[1] * r)
 
-    def _draw_oriented_text(self, painter, text, lat, lon, cx, cy, radius):
-        px, py, pz = self._project_3d(lat, lon)
-        if pz < 0.15:
+    def _polyline(self, painter, pts, cx, cy, r, pen):
+        painter.setPen(pen)
+        for a, b in zip(pts, pts[1:]):
+            if a[2] > 0 and b[2] > 0:
+                painter.drawLine(self._pt(a, cx, cy, r), self._pt(b, cx, cy, r))
+
+    def _label(self, painter, text, lat, lon, cx, cy, r, font):
+        p = self._project_3d(lat, lon)
+        if p[2] < 0.2:
             return
-        pl = self._project_3d(lat, lon - 2)
-        pr = self._project_3d(lat, lon + 2)
-        angle = math.degrees(math.atan2((pr[1] - pl[1]) * -radius,
-                                        (pr[0] - pl[0]) * radius))
-
-        painter.save()
-        painter.translate(cx + px * radius, cy - py * radius)
-        painter.rotate(angle)
-        painter.setFont(ui_font(11, QtGui.QFont.Weight.Bold))
+        pt = self._pt(p, cx, cy, r)
+        painter.setFont(font)
         m = painter.fontMetrics()
-        tw, th = m.horizontalAdvance(text), m.height()
-        painter.setPen(self.COLOR_BLACK)
-        for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            painter.drawText(QtCore.QRectF(-tw / 2 + ox, -th / 2 + oy, tw, th),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, text)
-        painter.setPen(self.COLOR_WHITE)
-        painter.drawText(QtCore.QRectF(-tw / 2, -th / 2, tw, th),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, text)
-        painter.restore()
+        rect = QtCore.QRectF(pt.x() - m.horizontalAdvance(text) / 2 - 3, pt.y() - m.height() / 2,
+                             m.horizontalAdvance(text) + 6, m.height())
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor(0, 0, 0, 120))
+        painter.drawRoundedRect(rect, 3, 3)
+        painter.setPen(QtGui.QColor("#ffffff"))
+        painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, text)
 
     def paintEvent(self, _event):
         painter = QtGui.QPainter(self)
@@ -1050,111 +1107,100 @@ class NavBallWidget(QtWidgets.QWidget):
         painter.setPen(QtGui.QPen(C("border"), 1))
         painter.setBrush(C("panel"))
         painter.drawRoundedRect(QtCore.QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
-        self.COLOR_UI_BG = C("panel2")
-        self.COLOR_GREEN = C("text")
-        cx, cy = rect.center().x(), rect.center().y()
-        radius = max(30, min(cx, cy - 34) - 22)
 
+        painter.setPen(C("muted"))
+        painter.setFont(ui_font(11, QtGui.QFont.Weight.ExtraBold))
+        painter.drawText(QtCore.QRectF(12, 6, rect.width() - 24, 16),
+                         QtCore.Qt.AlignmentFlag.AlignLeft, "ORIENTACE ŠPIČKY")
+
+        foot = 46
+        radius = max(40.0, min(rect.width() - 24, rect.height() - 28 - foot) / 2.0 - 6)
+        cx = rect.width() / 2.0
+        cy = 28 + 6 + radius
+        centre = QtCore.QPointF(cx, cy)
+
+        # sky, then the ground patches on top of it
+        path = QtGui.QPainterPath()
+        path.addEllipse(centre, radius, radius)
+        painter.setClipPath(path)
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
         painter.setBrush(self.COLOR_SKY)
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-
-        path = QtGui.QPainterPath()
-        path.addEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-        painter.setClipPath(path)
-
+        painter.drawEllipse(centre, radius, radius)
         painter.setBrush(self.COLOR_GROUND)
         painter.setPen(QtGui.QPen(self.COLOR_GROUND, 1))
-        for lat in range(-90, 0, 5):
-            for lon in range(0, 360, 5):
-                q = [self._project_3d(lat, lon), self._project_3d(lat + 5, lon),
-                     self._project_3d(lat + 5, lon + 5), self._project_3d(lat, lon + 5)]
-                if sum(p[2] for p in q) > 0:
-                    painter.drawPolygon(QtGui.QPolygonF(
-                        [QtCore.QPointF(float(cx + p[0] * radius), float(cy - p[1] * radius))
-                         for p in q]))
+        s = self.STEP
+        for lat in range(-90, 0, s):
+            for lon in range(0, 360, s):
+                q = [self._project_3d(lat, lon), self._project_3d(lat + s, lon),
+                     self._project_3d(lat + s, lon + s), self._project_3d(lat, lon + s)]
+                if max(p[2] for p in q) > 0:
+                    painter.drawPolygon(QtGui.QPolygonF([self._pt(p, cx, cy, radius) for p in q]))
 
-        painter.setClipping(False)
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.setPen(QtGui.QPen(C("dim"), 12))
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)),
-                            float(radius + 6), float(radius + 6))
-        painter.setPen(QtGui.QPen(C("text"), 3))
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-        painter.setClipPath(path)
-        painter.setClipping(True)
-
+        # a sparse grid: elevation rings at +-30/60, meridians every 45 deg,
+        # the horizon thick
+        thin = QtGui.QPen(QtGui.QColor(255, 255, 255, 110), 1.2)
+        for lat in (-60, -30, 30, 60):
+            self._polyline(painter, [self._project_3d(lat, lon) for lon in range(0, 361, 5)],
+                           cx, cy, radius, thin)
         for lon in range(0, 360, 45):
-            self._draw_3d_line(painter, cx, cy, radius,
-                               [self._project_3d(lat, lon) for lat in range(-90, 91, 5)],
-                               self.COLOR_GREY, 1)
-        self._draw_3d_line(painter, cx, cy, radius,
-                           [self._project_3d(0, lon) for lon in range(0, 365, 5)],
-                           self.COLOR_ORANGE, 3)
+            self._polyline(painter, [self._project_3d(lat, lon) for lat in range(-85, 86, 5)],
+                           cx, cy, radius, thin)
+        self._polyline(painter, [self._project_3d(0, lon) for lon in range(0, 361, 3)],
+                       cx, cy, radius, QtGui.QPen(QtGui.QColor("#ffffff"), 3))
 
-        for lon in range(0, 360, 10):
-            self._draw_3d_line(painter, cx, cy, radius,
-                               [self._project_3d(-2, lon), self._project_3d(2, lon)],
-                               self.COLOR_WHITE, 2)
-            if lon % 30 == 0:
-                txt = {0: "N", 90: "E", 180: "S", 270: "W"}.get(lon, f"{lon:03d}")
-                self._draw_oriented_text(painter, txt, -5, lon, cx, cy, radius)
+        small = ui_font(11, QtGui.QFont.Weight.Bold)
+        for lat in (30, 60, -30, -60):
+            self._label(painter, f"{lat:+d}", lat, 0, cx, cy, radius, small)
+        big = ui_font(13, QtGui.QFont.Weight.ExtraBold)
+        for txt, lon in (("S", 0), ("V", 90), ("J", 180), ("Z", 270)):
+            self._label(painter, txt, 15 if self.pitch >= 0 else -15, lon, cx, cy, radius, big)
 
-        for center_lon in (0, 90, 180, 270):
-            for lat in range(-80, 90, 10):
-                if lat == 0:
-                    continue
-                cos_lat = max(math.cos(math.radians(lat)), 0.05)
-                base = 12 if lat % 20 == 0 else 6
-                span = min(base / cos_lat, 40)
-                step = max(1, int(span / 5))
-                self._draw_3d_line(
-                    painter, cx, cy, radius,
-                    [self._project_3d(lat, lon)
-                     for lon in range(int(center_lon - span), int(center_lon + span) + 1, step)],
-                    self.COLOR_WHITE, 2)
-                off = 6.0 / cos_lat
-                self._draw_oriented_text(painter, str(abs(lat)), lat,
-                                         center_lon - span - off, cx, cy, radius)
-                self._draw_oriented_text(painter, str(abs(lat)), lat,
-                                         center_lon + span + off, cx, cy, radius)
-
+        # the zenith: "straight up". Its distance from the centre is the tilt.
+        z = self._project_3d(90, 0)
+        if z[2] > 0:
+            zp = self._pt(z, cx, cy, radius)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 3))
+            painter.drawLine(QtCore.QPointF(zp.x() - 9, zp.y()), QtCore.QPointF(zp.x() + 9, zp.y()))
+            painter.drawLine(QtCore.QPointF(zp.x(), zp.y() - 9), QtCore.QPointF(zp.x(), zp.y() + 9))
+        # the nadir, "straight down" - what the landing burn aims at
+        n = self._project_3d(-90, 0)
+        if n[2] > 0:
+            npt = self._pt(n, cx, cy, radius)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 3))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(npt, 8.0, 8.0)
         painter.setClipping(False)
 
-        chevron = [QtCore.QPointF(float(cx - 32), float(cy)),
-                   QtCore.QPointF(float(cx - 11), float(cy)),
-                   QtCore.QPointF(float(cx), float(cy + 16)),
-                   QtCore.QPointF(float(cx + 11), float(cy)),
-                   QtCore.QPointF(float(cx + 32), float(cy))]
-        painter.setPen(QtGui.QPen(self.COLOR_CHEVRON, 4))
+        # bezel
         painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.drawPolyline(QtGui.QPolygonF(chevron))
-        painter.setBrush(self.COLOR_CHEVRON)
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), 4.0, 4.0)
+        painter.setPen(QtGui.QPen(C("text"), 3))
+        painter.drawEllipse(centre, radius, radius)
 
-        f_small = ui_font(12, QtGui.QFont.Weight.ExtraBold)
-        f_large = ui_font(19, QtGui.QFont.Weight.Bold, mono=True)
+        # the nose: fixed in the centre
+        painter.setPen(QtGui.QPen(QtGui.QColor("#000000"), 6))
+        wing = [QtCore.QPointF(cx - 30, cy), QtCore.QPointF(cx - 11, cy),
+                QtCore.QPointF(cx, cy + 11), QtCore.QPointF(cx + 11, cy), QtCore.QPointF(cx + 30, cy)]
+        painter.drawPolyline(QtGui.QPolygonF(wing))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#ffc400"), 3))
+        painter.drawPolyline(QtGui.QPolygonF(wing))
+        painter.setBrush(QtGui.QColor("#ffc400"))
+        painter.drawEllipse(centre, 4.0, 4.0)
 
-        sr = QtCore.QRectF(cx - 80, cy - radius - 52, 160, 46)
-        painter.setBrush(self.COLOR_UI_BG)
-        painter.setPen(QtGui.QPen(C("border"), 2))
-        painter.drawRoundedRect(sr, 6, 6)
+        # read-out under the ball
+        painter.setPen(C("text"))
+        painter.setFont(ui_font(16, QtGui.QFont.Weight.Bold, mono=True))
+        if self.tilt is None:
+            txt = "--"
+        else:
+            txt = f"náklon {self.tilt:.1f}°  směr {self.tilt_az:03.0f}°"
+        painter.drawText(QtCore.QRectF(0, rect.height() - foot + 4, rect.width(), 22),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, txt)
         painter.setPen(C("muted"))
-        painter.setFont(f_small)
-        painter.drawText(QtCore.QRectF(sr.x(), sr.y() + 2, sr.width(), 16),
-                         QtCore.Qt.AlignmentFlag.AlignHCenter, "RYCHLOST")
-        painter.setPen(self.COLOR_GREEN)
-        painter.setFont(f_large)
-        painter.drawText(QtCore.QRectF(sr.x(), sr.y() + 17, sr.width(), 26),
-                         QtCore.Qt.AlignmentFlag.AlignHCenter, f"{self.speed:.1f} m/s")
-
-        hr = QtCore.QRectF(cx - 62, cy + radius + 8, 124, 36)
-        painter.setBrush(self.COLOR_UI_BG)
-        painter.setPen(QtGui.QPen(C("border"), 2))
-        painter.drawRoundedRect(hr, 6, 6)
-        painter.setPen(self.COLOR_GREEN)
-        painter.setFont(f_large)
-        painter.drawText(hr, QtCore.Qt.AlignmentFlag.AlignCenter, f"AZ {int(self.yaw):03d}°")
+        painter.setFont(ui_font(12, QtGui.QFont.Weight.Bold))
+        painter.drawText(QtCore.QRectF(0, rect.height() - foot + 24, rect.width(), 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter,
+                         f"špička {'NAHORU' if self.pitch >= 0 else 'DOLŮ'} · rychlost {self.speed:.1f} m/s")
+        painter.end()
 
 
 class AltimeterWidget(QtWidgets.QWidget):
@@ -1248,6 +1294,8 @@ class GroundStation(QtWidgets.QMainWindow):
         self.rx_timestamps = []
         self.is_test_mode = False
         self.last_state = None
+        self.last_state_seen = None
+        self._rampa_check = ("idle", "bez spojení s rampou")
 
         self.is_recording = False
         self.csv_file = None
@@ -1311,9 +1359,9 @@ class GroundStation(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(10, 8, 10, 4)
-        root.setSpacing(7)
+        root.setSpacing(6)
 
-        # ---------------- row 1: what the vehicle is doing, and the link ----------------
+        # ======== always visible: what the vehicle is doing, and ABORT ========
         bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(8)
         root.addLayout(bar)
@@ -1337,10 +1385,8 @@ class GroundStation(QtWidgets.QMainWindow):
         self.state_banner.setToolTip("Stav letového automatu (mission state)")
         bar.addWidget(self.state_banner)
 
-        # Launch countdown. The vehicle does not know when it will be
-        # launched; the operator does. Before lift-off this shows T-, from
-        # the rocket's synchronised countdown when there is one, else from
-        # the local START T-0; in flight it shows the flight time.
+        # Before lift-off T- (the rocket's synchronised countdown when there
+        # is one, else the local START T-0); in flight the flight time.
         self.clock = QtWidgets.QLabel("T  --:--")
         self.clock.setObjectName("Clock")
         self.clock.setProperty("level", "")
@@ -1348,6 +1394,11 @@ class GroundStation(QtWidgets.QMainWindow):
         self.clock.setMinimumWidth(190)
         self.clock.setToolTip("Odpočet do startu (T-) / čas letu (T+)")
         bar.addWidget(self.clock)
+
+        self.link_badge = badge("LoRa --")
+        self.link_badge.setMinimumWidth(120)
+        self.link_badge.setToolTip("Kvalita rádiového spoje (podíl doručených paketů)")
+        bar.addWidget(self.link_badge)
 
         self.test_mode_label = badge("SIMULACE · bez signálu", "warn")
         self.test_mode_label.setToolTip("Není připojená pozemní stanice - zobrazují se simulovaná data")
@@ -1360,111 +1411,28 @@ class GroundStation(QtWidgets.QMainWindow):
         bar.addWidget(self.los_label)
 
         bar.addStretch()
-
-        self.port_combo = QtWidgets.QComboBox()
-        self.port_combo.setMinimumWidth(130)
-        self.refresh_ports()
-        bar.addWidget(self.port_combo)
-
-        refresh = kbutton("⟳", "", "Znovu načíst seznam sériových portů")
-        refresh.setFixedWidth(40)
-        refresh.clicked.connect(self.refresh_ports)
-        bar.addWidget(refresh)
-
-        self.connect_btn = kbutton("PŘIPOJIT", "primary", "Připojit / odpojit pozemní stanici (USB)")
-        self.connect_btn.setMinimumWidth(118)
-        self.connect_btn.clicked.connect(self.toggle_connection)
-        bar.addWidget(self.connect_btn)
-
-        bar.addSpacing(8)
-        self.record_btn = kbutton("● ZÁZNAM", "", "Nahrávat telemetrii do CSV v Dokumenty\\Daidalos (klávesa R)")
-        self.record_btn.clicked.connect(self.toggle_recording)
-        bar.addWidget(self.record_btn)
-
-        self.map_btn = kbutton("MAPA ⭳", "", "Stáhnout letecké snímky (ČÚZK ortofoto, 15 cm/px) okolí "
-                                            "rampy pro použití offline na místě")
-        self.map_btn.clicked.connect(self.download_map_here)
-        bar.addWidget(self.map_btn)
-
-        self.theme_btn = kbutton("", "", "Přepnout vzhled: VENKU (světlý, na slunce) / NOC (tmavý)")
-        self.theme_btn.setMinimumWidth(92)
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        bar.addWidget(self.theme_btn)
-
-        # ---------------- row 2: uplink & Rampa control (fw 3.34) ----------------
-        ul = QtWidgets.QHBoxLayout()
-        ul.setSpacing(8)
-        root.addLayout(ul)
-
-        self.ul_win_label = badge("RX OKNO: --")
-        self.ul_win_label.setMinimumWidth(190)
-        ul.addWidget(self.ul_win_label)
-
-        self.rampa_label = badge("RAMPA: OFFLINE")
-        ul.addWidget(self.rampa_label)
-
-        self.ul_ack_label = QtWidgets.QLabel("ACK: —")
-        self.ul_ack_label.setObjectName("Ack")
-        ul.addWidget(self.ul_ack_label)
-
-        ul.addStretch()
-
-        t0_cap = QtWidgets.QLabel("T-0 ZA")
-        t0_cap.setObjectName("Caption")
-        ul.addWidget(t0_cap)
-        self.t0_spin = QtWidgets.QSpinBox()
-        self.t0_spin.setRange(5, 3600)
-        self.t0_spin.setValue(60)
-        self.t0_spin.setSuffix(" s")
-        self.t0_spin.setMinimumWidth(86)
-        ul.addWidget(self.t0_spin)
-        self.t0_btn = kbutton("START T-0", "", "Jen místní odpočet na této obrazovce (nic neodesílá)")
-        self.t0_btn.clicked.connect(self.toggle_countdown)
-        ul.addWidget(self.t0_btn)
-        self.t0_deadline = None
-        self.t0_timer = QtCore.QTimer()
-        self.t0_timer.timeout.connect(self.update_countdown)
-        self.t0_timer.start(200)
-
-        ul.addSpacing(10)
-        self.ul_prep_btn = kbutton("PŘÍPRAVA (PREP)", "info",
-                                   "Odešle pokyn Příprava / Start brzy (čerstvý PADREF + kontrola rampy)")
-        self.ul_prep_btn.clicked.connect(self.send_uplink_prep)
-        ul.addWidget(self.ul_prep_btn)
-
-        self.ul_cd_btn = kbutton("ODPOČET → RAMPA", "warn",
-                                 "Odešle synchronizovaný odpočet (dle pole T-0 ZA) raketě a přes pupeční I2C rampě")
-        self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
-        ul.addWidget(self.ul_cd_btn)
-
-        self.ul_padref_btn = kbutton("PADREF", "", "Raketa si znovu změří referenční polohu rampy")
-        self.ul_padref_btn.clicked.connect(lambda: self._send_ul("CMD:PADREF", "PADREF"))
-        ul.addWidget(self.ul_padref_btn)
-
-        self.ul_reboot_btn = kbutton("RESTART", "", "Vzdálený restart rakety (povoleno pouze na zemi)")
-        self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
-        ul.addWidget(self.ul_reboot_btn)
-
-        ul.addSpacing(18)
         self.ul_abort_btn = kbutton("✖  ABORT", "abort",
                                     "Okamžitě zařadí ABORT do nejbližšího RX okna (včetně nouzového okna T-1 s)")
         self.ul_abort_btn.clicked.connect(self.send_uplink_abort)
-        ul.addWidget(self.ul_abort_btn)
+        bar.addWidget(self.ul_abort_btn)
 
-        # ---------------- body ----------------
-        body = QtWidgets.QHBoxLayout()
-        body.setSpacing(10)
-        root.addLayout(body, stretch=1)
+        # ======== three pages ========
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setDocumentMode(True)
+        root.addWidget(self.tabs, 1)
 
-        # ---- left: the graphs, stacked, each the full width of the column ----
-        graphs = QtWidgets.QVBoxLayout()
-        graphs.setSpacing(6)
-        body.addLayout(graphs, stretch=30)
-
-        # ---- centre: the numbers, the lights, attitude and the map ----
-        centre = QtWidgets.QVBoxLayout()
-        centre.setSpacing(7)
-        body.addLayout(centre, stretch=66)
+        corner = QtWidgets.QWidget()
+        cl = QtWidgets.QHBoxLayout(corner)
+        cl.setContentsMargins(0, 0, 0, 4)
+        cl.setSpacing(6)
+        self.record_btn = kbutton("● ZÁZNAM", "", "Nahrávat telemetrii do CSV v Dokumenty\\Daidalos (klávesa R)")
+        self.record_btn.clicked.connect(self.toggle_recording)
+        cl.addWidget(self.record_btn)
+        self.theme_btn = kbutton("", "", "Přepnout vzhled: VENKU (světlý, na slunce) / NOC (tmavý)")
+        self.theme_btn.setMinimumWidth(92)
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        cl.addWidget(self.theme_btn)
+        self.tabs.setCornerWidget(corner, QtCore.Qt.Corner.TopRightCorner)
 
         self.tiles = {}
 
@@ -1473,80 +1441,226 @@ class GroundStation(QtWidgets.QMainWindow):
             self.tiles[key] = t
             return t
 
-        # The four numbers that matter during the flight, big.
-        hero = QtWidgets.QHBoxLayout()
-        hero.setSpacing(7)
-        centre.addLayout(hero)
-        for key, title in (("ALT", "Výška"), ("VZ", "Svislá rychlost"),
-                           ("TILT", "Náklon"), ("NEXT", "Další událost")):
-            hero.addWidget(tile(key, title, hero=True))
+        def panel(title):
+            fr = QtWidgets.QFrame()
+            fr.setObjectName("Panel")
+            v = QtWidgets.QVBoxLayout(fr)
+            v.setContentsMargins(10, 6, 10, 10)
+            v.setSpacing(6)
+            cap = QtWidgets.QLabel(title.upper())
+            cap.setObjectName("Caption")
+            v.addWidget(cap)
+            return fr, v
 
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(7)
-        grid.setVerticalSpacing(7)
-        centre.addLayout(grid)
-        small = [
-            ("HVEL", "Vodorovná rychlost"), ("ACCEL", "Zrychlení"), ("THRUST", "Tah · clamp"),
-            ("POWER", "Baterie · proud"), ("PHASE", "Fáze navedení"),
-            ("GPS", "GPS"),
-            # The UWB constellation: anchors alive AND what the filter does
-            # with them - they fail independently (a survey error looks like
-            # live anchors whose every fix is gated out).
-            ("UWB", "UWB kotvy · fúze"),
-            ("LORA", "LoRa linka"), ("PAD", "Poloha vůči rampě [m]"), ("ERROR", "Chyba"),
-        ]
-        for i, (key, title) in enumerate(small):
-            grid.addWidget(tile(key, title), i // 5, i % 5)
-        for col in range(5):
-            grid.setColumnStretch(col, 1)
+        def page():
+            w = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(w)
+            lay.setContentsMargins(0, 8, 0, 0)
+            lay.setSpacing(10)
+            return w, lay
 
-        strips = QtWidgets.QHBoxLayout()
-        strips.setSpacing(7)
-        centre.addLayout(strips)
-        self.health_strip = IndicatorStrip("Subsystémy", [n for _, n in HEALTH_BITS],
-                                           on_kind="okline", off_kind="bad")
-        strips.addWidget(self.health_strip, 1)
-        self.pyro_strip = IndicatorStrip("Pyro · C = kontinuita, F = odpáleno",
-                                         ["C1", "C2", "C3", "F1", "F2", "F3", "ARM", "RBF"],
-                                         on_kind="ok", off_kind="idle")
-        strips.addWidget(self.pyro_strip, 1)
+        # ---------------- 1. LET: only what matters in the air ----------------
+        p1, l1 = page()
+        self.tabs.addTab(p1, "  1 · LET  ")
 
+        col = QtWidgets.QVBoxLayout()
+        col.setSpacing(7)
+        l1.addLayout(col, 26)
+        for key, title, hero in (("ALT", "Výška", True), ("VZ", "Svislá rychlost", True),
+                                 ("NEXT", "Další událost", True), ("TILT", "Náklon", True),
+                                 ("PHASE", "Fáze navedení", False), ("HVEL", "Vodorovná rychlost", False)):
+            col.addWidget(tile(key, title, hero))
+        col.addStretch(1)
         self.event_strip = IndicatorStrip("Události letu", [n for _, n in EVENT_BITS],
-                                          on_kind="info", off_kind="idle")
-        centre.addWidget(self.event_strip)
+                                          on_kind="info", off_kind="idle", cols=4)
+        col.addWidget(self.event_strip)
 
-        # Attitude, three ways: the navball, a 3-D rocket in the pad frame,
-        # and the tilt bull's-eye (where the top of the vehicle leans); then
-        # the map and the nozzle.
-        lower = QtWidgets.QHBoxLayout()
-        lower.setSpacing(7)
-        centre.addLayout(lower, stretch=1)
+        mid = QtWidgets.QVBoxLayout()
+        mid.setSpacing(7)
+        l1.addLayout(mid, 34)
         self.navball = NavBallWidget()
-        self.navball.setMinimumSize(230, 240)
-        lower.addWidget(self.navball, stretch=3)
-        att_r = QtWidgets.QVBoxLayout()
-        att_r.setSpacing(7)
-        lower.addLayout(att_r, stretch=2)
-        self.rocket_view = RocketView()
-        self.rocket_view.setMinimumSize(170, 150)
-        self.rocket_view.show_readout = False      # the NÁKLON tile says it, larger
-        att_r.addWidget(self.rocket_view, stretch=3)
-        self.tilt_bubble = TiltBubble()
-        self.tilt_bubble.setMinimumSize(130, 120)
-        att_r.addWidget(self.tilt_bubble, stretch=2)
+        mid.addWidget(self.navball, 1)
 
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(7)
+        l1.addLayout(right, 40)
         self.map_widget = RocketMapWidget(self.pad_lat, self.pad_lon, self.pad_src)
-        self.map_widget.setMinimumWidth(220)
-        lower.addWidget(self.map_widget, stretch=4)
-
-        self.tvc_widget = TVCWidget()
-        self.tvc_widget.setFixedWidth(160)
-        lower.addWidget(self.tvc_widget, stretch=0)
-
+        self.map_widget.setMinimumHeight(220)
+        right.addWidget(self.map_widget, 6)
         self.alt_plot = pg.PlotWidget()
+        right.addWidget(self.alt_plot, 4)
+
+        self.altimeter = AltimeterWidget()
+        l1.addWidget(self.altimeter, 0)
+
+        # ---------------- 2. START: is it ready, and the countdown ----------------
+        p2, l2 = page()
+        self.tabs.addTab(p2, "  2 · START  ")
+
+        chk, chk_l = panel("Kontrola před startem")
+        l2.addWidget(chk, 56)
+        self.go_banner = QtWidgets.QLabel("BEZ DAT")
+        self.go_banner.setObjectName("State")
+        self.go_banner.setProperty("level", "idle")
+        self.go_banner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.go_banner.setWordWrap(True)
+        chk_l.addWidget(self.go_banner)
+        self.checks = {}
+        for key, name, hint in (
+                ("link", "Rádiový spoj", "Podíl doručených paketů (≥ 90 %) a síla signálu"),
+                ("health", "Subsystémy", "Všechny bity zdraví (POS, NAV, SOLN, FLASH, LOG, SERVO, GPS, POST)"),
+                ("error", "Chyba", "Kód chyby z rakety"),
+                ("batt", "Baterie", "2S Li-ion: < 7,0 V NO-GO, < 7,4 V pozor"),
+                ("gps", "GPS", "≥ 5 satelitů, HDOP ≤ 1,5 (≤ 2,5 pozor)"),
+                ("uwb", "UWB", "≥ 3 kotvy a filtr fixy přijímá"),
+                ("pyro1", "Pyro C1 · přistávací motor", "Kontinuita zapalovače hlavního motoru"),
+                ("pyro2", "Pyro C2 · záložní zapalovač", "Kontinuita záložního zapalovače"),
+                ("arm", "ARM / RBF", "Stav odjištění a Remove-Before-Flight"),
+                ("tilt", "Svislost na rampě", "< 4° OK, < 10° pozor"),
+                ("rampa", "Rampa", "Stav startovací rampy (přes LoRa sync)")):
+            row = CheckRow(name, hint)
+            self.checks[key] = row
+            chk_l.addWidget(row)
+        chk_l.addStretch(1)
+        note = QtWidgets.QLabel("Orientační kontrola z telemetrie. Rozhodnutí o startu dělá vedoucí startu.")
+        note.setObjectName("Caption")
+        chk_l.addWidget(note)
+
+        s_right = QtWidgets.QVBoxLayout()
+        s_right.setSpacing(10)
+        l2.addLayout(s_right, 44)
+
+        cd, cd_l = panel("Odpočet a rampa")
+        s_right.addWidget(cd)
+        self.ul_win_label = badge("RX OKNO: --")
+        cd_l.addWidget(self.ul_win_label)
+        self.rampa_label = badge("RAMPA: OFFLINE")
+        cd_l.addWidget(self.rampa_label)
+        self.ul_ack_label = QtWidgets.QLabel("ACK: —")
+        self.ul_ack_label.setObjectName("Ack")
+        cd_l.addWidget(self.ul_ack_label)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        cap = QtWidgets.QLabel("T-0 ZA")
+        cap.setObjectName("Caption")
+        row.addWidget(cap)
+        self.t0_spin = QtWidgets.QSpinBox()
+        self.t0_spin.setRange(5, 3600)
+        self.t0_spin.setValue(60)
+        self.t0_spin.setSuffix(" s")
+        self.t0_spin.setMinimumWidth(96)
+        row.addWidget(self.t0_spin)
+        self.t0_btn = kbutton("START T-0 (jen zde)", "", "Jen místní odpočet na této obrazovce (nic neodesílá)")
+        self.t0_btn.clicked.connect(self.toggle_countdown)
+        row.addWidget(self.t0_btn)
+        row.addStretch(1)
+        cd_l.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.ul_prep_btn = kbutton("PŘÍPRAVA (PREP)", "info",
+                                   "Odešle pokyn Příprava / Start brzy (čerstvý PADREF + kontrola rampy)")
+        self.ul_prep_btn.clicked.connect(self.send_uplink_prep)
+        row.addWidget(self.ul_prep_btn, 1)
+        self.ul_cd_btn = kbutton("ODPOČET → RAMPA", "warn",
+                                 "Odešle synchronizovaný odpočet (dle pole T-0 ZA) raketě a přes pupeční I2C rampě")
+        self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
+        row.addWidget(self.ul_cd_btn, 1)
+        cd_l.addLayout(row)
+        self.t0_deadline = None
+        self.t0_timer = QtCore.QTimer()
+        self.t0_timer.timeout.connect(self.update_countdown)
+        self.t0_timer.start(200)
+
+        vert, vert_l = panel("Raketa na rampě")
+        s_right.addWidget(vert, 1)
+        vr = QtWidgets.QHBoxLayout()
+        vr.setSpacing(8)
+        vert_l.addLayout(vr, 1)
+        self.rocket_view = RocketView()
+        self.rocket_view.setMinimumSize(180, 180)
+        self.rocket_view.show_readout = False      # the check list says it, larger
+        vr.addWidget(self.rocket_view, 1)
+        self.tilt_bubble = TiltBubble()
+        self.tilt_bubble.setMinimumSize(180, 180)
+        vr.addWidget(self.tilt_bubble, 1)
+
+        # ---------------- 3. DIAGNOSTIKA: everything else ----------------
+        p3, l3 = page()
+        self.tabs.addTab(p3, "  3 · DIAGNOSTIKA  ")
+
+        graphs = QtWidgets.QVBoxLayout()
+        graphs.setSpacing(6)
+        l3.addLayout(graphs, 34)
         self.accel_plot = pg.PlotWidget()
         self.vel_plot = pg.PlotWidget()
         self.tvc_plot = pg.PlotWidget()
+        for plt in (self.accel_plot, self.vel_plot, self.tvc_plot):
+            graphs.addWidget(plt)
+
+        dmid = QtWidgets.QVBoxLayout()
+        dmid.setSpacing(7)
+        l3.addLayout(dmid, 46)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(7)
+        grid.setVerticalSpacing(7)
+        dmid.addLayout(grid)
+        small = [
+            ("ACCEL", "Zrychlení"), ("THRUST", "Tah · clamp"), ("POWER", "Baterie · proud"),
+            ("GPS", "GPS"), ("UWB", "UWB kotvy · fúze"), ("LORA", "LoRa linka"),
+            ("PAD", "Poloha vůči rampě [m]"), ("ERROR", "Chyba"), ("PKT", "Pakety"),
+        ]
+        for i, (key, title) in enumerate(small):
+            grid.addWidget(tile(key, title), i // 3, i % 3)
+        for c_ in range(3):
+            grid.setColumnStretch(c_, 1)
+        self.health_strip = IndicatorStrip("Subsystémy", [n for _, n in HEALTH_BITS],
+                                           on_kind="okline", off_kind="bad")
+        dmid.addWidget(self.health_strip)
+        self.pyro_strip = IndicatorStrip("Pyro · C = kontinuita, F = odpáleno",
+                                         ["C1", "C2", "C3", "F1", "F2", "F3", "ARM", "RBF"],
+                                         on_kind="ok", off_kind="idle")
+        dmid.addWidget(self.pyro_strip)
+        self.tvc_widget = TVCWidget()
+        dmid.addWidget(self.tvc_widget, 1)
+
+        tools, tools_l = panel("Připojení a nástroje")
+        tools.setFixedWidth(270)
+        l3.addWidget(tools)
+        self.port_combo = QtWidgets.QComboBox()
+        self.refresh_ports()
+        tools_l.addWidget(self.port_combo)
+        row = QtWidgets.QHBoxLayout()
+        refresh = kbutton("⟳ Porty", "", "Znovu načíst seznam sériových portů")
+        refresh.clicked.connect(self.refresh_ports)
+        row.addWidget(refresh)
+        self.connect_btn = kbutton("PŘIPOJIT", "primary", "Připojit / odpojit pozemní stanici (USB)")
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        row.addWidget(self.connect_btn, 1)
+        tools_l.addLayout(row)
+        tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("PŘÍKAZY RAKETĚ (LADĚNÍ)")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        self.ul_padref_btn = kbutton("PADREF – změřit rampu", "", "Raketa si znovu změří referenční polohu rampy")
+        self.ul_padref_btn.clicked.connect(lambda: self._send_ul("CMD:PADREF", "PADREF"))
+        tools_l.addWidget(self.ul_padref_btn)
+        self.ul_reboot_btn = kbutton("RESTART rakety", "", "Vzdálený restart rakety (povoleno pouze na zemi)")
+        self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
+        tools_l.addWidget(self.ul_reboot_btn)
+        tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("MAPA")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        self.map_btn = kbutton("MAPA ⭳ stáhnout okolí", "", "Stáhnout letecké snímky (ČÚZK ortofoto, 15 cm/px) okolí "
+                                                          "rampy pro použití offline na místě")
+        self.map_btn.clicked.connect(self.download_map_here)
+        tools_l.addWidget(self.map_btn)
+        tools_l.addStretch(1)
+        keys = QtWidgets.QLabel("F1 / F2 / F3 – záložky\nR – záznam\nPři startu se samo přepne na LET.")
+        keys.setObjectName("Caption")
+        tools_l.addWidget(keys)
+
+        # plot set-up (all four, wherever they sit)
         self.alt_curve = self.alt_plot.plot()
         self.accel_curve = self.accel_plot.plot()
         self.vel_curve = self.vel_plot.plot()
@@ -1555,18 +1669,17 @@ class GroundStation(QtWidgets.QMainWindow):
         self.tvc_y_curve = self.tvc_plot.plot(name="Y")
         self._plots = ((self.alt_plot, "Výška", "m"), (self.accel_plot, "Zrychlení", "g"),
                        (self.vel_plot, "Svislá rychlost", "m/s"), (self.tvc_plot, "Výchylka TVC", "°"))
-        for plot, _title, _unit in self._plots:
-            plot.setMenuEnabled(False)
-            plot.getAxis("left").setWidth(44)
-            graphs.addWidget(plot)
+        for plt, _title, _unit in self._plots:
+            plt.setMenuEnabled(False)
+            plt.getAxis("left").setWidth(44)
         # Altitude and acceleration cannot go negative; vertical speed and
         # TVC very much can, so they keep a symmetric axis.
         self.alt_plot.getPlotItem().setLimits(yMin=0)
         self.accel_plot.getPlotItem().setLimits(yMin=0)
 
-        # ---- right: altimeter ----
-        self.altimeter = AltimeterWidget()
-        body.addWidget(self.altimeter, stretch=0)
+        for i, key in enumerate((QtCore.Qt.Key.Key_F1, QtCore.Qt.Key.Key_F2, QtCore.Qt.Key.Key_F3)):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            sc.activated.connect(lambda i=i: self.tabs.setCurrentIndex(i))
 
         self.status = self.statusBar()
         self.status.showMessage("ODPOJENO")
@@ -1632,7 +1745,7 @@ class GroundStation(QtWidgets.QMainWindow):
             set_level(self.t0_btn, "primary", "kind")
         else:
             self.t0_deadline = None
-            self.t0_btn.setText("START T-0")
+            self.t0_btn.setText("START T-0 (jen zde)")
             set_level(self.t0_btn, "", "kind")
         self.update_countdown()
 
@@ -1700,12 +1813,15 @@ class GroundStation(QtWidgets.QMainWindow):
         if s["rampa_state"] == 0:
             self.rampa_label.setText("RAMPA: OFFLINE")
             set_level(self.rampa_label, "")
+            self._rampa_check = ("warn", "offline")
         else:
             self.rampa_label.setText(
                 f"RAMPA: {rstate} · {key_s} · C {c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
             lvl = "okline" if s["rampa_state"] in (2, 3, 4) and s["rampa_fault"] == 0 else (
                 "bad" if s["rampa_state"] in (6, 7) or s["rampa_fault"] else "warn")
             set_level(self.rampa_label, lvl)
+            self._rampa_check = ("ok" if lvl == "okline" else lvl,
+                                 f"{rstate} · {key_s} · C {c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
 
         rc_txt = UL_RC_NAMES.get(s["last_cmd_rc"], "?")
         self.ul_ack_label.setText(f"ACK #{s['last_cmd_seq']}: {rc_txt}")
@@ -1847,13 +1963,38 @@ class GroundStation(QtWidgets.QMainWindow):
         lora = getattr(self, "_lora", None)
         sub = f"{lora[0]} dBm · SNR {lora[1]} dB" if lora else " "
         tile = self.tiles["LORA"]
-        tile.set_value("SIM" if pdr is None else f"{pdr:.0f} %", sub)
+        main = "SIM" if pdr is None else f"{pdr:.0f} %"
+        tile.set_value(main, sub)
         rank = 0
         if pdr is not None:
             rank = max(rank, 2 if pdr < 50 else 1 if pdr < 90 else 0)
         if lora:
             rank = max(rank, 0 if lora[0] > -90 else 1 if lora[0] > -110 else 2)
-        tile.set_level(("ok", "warn", "bad")[rank])
+        level = ("ok", "warn", "bad")[rank]
+        tile.set_level(level)
+        self.link_badge.setText(f"LoRa {main}")
+        set_level(self.link_badge, "okline" if level == "ok" else level)
+        self.checks["link"].set(level, f"{main} paketů · {sub}")
+
+    def _update_go(self, state):
+        """The banner over the check list: GO / NO-GO and why."""
+        lvl, txt = self._rampa_check
+        self.checks["rampa"].set(lvl, txt)
+        if state not in (1, 2):
+            self.go_banner.setText(f"{STATE_NAMES.get(state, '?')} – kontrola jen na rampě")
+            set_level(self.go_banner, "idle")
+            return
+        bad = [r.name.text() for r in self.checks.values() if r.level == "bad"]
+        warn = [r.name.text() for r in self.checks.values() if r.level == "warn"]
+        if bad:
+            self.go_banner.setText("NO-GO: " + ", ".join(bad))
+            set_level(self.go_banner, "bad")
+        elif warn:
+            self.go_banner.setText("GO s výhradou: " + ", ".join(warn))
+            set_level(self.go_banner, "warn")
+        else:
+            self.go_banner.setText("GO – vše v pořádku")
+            set_level(self.go_banner, "ok")
 
     def enable_test_mode(self, enabled):
         if self.is_test_mode == enabled:
@@ -2019,6 +2160,11 @@ class GroundStation(QtWidgets.QMainWindow):
         att = attitude_summary(*d["QUAT"])
         self.flight_t = d["T_FLIGHT"] if d["STATE"] >= 3 else None
 
+        # page 1 follows the flight on its own at lift-off
+        if d["STATE"] == 3 and self.last_state_seen is not None and self.last_state_seen < 3:
+            self.tabs.setCurrentIndex(0)
+        self.last_state_seen = d["STATE"]
+
         c["ALT"].set_value(f"{d['ALT']:.1f} m", f"max {max(self.data_alt):.0f} m")
         c["ALT"].set_level("ok" if d["STATE"] >= 1 else "idle")
         vz = d["VZ"]
@@ -2038,24 +2184,25 @@ class GroundStation(QtWidgets.QMainWindow):
         else:
             c["NEXT"].set_value(f"{d['T_EVENT']:.1f} s", "do PŘISTÁNÍ")
             c["NEXT"].set_level("accent")
-
+        c["PHASE"].set_value(PHASE_NAMES.get(d["PHASE"], "?"), " ")
+        c["PHASE"].set_level("accent" if d["PHASE"] in (3, 4) else
+                             "info" if d["PHASE"] == 2 else "idle")
         c["HVEL"].set_value(f"{d['HVEL']:.1f} m/s", f"celková {d['TOTVEL']:.1f} m/s")
         c["HVEL"].set_level("ok")
+
         c["ACCEL"].set_value(f"{d['ACCEL']:.2f} g", " ")
         c["ACCEL"].set_level("warn" if d["ACCEL"] > 8 else "ok")
         burn = d["PHASE"] == PHASE_BURN
         c["THRUST"].set_value(f"{d['THRUST']:.0f} N", f"clamp {d['CLAMP']} %")
         c["THRUST"].set_level("accent" if burn else "idle")
         # 2S lithium: 7.4 V nominal, 8.4 V full, 6.6 V empty.
+        batt_lvl = "bad" if d["BATTERY"] < 7.0 else "warn" if d["BATTERY"] < 7.4 else "ok"
         c["POWER"].set_value(f"{d['BATTERY']:.2f} V", f"{d['CURRENT']:.1f} A")
-        c["POWER"].set_level("bad" if d["BATTERY"] < 7.0 else "warn" if d["BATTERY"] < 7.4 else "ok")
-        c["PHASE"].set_value(PHASE_NAMES.get(d["PHASE"], "?"), " ")
-        c["PHASE"].set_level("accent" if d["PHASE"] in (3, 4) else
-                             "info" if d["PHASE"] == 2 else "idle")
-
+        c["POWER"].set_level(batt_lvl)
+        gps_lvl = ("bad" if d["SATS"] < 5 or d["HDOP"] > 2.5 else
+                   "warn" if d["HDOP"] > 1.5 else "ok")
         c["GPS"].set_value(f"{d['SATS']} sat", f"HDOP {d['HDOP']:.1f}")
-        c["GPS"].set_level("bad" if d["SATS"] < 5 or d["HDOP"] > 2.5 else
-                           "warn" if d["HDOP"] > 1.5 else "ok")
+        c["GPS"].set_level(gps_lvl)
         # Green only when the filter is ACCEPTING fixes. Alive but gated out
         # is amber, and it is the state worth acting on before launch. Three
         # anchors still navigates; two is a warning; fewer is not a
@@ -2066,21 +2213,48 @@ class GroundStation(QtWidgets.QMainWindow):
             fix = f"FUSED {UWB_MODE_NAMES.get(d['UWB_MODE'], '?')}"
         else:
             fix = "GATED OUT"
-        c["UWB"].set_value(f"{d['UWB_N']} / 4", fix)
         if not d["UWB_ALIVE"]:
-            c["UWB"].set_level("idle")
+            uwb_lvl = "idle"
         elif d["UWB_N"] < 2:
-            c["UWB"].set_level("bad")
+            uwb_lvl = "bad"
         elif d["UWB_N"] == 2 or not d["UWB_AIDED"]:
-            c["UWB"].set_level("warn")
+            uwb_lvl = "warn"
         else:
-            c["UWB"].set_level("ok")
+            uwb_lvl = "ok"
+        c["UWB"].set_value(f"{d['UWB_N']} / 4", fix)
+        c["UWB"].set_level(uwb_lvl)
         self._lora = (d["RSSI"], d["SNR"])
         self._show_link()
         c["PAD"].set_value(f"E{d['PX']:+d} N{d['PY']:+d}", " ")
         c["PAD"].set_level("ok")
-        c["ERROR"].set_value("žádná" if not d["ERROR"] else ERROR_NAMES.get(d["ERROR"], "?"), f"kód {d['ERROR']}" if d["ERROR"] else " ")
+        err_txt = "žádná" if not d["ERROR"] else ERROR_NAMES.get(d["ERROR"], "?")
+        c["ERROR"].set_value(err_txt, f"kód {d['ERROR']}" if d["ERROR"] else " ")
         c["ERROR"].set_level("bad" if d["ERROR"] else "ok")
+        c["PKT"].set_value(f"{self.packet_count}", f"zahozeno {getattr(self, '_link_bad', 0)}")
+        c["PKT"].set_level("idle" if is_simulated else "ok")
+
+        # ---- page 2: the pre-launch check ----
+        k = self.checks
+        failed = [n for b, n in HEALTH_BITS if not d["HEALTH"] & (1 << b)]
+        k["health"].set("bad" if failed else "ok",
+                        "chybí: " + ", ".join(failed) if failed else "všech 8 v pořádku")
+        k["error"].set("bad" if d["ERROR"] else "ok", err_txt)
+        k["batt"].set(batt_lvl, f"{d['BATTERY']:.2f} V · {d['CURRENT']:.1f} A")
+        k["gps"].set(gps_lvl, f"{d['SATS']} satelitů · HDOP {d['HDOP']:.1f}")
+        k["uwb"].set("bad" if uwb_lvl == "idle" else uwb_lvl, f"{d['UWB_N']} / 4 kotvy · {fix}")
+        for i, key in ((0, "pyro1"), (1, "pyro2")):
+            cont = bool(d["PYRO_CONT"] & (1 << i))
+            fired = bool(d["PYRO_FIRED"] & (1 << i))
+            if fired:
+                k[key].set("info", "odpáleno")
+            else:
+                k[key].set("ok" if cont else ("bad" if i == 0 else "warn"),
+                           "kontinuita OK" if cont else "BEZ KONTINUITY")
+        arm, rbf = bool(d["FLAGS"] & 0x01), bool(d["FLAGS"] & 0x02)
+        k["arm"].set("info", f"ARM {'ANO' if arm else 'ne'} · RBF {'ANO' if rbf else 'ne'}")
+        k["tilt"].set("ok" if att["tilt"] < 4 else "warn" if att["tilt"] < 10 else "bad",
+                      f"{att['tilt']:.1f}° · směr {att['tilt_az']:.0f}°")
+        self._update_go(d["STATE"])
 
         # state banner
         name = STATE_NAMES.get(d["STATE"], "?")
@@ -2108,7 +2282,8 @@ class GroundStation(QtWidgets.QMainWindow):
 
         # The navball shows the NOSE: +90 pitch on the pad, -90 falling
         # nose-first. The 3-D view and the bull's-eye need no convention.
-        self.navball.update_attitude(att["pitch"], 0.0, att["heading"], d["TOTVEL"])
+        self.navball.update_attitude(att["pitch"], 0.0, att["heading"], d["TOTVEL"],
+                                     att["tilt"], att["tilt_az"])
         self.rocket_view.set_quaternion(*d["QUAT"])
         self.rocket_view.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]),
                                        burning=(d["PHASE"] == PHASE_BURN))
