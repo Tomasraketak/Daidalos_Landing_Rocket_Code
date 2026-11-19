@@ -2,25 +2,35 @@
 //  Ariadna V2 — Rocket <-> Rampa (Launch Pad) Umbilical I2C Protocol
 //
 //  Physical connection: 3-pin magnetic pogo connector (GND, SDA, SCL)
-//    Ariadna V2 Master MCU  : I2C1 or I2C2 uSup -> GP8 (SDA), GP9 (SCL)
-//                             (shared I2C0 bus with PCA9685 @ 0x40)
-//    Rampa PCB1 (Pico 2 U7) : J3 pin 1 = GND
-//                             J3 pin 3 -> R22 (100R) -> GP1 (I2C0 SCL)
-//                             J3 pin 4 -> R21 (1k)   -> GP0 (I2C0 SDA)
-//                             (Rampa internal sensors live on I2C1 GP6/GP7)
+//    Ariadna V2 Navigation MCU : I2CN uSup -> D4 (GP6, Wire1 SDA),
+//                                             D5 (GP7, Wire1 SCL)
+//                                DEDICATED bus — completely isolated from
+//                                Master MCU PCA9685 servos (I2C0 GP8/GP9)!
+//    Rampa PCB1 (Pico 2 U7)    : J3 pin 1 = GND
+//                                J3 pin 3 -> R22 (100R) -> GP1 (I2C0 SCL)
+//                                J3 pin 4 -> R21 (1k)   -> GP0 (I2C0 SDA)
+//                                (Rampa internal sensors live on I2C1 GP6/GP7)
 //
-//  Role: Rocket (Master MCU) = I2C Master, Rampa = I2C Slave @ 0x2B.
-//  While umbilical I2C heartbeats arrive (< 2 s), Rampa keeps its LoRa
+//  DO NOT connect I2CN pin 2 (3V3) to Rampa J3 pin 2 (UMB_5V)!
+//  NSDA/NSCL have no external pull-ups on Ariadna V2; Navigation MCU enables
+//  internal pull-ups and clocks Wire1 at 100 kHz (external 4.7k pull-ups to
+//  3V3 on the umbilical harness recommended for cables > 15 cm).
+//
+//  Role: Master MCU owns mission/countdown state and bridges 16 B / 20 B
+//  frames over 921600-baud UART1 to Navigation MCU, which is the I2C Master
+//  on I2CN (Wire1 @ 100 kHz) talking to Rampa I2C Slave @ 0x2B.
+//  While umbilical I2C heartbeats arrive (< 1.5 s), Rampa keeps its LoRa
 //  radio hardware-powered OFF (TCA9534 P4 LORA_EN = LOW -> TPS22918 U12).
 //
 //  Safe hot-disconnect before liftoff (T - ARIADNA_UMB_DETACH_MS):
 //    1. T - 1000 ms: Rocket opens mandatory 300 ms final LoRa RX window
 //       for last-chance ABORT from Ground Station.
-//    2. T - 100 ms: Rocket sends RAMPA_CMD_COMMIT (exact remaining ms) and
-//       reads back RAMPA_STATE_COMMITTED.
-//    3. Immediately upon COMMIT ACK:
+//    2. T - 100 ms: Master sends RAMPA_CMD_COMMIT -> Navigation MCU writes
+//       it to Rampa over Wire1 and reads back RAMPA_STATE_COMMITTED.
+//    3. Immediately upon COMMIT ACK (both ends fully detach!):
 //         - Rampa calls Wire.end() and puts GP0/GP1 to Hi-Z INPUT.
-//         - Rocket stops addressing 0x2B (keeps I2C0 alive for PCA9685).
+//         - Navigation MCU calls Wire1.end() and puts D4/D5 to Hi-Z INPUT.
+//         - Master's PCA9685 servo bus (I2C0) is never touched at all.
 //    4. T - 0 ms: Rampa verifies physical key + local abort button, fires
 //       igniter, rocket lifts off and magnetic pogo separates cleanly.
 //
@@ -37,8 +47,10 @@
 extern "C" {
 #endif
 
-/** 7-bit I2C slave address of Rampa on Master MCU's I2C0 bus (clear of PCA9685 0x40/0x70). */
+/** 7-bit I2C slave address of Rampa on Navigation MCU's dedicated I2CN bus. */
 #define ARIADNA_RAMPA_I2C_ADDR      0x2Bu
+/** Umbilical I2C clock (100 kHz for robust operation over pogo + R21 1k). */
+#define ARIADNA_RAMPA_I2C_HZ        100000UL
 
 #define ARIADNA_RAMPA_CMD_MAGIC     0xB5u
 #define ARIADNA_RAMPA_STAT_MAGIC    0xB6u

@@ -190,6 +190,7 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_uwb_link.h:$(V2)/Bench_Tests/Position_Test/ariadna_uwb_link.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Position_MCU/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(NAV_DIR)/ariadna_link.h \
+  $(V2)/common/ariadna_rampa_link.h:$(NAV_DIR)/ariadna_rampa_link.h \
   $(V2)/common/ariadna_uart_dma.h:$(NAV_DIR)/ariadna_uart_dma.h \
   $(V2)/common/ariadna_rgb.h:$(NAV_DIR)/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Ground_Station/ariadna_link.h \

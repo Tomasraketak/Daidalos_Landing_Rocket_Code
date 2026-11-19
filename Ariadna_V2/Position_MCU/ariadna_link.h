@@ -142,9 +142,11 @@ typedef enum {
     ARIADNA_PKT_GPS_TIME     = 0x14,  // Position -> Master, 1 Hz GPS UTC time sync
     ARIADNA_PKT_ACTUATOR     = 0x20,  // Navigation -> Master
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
+    ARIADNA_PKT_RAMPA_STATUS = 0x22,  // Navigation -> Master (forwarded from Rampa I2CN)
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
     ARIADNA_PKT_CMD          = 0x31,  // Master -> Position, Navigation
     ARIADNA_PKT_PARAM        = 0x32,  // Master -> Position, Navigation (ground only)
+    ARIADNA_PKT_RAMPA_CMD    = 0x33,  // Master -> Navigation (forwarded to Rampa I2CN)
     ARIADNA_PKT_TELEMETRY    = 0x40,  // Master -> LoRa -> Ground Station -> PC
     ARIADNA_PKT_GS_SYNC      = 0x41,  // Master -> LoRa -> Ground Station -> PC (sync/Rampa/ACK)
     ARIADNA_PKT_HIL_IN       = 0x50   // PC -> Position MCU (USB CDC HIL sensor frame)

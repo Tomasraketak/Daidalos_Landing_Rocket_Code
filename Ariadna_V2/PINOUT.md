@@ -23,7 +23,7 @@ boards:
     uart0_pos: {tx: GP0, rx: GP1, baud: 921600, note: "GP0 also wired to NAV.D11"}
     uart1_nav: {tx: GP4, rx: GP5, baud: 921600}
     i2c0_bus:  {sda: GP8, scl: GP9, clk_khz: 400, pullup: "10k to 3V3M",
-                devs: {pca9685: 0x40, rampa_umbilical_via_I2C1_or_I2C2: 0x2B}}
+                devs: {pca9685: 0x40}, note: "PCA9685 servos ONLY — keep umbilical off this bus!"}
     spi0_lora: {miso: GP16, cs: GP17, sck: GP18, mosi: GP19, dio0: GP20, rst: GP21, ic: "Ra-02 SX1278 433MHz"}
     spi1_flash:{miso: GP12, cs: GP13, sck: GP14, mosi: GP15, ic: "W25Q128JV 16MB"}
     io:        {rgb_sk6812: GP2, buzzer: GP3, pca_oe_low: GP6, nav_rst_low: GP7,
@@ -31,7 +31,7 @@ boards:
     adc:       {i_acs712_20a: "GP26 (10k/10k 2:1, 0A=1.252V)", vbat_2s: "GP27 (20k/10k 3:1)",
                 rbf: "GP28 (Q4 IRF9540NS gate network, removed=LOW)"}
     gotchas:   ["GP6 connects to PCA9685 /OE AND via diode D6 to POS.RUN (PRST)",
-                "I2C1/I2C2 uSup share I2C0 with PCA9685: Rampa MUST detach I2C before liftoff"]
+                "Do NOT plug Rampa pogo into Master I2C1/I2C2 (shared with PCA9685); use Navigation I2CN instead"]
 
   ariadna_position: # Netlist_Ariadna_V2 | XIAO RP2350 | Position_MCU/Position_MCU.ino
     spi0_imu:  {sck: D8, miso: D9, mosi: D10, cs: D3, ic: "TriSense Pro ONLY (drives SCK/MOSI when CS=H!)"}
@@ -45,7 +45,8 @@ boards:
     uart_mst:  {tx: D6, rx: D7, baud: 921600}
     pyro_out:  {ch1_ign1: D3, ch2_ign2: D8, ch3_legs: D9, fet: "AO3400A low-side, HIGH=FIRE"}
     pyro_cont: {ch1: D0, ch2: D1, ch3: D2, divider: "20k/10k 3:1 on PYRO1..3"}
-    i2c_spare: {sda: D4, scl: D5, conn: I2CN}
+    i2c1_umb:  {sda: D4, scl: D5, clk_khz: 100, conn: I2CN, devs: {rampa_umbilical: 0x2B},
+                note: "DEDICATED umbilical bus (isolated from servos!); Wire1.end()+Hi-Z at T-100ms; no PCB pull-ups (uses internal PU, 4.7k on harness recommended >15cm)"}
     rgb:       {pin: "XIAO onboard PIN_NEOPIXEL (22)", pwr: "NEOPIXEL_POWER (23)"}
 
   uwb_anchor_and_tag: # Netlist_Anchor-PCB | XIAO RP2350 | Uwb_Anchor.ino / Uwb_Tag.ino
@@ -87,10 +88,10 @@ boards:
 
 | Board | MCU | Role | Sketch |
 |---|---|---|---|
-| **Control / Master** | Raspberry Pi Pico 2 W | mission state machine, servos, flash log, bidirectional LoRa, Rampa I²C master | `Master_MCU/Master_MCU.ino` |
+| **Control / Master** | Raspberry Pi Pico 2 W | mission state machine, servos (PCA9685), flash log, bidirectional LoRa | `Master_MCU/Master_MCU.ino` |
 | **Position** | Seeed XIAO RP2350 | sensor fusion, navigation KF, UWB multilateration, GPS UTC clock | `Position_MCU/Position_MCU.ino` |
 | **UWB Tag** | Seeed XIAO RP2350 (Anchor PCB) | two-way ranging, I²C slave `0x2A` (34 B fast frame) | `Uwb_Tag/Uwb_Tag.ino` |
-| **Navigation** | Seeed XIAO RP2350 | guidance, ignition timing, TVC, fins, pyros | `Navigation_MCU/Navigation_MCU.ino` |
+| **Navigation** | Seeed XIAO RP2350 | guidance, ignition timing, TVC, fins, pyros, **Rampa umbilical I²C master (`I2CN`)** | `Navigation_MCU/Navigation_MCU.ino` |
 | **Ground Station** | Raspberry Pi Pico 2 W | bidirectional LoRa (10 s + T-1 s TDMA), OLED, USB to visualizer | `Ground_Station/Ground_Station.ino` |
 | **UWB Anchor ×4** | Seeed XIAO RP2350 (Anchor PCB) | fixed ground ranging beacons | `Uwb_Anchor/Uwb_Anchor.ino` |
 | **Rampa PCB1** | Raspberry Pi Pico 2 | launch pad controller, umbilical I²C slave `0x2B`, dual-stage igniters | `Rampa_MCU/Rampa_MCU.ino` |
@@ -111,7 +112,7 @@ Pin numbers are raw `GPnn` GPIO numbers (`Master_MCU/Master_MCU.ino`).
 | GP5 | UART1 RX | Navigation MCU TX (`D6`), 921600 baud | `PIN_NAV_RX` |
 | GP6 | digital out | PCA9685 `/OE` (`R25` 10 kΩ PU; LOW = outputs on) + diode `D6` → `PRST` | `PIN_PCA_OE` |
 | GP7 | digital out | RESET to Navigation MCU via diode `D7` → `NRST` | `PIN_RST_NAV` |
-| GP8 | I2C0 SDA | PCA9685 (`0x40`) + **`I2C1`/`I2C2` uSup (Rampa umbilical `0x2B`)**, `R21` 10 kΩ | `PIN_I2C_SDA` |
+| GP8 | I2C0 SDA | **PCA9685 (`0x40`) ONLY** (`R21` 10 kΩ; do NOT plug umbilical into `I2C1`/`I2C2`) | `PIN_I2C_SDA` |
 | GP9 | I2C0 SCL | same bus, `R22` 10 kΩ | `PIN_I2C_SCL` |
 | GP10 | digital in, PU | Breakwire (`TRH1`/`TRH2`, `R26` 10 kΩ) — launch detect | `PIN_BREAKWIRE` |
 | GP11 | — | free | — |
@@ -165,8 +166,9 @@ Default channel map (editable via `srv.ch_*` parameters in flash):
 |---|---|---|---|
 | D0–D2 | analog in | Pyro continuity ch 1–3 (`PYRO1..3` via 20k/10k 3:1 dividers `R13/14`, `R16/17`, `R19/20`) | `PIN_CONT_1..3` |
 | D3 | digital out | **Pyro 1 — landing motor igniter** (`Q1` AO3400A, `R12` 10k PD) | `PIN_PYRO_1` |
-| D4–D5 | I2C | `I2CN` uSup (`NSDA`/`NSCL`), unused | — |
-| D6–D7 | UART0 TX/RX | Master MCU (`GP5`/`GP4`), 921600 baud | `PIN_MASTER_TX/RX` |
+| D4 | **I2C1 SDA (100 kHz)** | **`I2CN` uSup (`NSDA`) — DEDICATED Rampa umbilical (`0x2B`), detached Hi-Z at T-100 ms** | `PIN_UMB_SDA` |
+| D5 | **I2C1 SCL (100 kHz)** | **`I2CN` uSup (`NSCL`) — DEDICATED Rampa umbilical (`0x2B`), detached Hi-Z at T-100 ms** | `PIN_UMB_SCL` |
+| D6–D7 | UART0 TX/RX | Master MCU (`GP5`/`GP4`), 921600 baud (also bridges `RAMPA_CMD`/`RAMPA_STATUS`) | `PIN_MASTER_TX/RX` |
 | D8 | digital out | **Pyro 2 — backup igniter** (`Q2` AO3400A, `R15` 10k PD) | `PIN_PYRO_2` |
 | D9 | digital out | **Pyro 3 — landing-leg release** (`Q3` AO3400A, `R18` 10k PD) | `PIN_PYRO_3` |
 | onboard | PIO | XIAO WS2812 (`PIN_NEOPIXEL = 22`, power `NEOPIXEL_POWER = 23`) | `ARIADNA_RGB_PIN` |
@@ -276,12 +278,16 @@ Identical hardware for all 4 ground anchors (`Uwb_Anchor/Uwb_Anchor.ino`, `ANCHO
 
 ### Rocket ↔ Rampa Umbilical (Magnetic Pogo, 3 wires ONLY)
 
-| Ariadna V2 Master (`I2C1` or `I2C2` uSup) | Magnetic Pogo | Rampa PCB1 (`J3`) | Note |
+Connect the magnetic pogo harness to **Navigation MCU `I2CN` uSup** (NOT Master `I2C1`/`I2C2`!) so the umbilical is **100% electrically isolated from the PCA9685 servo bus**.
+
+| Ariadna V2 Navigation (`I2CN` uSup) | Magnetic Pogo | Rampa PCB1 (`J3`) | Note |
 |---|---|---|---|
 | Pin 1 (`GND`) | Pin 1 (`GND`, longest / first-mate-last-break) | Pin 1 (`GND`) | Common ground |
 | Pin 2 (`3V3`) | **NOT CONNECTED** | Pin 2 (`UMB_5V`) | Never short Ariadna `3V3` to Rampa `5V`! |
-| Pin 3 (`SDA` / GP8) | Pin 2 (`SDA`) | Pin 4 (`J3.4` → `R21` 1k → GP0) | Hardware `I2C0 SDA` |
-| Pin 4 (`SCL` / GP9) | Pin 3 (`SCL`) | Pin 3 (`J3.3` → `R22` 100R → GP1) | Hardware `I2C0 SCL` |
+| Pin 3 (`NSDA` / `D4` = GP6) | Pin 2 (`SDA`) | Pin 4 (`J3.4` → `R21` 1k → GP0) | Dedicated `Wire1 SDA` (100 kHz) |
+| Pin 4 (`NSCL` / `D5` = GP7) | Pin 3 (`SCL`) | Pin 3 (`J3.3` → `R22` 100R → GP1) | Dedicated `Wire1 SCL` (100 kHz) |
+
+> **Pull-up note:** `NSDA`/`NSCL` have no external pull-up resistors on Ariadna V2. Firmware enables RP2350 internal pull-ups (~50 kΩ) and runs `Wire1` at **100 kHz** (works on short pogo cables). For umbilical cables longer than ~15 cm, add two **4.7 kΩ pull-ups to `3V3`** (`I2CN` pin 2) on the rocket-side pogo adapter.
 
 ---
 
@@ -293,16 +299,16 @@ Defined in [`common/ariadna_link.h`](common/ariadna_link.h) and [`common/ariadna
    - Position MCU parses NMEA UTC time (`$GNRMC`/`$GNGGA`) and sends `ARIADNA_PKT_GPS_TIME` (1 Hz) to Master MCU; PC sends `UTC:<ms>` every 5 s to Ground Station.
    - Master MCU broadcasts a 28-byte `ariadna_lora_sync_t` beacon (1 Hz on ground, 2 Hz during countdown, plus immediate ACK after every RX window) carrying the exact `next_rx_in_ms` from TX start, `t_launch_rem_ms`, and Rampa status/faults.
    - Ground Station anchors its RX-window clock to `gs_rx_ms + next_rx_in_ms - sync_airtime_ms` (**±2 ms lock**, working even indoors without GPS!), with PC UTC 10 s boundary fallback if downlink fades.
-   - Master MCU polls Rampa over I²C at 20 Hz, locking Rampa's firing clock to **< 1 ms**.
+   - Master MCU bridges 20 Hz Rampa polls over 921600-baud UART1 to Navigation MCU (`I2CN` / `Wire1` @ 100 kHz), locking Rampa's firing clock to **< 1 ms**.
 2. **Periodic 10 s RX Windows + Mandatory T-1 s Final Abort Window:**
    - Every **10 s** (on UTC 10 s boundaries when GPS UTC is valid), Master MCU pauses downlink TX (70 ms guard band) and switches SX1278 to RX for **300 ms**.
    - Ground Station transmits 20-byte `ariadna_lora_uplink_t` (29 ms airtime) at `+55 ms` into the window (and a redundant 2nd copy at `+165 ms` for `ABORT` / `COUNTDOWN`).
    - Supported uplink commands: `PING`, `LAUNCH_SOON` (PREP), `COUNTDOWN <sec>`, `ABORT`, `REBOOT` (**strictly blocked in flight!**), `PADREF`, `DISARM` — all protected by CRC-16 + per-command safety tokens.
    - During an active countdown, Rocket **always** opens a mandatory 300 ms **final abort window centered at T-1.000 s** (`T-1150 ms .. T-850 ms`), regardless of the 10 s grid.
-3. **Safe Hot-Disconnect before Liftoff (`T - 100 ms`):**
-   - At `T - 100 ms`, Master sends `RAMPA_CMD_COMMIT` and reads back `RAMPA_STATE_COMMITTED`.
-   - Rampa immediately calls `Wire.end()` and floats `GP0`/`GP1` (`INPUT` Hi-Z); Master stops addressing `0x2B` (keeping `I2C0` alive for PCA9685 with 3 ms timeout + 9-clock bus recovery).
-   - At `T - 0`, Rampa re-verifies key + abort button + VBAT and fires the igniter; magnetic pogo detaches cleanly without glitching either MCU.
+3. **Safe Dual-End Hot-Disconnect before Liftoff (`T - 100 ms`):**
+   - At `T - 100 ms`, Master sends `RAMPA_CMD_COMMIT` via Navigation MCU (`I2CN`) and receives `RAMPA_STATE_COMMITTED` (~4 ms round-trip).
+   - **Both sides immediately detach hardware I²C:** Rampa calls `Wire.end()` + floats `GP0`/`GP1` (`INPUT` Hi-Z), and Navigation MCU calls `Wire1.end()` + floats `D4`/`D5` (`INPUT` Hi-Z). Master's `I2C0` (`PCA9685` servos) is completely isolated and never touched.
+   - At `T - 0`, Rampa re-verifies key + abort button + VBAT and fires the igniter; magnetic pogo detaches cleanly without any possibility of disturbing servos or sensors.
 
 ---
 

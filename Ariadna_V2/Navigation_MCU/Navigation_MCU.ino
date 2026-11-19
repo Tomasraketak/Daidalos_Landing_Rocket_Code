@@ -61,6 +61,7 @@
 #include "ariadna_params.h"
 #include "ariadna_seq.h"
 #include "actcon_pyro.h"
+#include "ariadna_rampa_link.h"
 // Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
 // library's include path only when it sees a real #include of it.
 // ARDUINO is undefined in the host `make syntax` build, which has no
@@ -71,6 +72,7 @@
 #include "ariadna_rgb.h"
 
 #include <Arduino.h>
+#include <Wire.h>
 #include "hardware/watchdog.h"
 #include <string.h>
 #include <math.h>
@@ -85,6 +87,12 @@ static const uint8_t PIN_PYRO_3  = D9;   // leg release (burn wire)
 static const uint8_t PIN_CONT_1  = D0;   // A0, continuity sense, channel 1
 static const uint8_t PIN_CONT_2  = D1;   // A1
 static const uint8_t PIN_CONT_3  = D2;   // A2
+
+// Dedicated Rampa umbilical I2C port (I2CN uSup: D4=GP6 SDA, D5=GP7 SCL -> Wire1).
+// Completely isolated from Master MCU's PCA9685 servo bus (I2C0) so pogo
+// hot-separation can never disturb servos. Detached (Wire1.end + Hi-Z) at T-100 ms.
+static const uint8_t PIN_UMB_SDA = D4;
+static const uint8_t PIN_UMB_SCL = D5;
 
 // D6/D7. If this port stays silent on the bench, change this one line to
 // Serial2 before touching anything else.
@@ -125,6 +133,8 @@ static const float BODY_SERVO1_AXIS[3] = { 1.0f, 0.0f, 0.0f };
     } while (0)
 
 static void handle_command(const ariadna_cmd_t *c);
+static void umb_i2c_detach(void);
+static void umb_handle_rampa_cmd(const ariadna_rampa_cmd_t *c);
 
 // =====================================================================
 //  2. STATE
@@ -345,6 +355,7 @@ static void link_poll(void)
             s_master       = m;
             s_master_us    = micros();
             s_have_master  = true;
+            if (!on_ground()) umb_i2c_detach();
             break;
         }
         case ARIADNA_PKT_CMD: {
@@ -355,6 +366,11 @@ static void link_poll(void)
         case ARIADNA_PKT_PARAM: {
             ariadna_param_pkt_t p;
             if (ariadna_unpack(pl, len, &p, sizeof(p))) param_receive(&p);
+            break;
+        }
+        case ARIADNA_PKT_RAMPA_CMD: {
+            ariadna_rampa_cmd_t rc;
+            if (ariadna_unpack(pl, len, &rc, sizeof(rc))) umb_handle_rampa_cmd(&rc);
             break;
         }
         case ACTCON_PKT_PYRO_CMD: {
@@ -377,6 +393,75 @@ static ariadna_uart_tx_t s_tx;
 static void link_send(uint8_t type, const void *payload, uint8_t len)
 {
     ariadna_uart_tx_send(&s_tx, MASTER_PORT, type, payload, len);
+}
+
+// =====================================================================
+//  5b. RAMPA UMBILICAL I2C BRIDGE (DEDICATED I2CN / Wire1, D4/D5)
+//
+//  Completely isolated from Master MCU's PCA9685 servo bus (I2C0).
+//  Only active on the ground; at T-100 ms (RAMPA_CMD_COMMIT) or liftoff,
+//  Wire1.end() is called and D4/D5 are floated Hi-Z before pogo separation.
+// =====================================================================
+static bool s_umb_attached = false;
+
+static void umb_i2c_attach(void)
+{
+    if (s_umb_attached) return;
+    // NSDA/NSCL have no external pull-ups on Ariadna V2: enable internal
+    // RP2350 pull-ups and clock at 100 kHz for clean edges over pogo + R21.
+    pinMode(PIN_UMB_SDA, INPUT_PULLUP);
+    pinMode(PIN_UMB_SCL, INPUT_PULLUP);
+    Wire1.setSDA(PIN_UMB_SDA);
+    Wire1.setSCL(PIN_UMB_SCL);
+    Wire1.begin();
+    Wire1.setClock(ARIADNA_RAMPA_I2C_HZ);
+    Wire1.setTimeout(5);
+    s_umb_attached = true;
+}
+
+static void umb_i2c_detach(void)
+{
+    if (!s_umb_attached) return;
+    Wire1.end();
+    pinMode(PIN_UMB_SDA, INPUT);
+    pinMode(PIN_UMB_SCL, INPUT);
+    s_umb_attached = false;
+}
+
+static void umb_handle_rampa_cmd(const ariadna_rampa_cmd_t *c)
+{
+    // Never touch the umbilical I2C bus in flight.
+    if (!on_ground()) {
+        umb_i2c_detach();
+        return;
+    }
+
+    umb_i2c_attach();
+
+    Wire1.beginTransmission((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
+    Wire1.write((const uint8_t *)c, sizeof(*c));
+    const uint8_t wr_rc = Wire1.endTransmission(true);
+
+    if (wr_rc == 0) {
+        uint8_t buf[ARIADNA_RAMPA_STAT_SIZE];
+        const int got = Wire1.requestFrom((int)ARIADNA_RAMPA_I2C_ADDR, (int)sizeof(buf));
+        size_t n = 0;
+        while (Wire1.available()) {
+            const int ch = Wire1.read();
+            if (n < sizeof(buf)) buf[n++] = (uint8_t)ch;
+        }
+        ariadna_rampa_status_t st;
+        if (got == (int)sizeof(buf) && n == sizeof(buf) &&
+            ariadna_rampa_status_decode(buf, n, &st) == ARIADNA_RAMPA_OK) {
+            link_send(ARIADNA_PKT_RAMPA_STATUS, &st, (uint8_t)sizeof(st));
+        }
+    }
+
+    // At T-100 ms COMMIT, both ends immediately detach I2C before ignition
+    // and magnetic pogo separation.
+    if (c->cmd == RAMPA_CMD_COMMIT) {
+        umb_i2c_detach();
+    }
 }
 
 // =====================================================================

@@ -12,9 +12,10 @@
 //  ARCHITECTURE & SAFETY
 //  ---------------------------------------------------------------------
 //  * Umbilical link (J3 -> GP0/GP1 = hardware I2C0 Slave @ 0x2B):
-//      Rocket (Master MCU) is I2C Master, Rampa is I2C Slave.
-//      Completely separate hardware I2C block from Rampa's internal
-//      sensors (Wire1 / I2C1 on GP6/GP7).
+//      Rocket Navigation MCU (I2CN uSup D4/D5, Wire1 @ 100 kHz) is I2C
+//      Master, Rampa is I2C Slave (Master MCU bridges commands over UART1).
+//      Completely isolated from Master MCU's PCA9685 servo bus (I2C0) AND
+//      from Rampa's internal sensors (Wire1 / I2C1 on GP6/GP7).
 //  * LoRa radio (M1 Ra-02, power-gated by U12 TPS22918 via TCA9534 P4):
 //      Kept hardware-powered OFF (LORA_EN = LOW) whenever the umbilical
 //      is active, preventing RF collision with the Rocket's LoRa radio.

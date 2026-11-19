@@ -1250,6 +1250,8 @@ static void poll_position(void)
  * than being stashed for the end of the tick. That removes up to a full
  * 5 ms tick from the command path for the cost of nothing.
  */
+static void rampa_on_status(const ariadna_rampa_status_t &st, uint32_t now_ms);
+
 static void poll_navigation(void)
 {
     while (NAV_PORT.available()) {
@@ -1271,6 +1273,10 @@ static void poll_navigation(void)
                 s_have_nav_status = true;
                 s_nav_status_ms   = millis();
             }
+        } else if (type == ARIADNA_PKT_RAMPA_STATUS) {
+            ariadna_rampa_status_t rst;
+            if (ariadna_rampa_status_decode(pl, len, &rst) == ARIADNA_RAMPA_OK)
+                rampa_on_status(rst, millis());
         } else if (type == ACTCON_PKT_PYRO_REPORT) {
             if (ariadna_unpack(pl, len, &s_pyro_rep, sizeof(s_pyro_rep)))
                 s_pyro_rep_ms = millis();
@@ -3188,10 +3194,12 @@ static uint32_t s_rampa_last_ok_ms = 0;
 static uint32_t s_rampa_detach_ms  = 0;
 static uint8_t  s_rampa_seq        = 0;
 
-static bool     s_launch_soon      = false;
-static bool     s_cd_active        = false;
-static bool     s_cd_committed     = false;
-static uint32_t s_cd_t0_ms         = 0;
+static bool     s_launch_soon       = false;
+static bool     s_cd_active         = false;
+static bool     s_cd_commit_sent    = false;
+static uint32_t s_cd_commit_sent_ms = 0;
+static bool     s_cd_committed      = false;
+static uint32_t s_cd_t0_ms          = 0;
 static uint8_t  s_cd_pyro_ch       = 1;
 static uint8_t  s_ul_last_seq      = 0;
 static uint8_t  s_ul_last_rc       = ARIADNA_ULRC_NONE;
@@ -3269,31 +3277,11 @@ static bool sync_acquire(LoRaSyncSnap *sn)
     return s_sync_seq == a;
 }
 
-/** 9-clock I2C bus clear in case pogo hot-separation glitches SDA/SCL. */
-static void i2c0_recover_if_stuck(void)
+/** Send one Rocket -> Rampa command to Navigation MCU (which owns I2CN / Wire1).
+ *  Master MCU's I2C0 (GP8/GP9) stays 100% dedicated to PCA9685 servos. */
+static void rampa_send_cmd(uint8_t cmd_id, int32_t t_rem_ms, uint32_t now_ms)
 {
-    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
-    if (digitalRead(PIN_I2C_SDA) == LOW) {
-        Wire.end();
-        pinMode(PIN_I2C_SCL, OUTPUT);
-        for (uint8_t i = 0; i < 9; i++) {
-            digitalWrite(PIN_I2C_SCL, LOW);
-            delayMicroseconds(5);
-            digitalWrite(PIN_I2C_SCL, HIGH);
-            delayMicroseconds(5);
-        }
-        Wire.setSDA(PIN_I2C_SDA);
-        Wire.setSCL(PIN_I2C_SCL);
-        Wire.begin();
-        Wire.setClock(400000);
-        Wire.setTimeout(3);
-    }
-}
-
-/** One Rocket -> Rampa command write + status read over I2C0 (0x2B). */
-static bool rampa_exchange(uint8_t cmd_id, int32_t t_rem_ms, uint32_t now_ms)
-{
-    if (s_rampa_detached) return false;
+    if (s_rampa_detached) return;
 
     ariadna_rampa_cmd_t c;
     memset(&c, 0, sizeof(c));
@@ -3305,41 +3293,52 @@ static bool rampa_exchange(uint8_t cmd_id, int32_t t_rem_ms, uint32_t now_ms)
     c.pyro_ch      = s_cd_pyro_ch;
     ariadna_rampa_cmd_seal(&c);
 
-    Wire.beginTransmission((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
-    Wire.write((const uint8_t *)&c, sizeof(c));
-    if (Wire.endTransmission(true) != 0) {
-        return false;
-    }
-
-    uint8_t buf[ARIADNA_RAMPA_STAT_SIZE];
-    const int got = Wire.requestFrom((int)ARIADNA_RAMPA_I2C_ADDR, (int)sizeof(buf));
-    size_t n = 0;
-    while (Wire.available()) {
-        const int ch = Wire.read();
-        if (n < sizeof(buf)) buf[n++] = (uint8_t)ch;
-    }
-    ariadna_rampa_status_t st;
-    if (got != (int)sizeof(buf) || n != sizeof(buf) ||
-        ariadna_rampa_status_decode(buf, n, &st) != ARIADNA_RAMPA_OK) {
-        return false;
-    }
-
-    s_rampa_stat       = st;
-    s_rampa_connected  = true;
-    s_rampa_last_ok_ms = now_ms ? now_ms : 1u;
-    return true;
+    send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_RAMPA_CMD, &c, (uint8_t)sizeof(c));
 }
 
 static void launch_abort_now(uint32_t now_ms, const char *reason)
 {
-    s_cd_active    = false;
-    s_cd_committed = false;
-    s_launch_soon  = false;
+    s_cd_active      = false;
+    s_cd_commit_sent = false;
+    s_cd_committed   = false;
+    s_launch_soon    = false;
     if (!s_rampa_detached && s_rampa_connected) {
-        (void)rampa_exchange(RAMPA_CMD_ABORT, -1, now_ms);
+        rampa_send_cmd(RAMPA_CMD_ABORT, -1, now_ms);
     }
     MASTER_PRINT("# LAUNCH ABORT (%s)\n", reason);
     s_ul_ack_req = s_ul_ack_req + 1u;
+}
+
+/** Handle a verified Rampa status frame forwarded from Navigation MCU over UART1. */
+static void rampa_on_status(const ariadna_rampa_status_t &st, uint32_t now_ms)
+{
+    s_rampa_stat       = st;
+    s_rampa_connected  = true;
+    s_rampa_last_ok_ms = now_ms ? now_ms : 1u;
+
+    if (s_cd_active && !s_cd_committed) {
+        if (s_cd_commit_sent) {
+            if (st.state == RAMPA_STATE_COMMITTED) {
+                s_cd_committed    = true;
+                s_rampa_detached  = true;
+                s_rampa_connected = false;
+                s_rampa_detach_ms = now_ms;
+                MASTER_PRINT("# RAMPA COMMITTED (T-%ld ms), Nav I2CN umbilical detached\n",
+                             (long)st.t_rem_ms);
+            } else {
+                launch_abort_now(now_ms, "Rampa COMMIT refused");
+            }
+            return;
+        }
+        const uint8_t cont_bit = (uint8_t)(ARIADNA_RMP_CONT1 << (s_cd_pyro_ch - 1u));
+        if (st.state == RAMPA_STATE_ABORT ||
+            st.state == RAMPA_STATE_FAULT ||
+            st.fault_mask != 0u ||
+            !(st.flags & ARIADNA_RMP_KEY_ARMED) ||
+            !(st.flags & cont_bit)) {
+            launch_abort_now(now_ms, "Rampa interlock/abort");
+        }
+    }
 }
 
 /** Process one verified LoRa uplink command handed off from Core 1. */
@@ -3388,7 +3387,7 @@ static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
             s_launch_soon    = true;
             s_rampa_detached = false;
             broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
-            if (!s_rampa_detached) (void)rampa_exchange(RAMPA_CMD_PREPARE, -1, now);
+            rampa_send_cmd(RAMPA_CMD_PREPARE, -1, now);
             s_ul_last_rc = ARIADNA_ULRC_OK;
         }
         break;
@@ -3416,12 +3415,13 @@ static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
             const uint32_t air_ms = ariadna_lora_airtime_us(sizeof(ariadna_lora_uplink_t)) / 1000u;
             const uint32_t elapsed = (uint32_t)(now - rx_ms) + air_ms;
             const uint32_t rem = (u.arg_ms > elapsed) ? (u.arg_ms - elapsed) : 0u;
-            s_cd_pyro_ch   = ch;
-            s_cd_t0_ms     = now + rem;
-            s_cd_active    = true;
-            s_cd_committed = false;
-            s_launch_soon  = true;
-            (void)rampa_exchange(RAMPA_CMD_COUNTDOWN, (int32_t)rem, now);
+            s_cd_pyro_ch     = ch;
+            s_cd_t0_ms       = now + rem;
+            s_cd_active      = true;
+            s_cd_commit_sent = false;
+            s_cd_committed   = false;
+            s_launch_soon    = true;
+            rampa_send_cmd(RAMPA_CMD_COUNTDOWN, (int32_t)rem, now);
             MASTER_PRINT("# LORA COUNTDOWN T-%lu ms (ch %u)\n", (unsigned long)rem, (unsigned)ch);
             s_ul_last_rc = ARIADNA_ULRC_OK;
         }
@@ -3445,13 +3445,14 @@ static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
         if (in_flight) {
             s_ul_last_rc = ARIADNA_ULRC_REJECT_FLIGHT;
         } else {
-            s_cd_active    = false;
-            s_cd_committed = false;
-            s_launch_soon  = false;
+            s_cd_active      = false;
+            s_cd_commit_sent = false;
+            s_cd_committed   = false;
+            s_launch_soon    = false;
             s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_ABORT);
             broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
             if (!s_rampa_detached && s_rampa_connected)
-                (void)rampa_exchange(RAMPA_CMD_PING, -1, now);
+                rampa_send_cmd(RAMPA_CMD_PING, -1, now);
             s_ul_last_rc = ARIADNA_ULRC_OK;
         }
         break;
@@ -3462,10 +3463,11 @@ static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
         } else if (u.token != ARIADNA_UL_TOK_REBOOT) {
             s_ul_last_rc = ARIADNA_ULRC_REJECT_TOKEN;
         } else {
-            s_cd_active = false;
-            s_launch_soon = false;
+            s_cd_active      = false;
+            s_cd_commit_sent = false;
+            s_launch_soon    = false;
             if (!s_rampa_detached && s_rampa_connected)
-                (void)rampa_exchange(RAMPA_CMD_ABORT, -1, now);
+                rampa_send_cmd(RAMPA_CMD_ABORT, -1, now);
             broadcast_cmd(ARIADNA_CMD_REBOOT, u.target, 0);
             if (u.target == 0u) {
                 s_reboot_pending = true;
@@ -3482,8 +3484,9 @@ static void handle_lora_uplink(const ariadna_lora_uplink_t &u, uint32_t rx_ms)
     s_ul_ack_req = s_ul_ack_req + 1u;
 }
 
-/** Called at 200 Hz from Core 0 loop(). Handles uplink inbox, Rampa I2C @ 20 Hz,
- *  pre-liftoff commit/detach at T - 100 ms, and publishes sync snapshot to Core 1. */
+/** Called at 200 Hz from Core 0 loop(). Handles uplink inbox, Rampa UART->I2CN
+ *  polling @ 20 Hz, pre-liftoff commit/detach at T - 100 ms, and publishes
+ *  sync snapshot to Core 1. */
 static void rampa_and_uplink_service(void)
 {
     static uint32_t next_rampa_ms = 0;
@@ -3509,10 +3512,11 @@ static void rampa_and_uplink_service(void)
 
     // 3. Liftoff detected -> immediately freeze umbilical & clear countdown.
     if (in_flight) {
-        s_cd_active      = false;
-        s_cd_committed   = false;
-        s_launch_soon    = false;
-        s_rampa_detached = true;
+        s_cd_active       = false;
+        s_cd_commit_sent  = false;
+        s_cd_committed    = false;
+        s_launch_soon     = false;
+        s_rampa_detached  = true;
         s_rampa_connected = false;
         sync_publish(now);
         return;
@@ -3520,15 +3524,15 @@ static void rampa_and_uplink_service(void)
 
     // 4. If we detached for liftoff, check for no-liftoff timeout (T + 5 s).
     if (s_rampa_detached && s_cd_committed && (uint32_t)(now - s_rampa_detach_ms) > 5000u) {
-        s_cd_active    = false;
-        s_cd_committed = false;
-        s_launch_soon  = false;
+        s_cd_active      = false;
+        s_cd_commit_sent = false;
+        s_cd_committed   = false;
+        s_launch_soon    = false;
         s_rampa_detached = false;
-        i2c0_recover_if_stuck();
         MASTER_PRINT("# RAMPA: no liftoff within 5 s after commit -> re-enabled umbilical\n");
     }
 
-    // 5. Active countdown checks & T - 100 ms commit / hot-detach.
+    // 5. Active countdown checks & T - 100 ms commit / hot-detach via Navigation I2CN.
     int32_t t_rem_ms = -1;
     if (s_cd_active) {
         t_rem_ms = (int32_t)(s_cd_t0_ms - now);
@@ -3539,48 +3543,39 @@ static void rampa_and_uplink_service(void)
             } else if (!s_rampa_connected) {
                 launch_abort_now(now, "Rampa link lost");
                 t_rem_ms = -1;
-            } else if (t_rem_ms <= (int32_t)ARIADNA_UMB_DETACH_MS) {
-                // Final T - 100 ms handoff: send COMMIT and cleanly detach I2C
-                // before motor ignition so magnetic pogo rip-away cannot hang I2C0.
-                const int32_t send_rem = t_rem_ms > 10 ? t_rem_ms : 10;
-                if (rampa_exchange(RAMPA_CMD_COMMIT, send_rem, now) &&
-                    s_rampa_stat.state == RAMPA_STATE_COMMITTED) {
-                    s_cd_committed    = true;
-                    s_rampa_detached  = true;
-                    s_rampa_connected = false;
-                    s_rampa_detach_ms = now;
-                    MASTER_PRINT("# RAMPA COMMITTED (T-%ld ms), I2C umbilical detached\n",
-                                 (long)send_rem);
-                } else {
-                    launch_abort_now(now, "Rampa COMMIT refused");
+            } else if (s_cd_commit_sent) {
+                // Waiting for Navigation MCU to return RAMPA_STATE_COMMITTED (~4 ms).
+                if ((uint32_t)(now - s_cd_commit_sent_ms) > 25u) {
+                    launch_abort_now(now, "Rampa COMMIT timeout");
                     t_rem_ms = -1;
                 }
+            } else if (t_rem_ms <= (int32_t)ARIADNA_UMB_DETACH_MS) {
+                // Final T - 100 ms handoff: Navigation MCU writes COMMIT over
+                // dedicated I2CN (Wire1), reads back COMMITTED, and calls Wire1.end().
+                const int32_t send_rem = t_rem_ms > 10 ? t_rem_ms : 10;
+                s_cd_commit_sent    = true;
+                s_cd_commit_sent_ms = now;
+                rampa_send_cmd(RAMPA_CMD_COMMIT, send_rem, now);
             }
         }
     }
 
-    // 6. Periodic 20 Hz Rampa I2C exchange while connected & not detached.
-    if (!s_rampa_detached && !s_test && !s_hil && (int32_t)(now - next_rampa_ms) >= 0) {
+    // 6. Periodic 20 Hz Rampa poll forwarded to Navigation MCU (I2CN) while on pad.
+    if (!s_rampa_detached && !s_cd_commit_sent && !s_test && !s_hil &&
+        (int32_t)(now - next_rampa_ms) >= 0) {
         next_rampa_ms = now + 1000u / ARIADNA_RAMPA_POLL_HZ;
         const uint8_t cmd = s_cd_active   ? (uint8_t)RAMPA_CMD_COUNTDOWN
                           : s_launch_soon ? (uint8_t)RAMPA_CMD_PREPARE
                                           : (uint8_t)RAMPA_CMD_PING;
-        if (rampa_exchange(cmd, t_rem_ms, now)) {
-            if (s_cd_active && !s_cd_committed) {
-                const uint8_t cont_bit = (uint8_t)(ARIADNA_RMP_CONT1 << (s_cd_pyro_ch - 1u));
-                if (s_rampa_stat.state == RAMPA_STATE_ABORT ||
-                    s_rampa_stat.state == RAMPA_STATE_FAULT ||
-                    s_rampa_stat.fault_mask != 0u ||
-                    !(s_rampa_stat.flags & ARIADNA_RMP_KEY_ARMED) ||
-                    !(s_rampa_stat.flags & cont_bit)) {
-                    launch_abort_now(now, "Rampa interlock/abort");
-                }
-            }
-        } else if (s_rampa_connected && (uint32_t)(now - s_rampa_last_ok_ms) > ARIADNA_RAMPA_TIMEOUT_MS) {
-            s_rampa_connected = false;
-            if (s_cd_active && !s_cd_committed)
-                launch_abort_now(now, "Rampa I2C timeout");
-        }
+        rampa_send_cmd(cmd, t_rem_ms, now);
+    }
+
+    // 7. Supervise Rampa heartbeat timeout.
+    if (s_rampa_connected && !s_rampa_detached &&
+        (uint32_t)(now - s_rampa_last_ok_ms) > ARIADNA_RAMPA_TIMEOUT_MS) {
+        s_rampa_connected = false;
+        if (s_cd_active && !s_cd_committed)
+            launch_abort_now(now, "Rampa I2CN timeout");
     }
 
     sync_publish(now);
