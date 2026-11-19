@@ -769,23 +769,54 @@ python -m pip install pyserial PyQt6 PyQt6-WebEngine pyqtgraph haversine
 python Ground_Visualizer\ground_visualizer.py
 ```
 
-* **Orientace třikrát**: navball (jako v KSP — špička rakety), **3-D model rakety** v rámci
-  rampy (oranžová = přistávací motor/špička, zelené = křidélko 1, plamen s výchylkou trysky)
-  a **terč náklonu**.
-* Karty: výška, stav mise (česky), rychlosti, zrychlení, **fáze navedení**, tah, klapka,
-  **baterie**, proud, **náklon**, GPS, **další událost s odpočtem** („ZÁŽEH za 2,1 s“ /
-  „DOSEDNUTÍ za 1,3 s“), **čas letu**, **posun od rampy**, **T-0 odpočet startu**
-  (nastavíte sekundy a stisknete START T-0 — raketa čas startu nezná, ten zná operátor),
-  signál, kvalita spoje, **chyba** (česky), UWB.
-* Lišty: zdraví subsystémů, pyro (kontinuita/odpáleno), **události letu** (apogeum,
-  aerokryt, zážeh 1, tah, zážeh 2, nohy, lidar, dosed).
-* **Rozložení:** vlevo sloupec grafů (výška, zrychlení, svislá rychlost, TVC) přes celou
-  výšku okna, uprostřed karty v mřížce 4 × N s lištami a pod nimi orientace, mapa a TVC;
-  vpravo výškoměr. Záznam CSV (klávesa R).
-* **Grafy** mají popsané osy: vlevo jednotka, dole čas v sekundách před posledním paketem.
+* **Vzhled pro venek** (navrženo na Dell Vostro 7500: 15,6" FHD, matný panel ~300 nitů,
+  Windows 125 %): výchozí světlý kontrastní motiv **VENKU** (černý text na bílé — tmavé UI
+  na slunci splývá s odlesky), tlačítkem **☾ NOC / ☀ VENKU** vpravo nahoře se přepne na
+  tmavý motiv na soumrak; volba se pamatuje. Okno se otevře maximalizované.
+* **„Tmavý kokpit“**: zdravá hodnota = neutrální dlaždice se **zeleným pruhem** vlevo;
+  **varování = celá dlaždice žlutá**, **alarm = celá červená**. Křičí jen to, co je špatně.
+* **Nahoře vždy vidět** (na všech záložkách): **stav mise**, **hodiny** (T− odpočet ze
+  synchronizovaného odpočtu rakety ⚡ nebo z místního odpočtu, za letu T+ čas letu),
+  kvalita spoje LoRa (při výpadku „x s bez paketu“), upozornění SIMULACE / ZTRÁTA SIGNÁLU
+  a tlačítko **ABORT**. U záložek ZÁZNAM (klávesa R), **🔊 HLAS** (narátor) a přepínač motivu.
+* **Tři záložky** (F1 / F2 / F3; při vzletu se samo přepne na LET):
+  1. **LET** — velké dlaždice výška, svislá rychlost, další událost s odpočtem (do ZÁŽEHU /
+     do PŘISTÁNÍ), náklon, fáze navedení, vodorovná rychlost; lišta událostí letu;
+     **naklápěcí 3-D model rakety** (oranžová = přistávací motor/špička, zelené = křidélko 1,
+     plamen s výchylkou trysky); pod ním malým písmem **„poslední paket před x s · průměrně
+     každých y ms (z Hz) · doručeno %“** (žlutě > 1 s, červeně > 3 s); mapa, graf výšky a
+     výškoměr s čarou zážehu.
+  2. **START** — **kontrola před startem** (spoj, subsystémy, chyba, baterie, GPS, UWB,
+     pyro C1/C2, ARM/RBF, svislost, rampa) s pruhem **GO / GO s výhradou / NO-GO**;
+     **předstartovní procedura** (viz níže); RX okno, stav rampy, ACK a terč svislosti.
+  3. **DIAGNOSTIKA** — grafy zrychlení / svislé rychlosti / TVC, podrobné dlaždice, lišty
+     subsystémů a pyro, TVC s klapkou; připojení (port, PŘIPOJIT), ladicí příkazy PADREF a
+     RESTART, vlastní odpočet (libovolné sekundy, mimo proceduru) a stažení mapy.
+* **Předstartovní procedura — start za 30 s** (záložka START). Tlačítko **▶ ODESLAT: START
+  ZA 30 s** se odemkne, až jsou splněny všechny kroky:
+  1. spojení čerstvé (paket < 1 s, ≥ 90 % doručeno) — automaticky,
+  2. kontrola před startem bez NO-GO a raketa v IDLE/ARMED — automaticky,
+  3. **PŘÍPRAVA** odeslána (tlačítko ODESLAT u kroku) **a potvrzena raketou** (ACK OK),
+  4. rampa READY, klíč zapnut, kontinuita C1 — automaticky z LoRa sync,
+  5. záznam telemetrie běží (tlačítko ZAPNOUT u kroku),
+  6. až 8. ruční zaškrtnutí: prostor vyklizen · RBF vytažen a klíč rampy zapnut · souhlas
+     vedoucího startu.
+
+  Po stisku se otevře potvrzovací okno — **odeslat jde jen po napsání `START`**. Program pak
+  pošle `CMD:CD:30:1` a čeká na **potvrzení od rakety** v nejbližším RX okně (ACK v sync
+  paketu): „✔ POTVRZENO RAKETOU – odpočet běží“, nebo „✖ RAKETA ODMÍTLA: důvod“ (let,
+  stav, rampa, token), nebo po 25 s „⚠ nepotvrdila“. ABORT proceduru zruší; po vzletu se
+  zaškrtnutí vynulují.
+* **Narátor (🔊 HLAS, anglicky)**: odpočet „T minus ten · five · three · Start!“, „Countdown
+  confirmed / rejected“, „Liftoff“, události letu („Apogee. 161 meters“ — výška nad
+  rampou, „Cover released“, „Ignition“, „Thrust confirmed“, „Backup ignition“, „Landing legs
+  deployed“, „Lidar lock“, „Touchdown“), „Abort“, „Signal lost / regained“. Používá hlasy
+  Windows (Qt TextToSpeech, nic se neinstaluje); kvůli angličtině přidejte ve Windows
+  *Nastavení → Čas a jazyk → Řeč* anglický hlas — jinak mluví českým hlasem s přízvukem.
+  Zapnutí se pamatuje.
 * **Mapa** (fw 3.28): letecký snímek **ČÚZK ortofoto, 15 cm/px** (zoom 20; mimo ČR Google).
   Při startu se stáhne do `Dokumenty/Daidalos/map_cache/aerial` kolem rampy (~60 MB) a pak
-  funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAP ⭳ PAD** stáhne mapu
+  funguje bez internetu; s internetem se navíc dočítá živě. Tlačítko **MAPA ⭳** stáhne mapu
   kolem aktuální rampy znovu. **Rampa** se bere z rakety: GPS poloha minus posun od rampy
   (`px/py`), průměrovaná na zemi (IDLE/ARMED), a ukládá se do `Dokumenty/Daidalos/pad.json`
   — příště se mapa stáhne rovnou tam. V rohu mapy: souřadnice rampy (zdroj), rakety a

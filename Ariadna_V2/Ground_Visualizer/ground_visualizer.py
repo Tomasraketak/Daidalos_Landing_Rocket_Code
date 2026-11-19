@@ -324,8 +324,8 @@ LEAFLET_HTML = """
         var info = L.control({position: 'topright'});
         info.onAdd = function () {
             this._div = L.DomUtil.create('div');
-            this._div.style.cssText = 'background:rgba(0,0,0,0.65);color:#fff;font:12px Consolas,monospace;' +
-                                      'padding:6px 9px;border-radius:5px;line-height:1.45;';
+            this._div.style.cssText = 'background:rgba(0,0,0,0.78);color:#fff;font:bold 13px Consolas,monospace;' +
+                                      'padding:6px 9px;border-radius:6px;line-height:1.45;';
             return this._div;
         };
         info.addTo(map);
@@ -339,8 +339,8 @@ LEAFLET_HTML = """
         var padIcon = L.divIcon({ html: padSvg, className: 'custom-svg-icon',
                                   iconSize: [24,24], iconAnchor: [12,12] });
         var rocketIcon = L.divIcon({
-            html: '<div style="background-color:#ff0000;width:14px;height:14px;border-radius:50%;border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,0.8);"></div>',
-            className: 'custom-svg-icon', iconSize: [14,14], iconAnchor: [7,7] });
+            html: '<div style="background-color:#ff0000;width:18px;height:18px;border-radius:50%;border:3px solid white;box-shadow:0 0 5px rgba(0,0,0,0.9);"></div>',
+            className: 'custom-svg-icon', iconSize: [18,18], iconAnchor: [9,9] });
 
         var padLat = PAD_LAT_V, padLon = PAD_LON_V, minRadiusDeg = 0.0010;
         var lastRocketPos = [padLat, padLon], lastViewUpdate = 0;
@@ -350,7 +350,7 @@ LEAFLET_HTML = """
 
         var padMarker = L.marker([padLat, padLon], {icon: padIcon, zIndexOffset: 100}).addTo(map);
         var rocketMarker = L.marker([padLat, padLon], {icon: rocketIcon, zIndexOffset: 1000}).addTo(map);
-        var trajectory = L.polyline([], {color:'#ff8c00', weight:3, opacity:0.9,
+        var trajectory = L.polyline([], {color:'#ff8c00', weight:4, opacity:0.9,
                                          lineCap:'round', lineJoin:'round'}).addTo(map);
 
         function updateInfo() {
@@ -621,88 +621,317 @@ class SerialWorker(QtCore.QThread):
 
 
 # ==============================================================================
+#  Look: two themes
+# ==============================================================================
+# The station is used outdoors, on a laptop (Dell Vostro 7500: 15.6" FHD,
+# ~300 nit matte panel, Windows at 125 % = 1536 x 864 logical px). In
+# daylight a dark UI on a 300 nit panel drowns in reflections, so the default
+# theme ("Venku") is light and high-contrast: near-black text on white, no
+# pale-grey text anywhere, status shown by solid fills, not thin coloured
+# borders. "Dark cockpit": a healthy value is a neutral tile with a green
+# stripe; only a warning (solid amber) or an alarm (solid red) shouts.
+# "Noc" is the dark theme, for dusk and night.
+THEMES = {
+    "light": dict(
+        bg="#dfe4e9", panel="#ffffff", panel2="#eef1f4", border="#8995a1", dim="#6c7783",
+        text="#070b0f", muted="#2f3943", accent="#c2410c",
+        ok="#0d7a34", ok_text="#ffffff", warn="#f5ab00", warn_text="#000000",
+        bad="#c8102e", bad_text="#ffffff", info="#1356b5", info_text="#ffffff",
+        idle="#d2d8de", idle_text="#38424c",
+        plot_bg="#ffffff", plot_fg="#070b0f", grid=0.35,
+        s_alt="#c2410c", s_acc="#0d7a34", s_vz="#1356b5", s_tx="#d97706", s_ty="#1356b5"),
+    "dark": dict(
+        bg="#0a0e12", panel="#141a20", panel2="#1b232b", border="#3c4853", dim="#5c6b76",
+        text="#f2f5f7", muted="#b1bcc6", accent="#ff7a1a",
+        ok="#22c55e", ok_text="#03140a", warn="#fbbf24", warn_text="#000000",
+        bad="#ef4444", bad_text="#ffffff", info="#3b82f6", info_text="#ffffff",
+        idle="#25303a", idle_text="#9ba7b2",
+        plot_bg="#141a20", plot_fg="#e7ecef", grid=0.22,
+        s_alt="#ff7a1a", s_acc="#22c55e", s_vz="#38bdf8", s_tx="#fbbf24", s_ty="#38bdf8"),
+}
+THEME_LABEL = {"light": "VENKU", "dark": "NOC"}
+T = dict(THEMES["light"])
+T["key"] = "light"
+UI_FONT = "Segoe UI"
+MONO_FONT = "Consolas"
+
+
+def C(key: str, alpha: int | None = None) -> QtGui.QColor:
+    col = QtGui.QColor(T[key])
+    if alpha is not None:
+        col.setAlpha(alpha)
+    return col
+
+
+def ui_font(px: int, weight=QtGui.QFont.Weight.Bold, mono=False) -> QtGui.QFont:
+    f = QtGui.QFont(MONO_FONT if mono else UI_FONT)
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    return f
+
+
+def build_qss() -> str:
+    t = T
+    return f"""
+    QWidget {{ background:{t['bg']}; color:{t['text']}; font-family:"{UI_FONT}"; font-size:13px; }}
+    QMainWindow, QDialog, QMessageBox, QProgressDialog {{ background:{t['bg']}; }}
+    QStatusBar {{ background:{t['panel']}; color:{t['text']}; border-top:1px solid {t['border']};
+                  font-size:12px; font-weight:600; }}
+    QStatusBar QLabel {{ background:transparent; }}
+    QToolTip {{ background:{t['panel']}; color:{t['text']}; border:1px solid {t['border']};
+                font-size:13px; padding:4px; }}
+    QComboBox, QSpinBox {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']};
+                border-radius:6px; padding:2px 8px; min-height:28px; font-size:14px; font-weight:700; }}
+    QComboBox QAbstractItemView {{ background:{t['panel']}; color:{t['text']};
+                selection-background-color:{t['info']}; selection-color:{t['info_text']}; }}
+    QPushButton {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']};
+                border-radius:6px; padding:3px 12px; min-height:28px; font-size:13px; font-weight:800; }}
+    QPushButton:pressed {{ background:{t['idle']}; }}
+    QPushButton[kind="primary"] {{ background:{t['accent']}; border-color:{t['accent']}; color:#ffffff; }}
+    QPushButton[kind="info"] {{ background:{t['info']}; border-color:{t['info']}; color:{t['info_text']}; }}
+    QPushButton[kind="warn"] {{ background:{t['warn']}; border-color:{t['warn']}; color:{t['warn_text']}; }}
+    QPushButton[kind="danger"] {{ background:{t['bad']}; border-color:{t['bad']}; color:{t['bad_text']}; }}
+    QPushButton[kind="abort"] {{ background:{t['bad']}; border:3px solid {t['text']}; color:{t['bad_text']};
+                font-size:20px; font-weight:900; padding:2px 26px; min-height:36px; }}
+    QPushButton:hover {{ border-color:{t['text']}; }}
+    QPushButton:disabled {{ color:{t['dim']}; border-color:{t['idle']}; }}
+
+    QFrame#Panel {{ background:{t['panel']}; border:1px solid {t['border']}; border-radius:8px; }}
+    QFrame#Panel QLabel {{ background:transparent; }}
+    QLabel#Caption {{ color:{t['muted']}; font-size:11px; font-weight:800; background:transparent; }}
+    QLabel#Brand {{ color:{t['accent']}; font-size:20px; font-weight:900; }}
+    QLabel#BrandSub {{ color:{t['muted']}; font-size:11px; font-weight:700; }}
+    QLabel#Ack {{ color:{t['text']}; font-size:13px; font-weight:700; }}
+
+    QFrame#Tile {{ background:{t['panel']}; border:1px solid {t['border']};
+                border-left:8px solid {t['idle']}; border-radius:6px; }}
+    QFrame#Tile[level="ok"] {{ border-left-color:{t['ok']}; }}
+    QFrame#Tile[level="info"] {{ border-left-color:{t['info']}; }}
+    QFrame#Tile[level="accent"] {{ border-left-color:{t['accent']}; }}
+    QFrame#Tile[level="warn"] {{ background:{t['warn']}; border-color:{t['warn']}; }}
+    QFrame#Tile[level="bad"] {{ background:{t['bad']}; border-color:{t['bad']}; }}
+    QFrame#Tile QLabel {{ background:transparent; border:none; }}
+    QLabel#TileTitle {{ color:{t['muted']}; font-size:11px; font-weight:800; }}
+    QLabel#TileValue {{ color:{t['text']}; font-family:"{MONO_FONT}"; font-size:22px; font-weight:700; }}
+    QLabel#TileValue[hero="true"] {{ font-size:34px; }}
+    QLabel#TileSub {{ color:{t['muted']}; font-size:12px; font-weight:700; }}
+    QFrame#Tile[level="warn"] QLabel {{ color:{t['warn_text']}; }}
+    QFrame#Tile[level="bad"] QLabel {{ color:{t['bad_text']}; }}
+
+    QLabel#Badge {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']};
+                border-radius:6px; padding:2px 10px; min-height:26px; font-size:13px; font-weight:800; }}
+    QLabel#Badge[level="ok"] {{ background:{t['ok']}; border-color:{t['ok']}; color:{t['ok_text']}; }}
+    QLabel#Badge[level="info"] {{ border-color:{t['info']}; color:{t['info']}; }}
+    QLabel#Badge[level="warn"] {{ background:{t['warn']}; border-color:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#Badge[level="bad"] {{ background:{t['bad']}; border-color:{t['bad']}; color:{t['bad_text']}; }}
+    QLabel#Badge[level="okline"] {{ border-color:{t['ok']}; color:{t['ok']}; }}
+
+    QLabel#State {{ background:{t['idle']}; color:{t['idle_text']}; border-radius:8px;
+                padding:0px 22px; min-height:44px; font-size:26px; font-weight:900; }}
+    QLabel#State[level="ok"] {{ background:{t['ok']}; color:{t['ok_text']}; }}
+    QLabel#State[level="info"] {{ background:{t['info']}; color:{t['info_text']}; }}
+    QLabel#State[level="accent"] {{ background:{t['accent']}; color:#ffffff; }}
+    QLabel#State[level="warn"] {{ background:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#State[level="bad"] {{ background:{t['bad']}; color:{t['bad_text']}; }}
+    QLabel#State[level="plain"] {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']}; }}
+
+    QLabel#Clock {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']};
+                border-radius:8px; padding:0px 14px; min-height:44px;
+                font-family:"{MONO_FONT}"; font-size:28px; font-weight:700; }}
+    QLabel#Clock[level="warn"] {{ background:{t['warn']}; border-color:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#Clock[level="bad"] {{ background:{t['bad']}; border-color:{t['bad']}; color:{t['bad_text']}; }}
+    QLabel#Clock[level="ok"] {{ border-color:{t['ok']}; color:{t['ok']}; }}
+
+    QFrame#CheckRow {{ background:transparent; border:none; border-bottom:1px solid {t['panel2']}; }}
+    QLabel#CheckName {{ color:{t['text']}; font-size:15px; font-weight:800; background:transparent; }}
+    QLabel#CheckDetail {{ color:{t['text']}; font-family:"{MONO_FONT}"; font-size:15px; font-weight:600;
+                background:transparent; }}
+    QTabWidget::pane {{ border:none; border-top:3px solid {t['accent']}; }}
+    QTabBar::tab {{ background:{t['idle']}; color:{t['idle_text']}; font-size:15px; font-weight:900;
+                padding:7px 26px; margin-right:4px; border-top-left-radius:8px; border-top-right-radius:8px; }}
+    QTabBar::tab:selected {{ background:{t['accent']}; color:#ffffff; }}
+    QTabBar::tab:hover:!selected {{ color:{t['text']}; }}
+    QLabel#LinkInfo {{ color:{t['muted']}; font-size:12px; font-weight:700; padding:2px 6px;
+                border-radius:4px; background:transparent; }}
+    QLabel#LinkInfo[level="warn"] {{ background:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#LinkInfo[level="bad"] {{ background:{t['bad']}; color:{t['bad_text']}; }}
+    QLabel#ProcText, QCheckBox#ProcCheck {{ color:{t['text']}; font-size:14px; font-weight:700;
+                background:transparent; }}
+    QCheckBox#ProcCheck::indicator {{ width:22px; height:22px; }}
+    QLineEdit {{ background:{t['panel']}; color:{t['text']}; border:2px solid {t['border']}; border-radius:6px; }}
+    QLabel#Lamp {{ background:{t['idle']}; color:{t['idle_text']}; border:2px solid {t['idle']};
+                border-radius:4px; padding:1px 4px; font-size:12px; font-weight:800; }}
+    QLabel#Lamp[kind="ok"] {{ background:{t['ok']}; border-color:{t['ok']}; color:{t['ok_text']}; }}
+    QLabel#Lamp[kind="okline"] {{ background:{t['panel']}; border-color:{t['ok']}; color:{t['ok']}; }}
+    QLabel#Lamp[kind="info"] {{ background:{t['info']}; border-color:{t['info']}; color:{t['info_text']}; }}
+    QLabel#Lamp[kind="warn"] {{ background:{t['warn']}; border-color:{t['warn']}; color:{t['warn_text']}; }}
+    QLabel#Lamp[kind="bad"] {{ background:{t['bad']}; border-color:{t['bad']}; color:{t['bad_text']}; }}
+    """
+
+
+def apply_theme(key: str) -> None:
+    T.clear()
+    T.update(THEMES.get(key, THEMES["light"]))
+    T["key"] = key if key in THEMES else "light"
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.setStyleSheet(build_qss())
+
+
+def set_level(widget: QtWidgets.QWidget, level: str, prop: str = "level") -> None:
+    """Change a QSS state property and re-apply the style sheet to the widget
+    and its labels (Qt does not do that on its own)."""
+    if widget.property(prop) == level:
+        return
+    widget.setProperty(prop, level)
+    st = widget.style()
+    for w in [widget, *widget.findChildren(QtWidgets.QLabel)]:
+        st.unpolish(w)
+        st.polish(w)
+    widget.update()
+
+
+def kbutton(text: str, kind: str = "", tip: str = "") -> QtWidgets.QPushButton:
+    b = QtWidgets.QPushButton(text)
+    if kind:
+        b.setProperty("kind", kind)
+    if tip:
+        b.setToolTip(tip)
+    b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+    return b
+
+
+def badge(text: str, level: str = "") -> QtWidgets.QLabel:
+    lab = QtWidgets.QLabel(text)
+    lab.setObjectName("Badge")
+    lab.setProperty("level", level)
+    return lab
+
+
+# ==============================================================================
 #  Widgets
 # ==============================================================================
-class TelemetryCard(QtWidgets.QFrame):
-    def __init__(self, title, value="--"):
+class Tile(QtWidgets.QFrame):
+    """
+    One reading: a caption, a big number and a small second line.
+
+    level: "idle" (no data / not relevant), "ok" (green stripe), "info",
+    "accent", "warn" (solid amber), "bad" (solid red).
+    """
+
+    def __init__(self, title, value="--", hero=False):
         super().__init__()
-        self.setObjectName("TelemetryCard")
+        self.setObjectName("Tile")
+        self.setProperty("level", "idle")
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(6, 3, 6, 3)
-        lay.setSpacing(1)
-
-        self.title_label = QtWidgets.QLabel(title)
-        self.title_label.setObjectName("CardTitle")
+        lay.setContentsMargins(10, 4, 8, 5)
+        lay.setSpacing(0)
+        self.title_label = QtWidgets.QLabel(title.upper())
+        self.title_label.setObjectName("TileTitle")
         self.value_label = QtWidgets.QLabel(value)
-        self.value_label.setObjectName("CardValue")
-        lay.addWidget(self.title_label)
-        lay.addWidget(self.value_label)
-        self.set_status("#444444")
+        self.value_label.setObjectName("TileValue")
+        self.value_label.setProperty("hero", "true" if hero else "false")
+        self.sub_label = QtWidgets.QLabel(" ")
+        self.sub_label.setObjectName("TileSub")
+        for w in (self.title_label, self.value_label, self.sub_label):
+            w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                            QtWidgets.QSizePolicy.Policy.Preferred)
+            lay.addWidget(w)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Fixed)
 
-    def set_value(self, text):
+    def set_value(self, text, sub=None):
         self.value_label.setText(text)
+        if sub is not None:
+            self.sub_label.setText(sub or " ")
 
-    def set_status(self, color):
-        self.setStyleSheet(f"""
-        QFrame#TelemetryCard {{
-            background-color: #1e1e1e;
-            border: 2px solid {color};
-            border-radius: 6px;
-        }}
-        QLabel#CardTitle {{ color: #aaaaaa; font-size: 9px;  font-weight: bold; }}
-        QLabel#CardValue {{ color: white;   font-size: 15px; font-weight: bold; }}
-        """)
+    def set_level(self, level):
+        set_level(self, level)
 
 
 class IndicatorStrip(QtWidgets.QFrame):
     """
     A row of named lights.
 
-    Used for subsystem health and pyro continuity — the two things that are
-    binary, that matter before launch, and that a number cannot express.
+    Used for subsystem health, pyro continuity and the flight events — the
+    things that are binary and that a number cannot express. on_kind / off_kind
+    pick what "set" and "not set" look like (see the Lamp styles).
     """
 
-    def __init__(self, title, labels):
+    def __init__(self, title, labels, on_kind="ok", off_kind="idle", cols=0):
         super().__init__()
-        self.setObjectName("TelemetryCard")
-        self.setStyleSheet("""
-        QFrame#TelemetryCard { background-color: #1e1e1e; border: 2px solid #444;
-                               border-radius: 6px; }
-        """)
+        self.setObjectName("Panel")
+        self.on_kind, self.off_kind = on_kind, off_kind
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(6, 3, 6, 3)
-        outer.setSpacing(2)
+        outer.setContentsMargins(8, 3, 8, 6)
+        outer.setSpacing(3)
 
-        cap = QtWidgets.QLabel(title)
-        cap.setStyleSheet("color:#aaaaaa; font-size:9px; font-weight:bold;")
+        cap = QtWidgets.QLabel(title.upper())
+        cap.setObjectName("Caption")
         outer.addWidget(cap)
 
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(3)
+        row = QtWidgets.QGridLayout()
+        row.setHorizontalSpacing(4)
+        row.setVerticalSpacing(4)
         outer.addLayout(row)
+        cols = cols or len(labels)
 
         self.lamps = {}
-        for name in labels:
+        for idx, name in enumerate(labels):
             lamp = QtWidgets.QLabel(name)
+            lamp.setObjectName("Lamp")
             lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            lamp.setFixedHeight(18)
+            lamp.setFixedHeight(26)
+            lamp.setMinimumWidth(10)
+            lamp.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                               QtWidgets.QSizePolicy.Policy.Fixed)
+            lamp.setProperty("kind", off_kind)
             self.lamps[name] = lamp
-            row.addWidget(lamp)
-            self.set(name, False)
+            row.addWidget(lamp, idx // cols, idx % cols)
 
     def set(self, name, on, warn=False):
         lamp = self.lamps.get(name)
         if lamp is None:
             return
-        if warn:
-            bg, fg = "#ffaa00", "#000000"
-        elif on:
-            bg, fg = "#00ff88", "#000000"
-        else:
-            bg, fg = "#3a1010", "#886666"
-        lamp.setStyleSheet(
-            f"background-color:{bg}; color:{fg}; font-size:9px; font-weight:bold;"
-            f"border-radius:3px; padding:2px 4px;")
+        set_level(lamp, "warn" if warn else (self.on_kind if on else self.off_kind), "kind")
+
+
+class CheckRow(QtWidgets.QFrame):
+    """One line of the pre-launch check: a status lamp, what is checked and
+    the value it was judged on."""
+
+    WORDS = {"ok": "OK", "warn": "POZOR", "bad": "NO-GO", "idle": "—", "info": "INFO"}
+
+    def __init__(self, name, hint=""):
+        super().__init__()
+        self.setObjectName("CheckRow")
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(6, 3, 10, 3)
+        lay.setSpacing(12)
+        self.lamp = QtWidgets.QLabel("—")
+        self.lamp.setObjectName("Lamp")
+        self.lamp.setProperty("kind", "idle")
+        self.lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.lamp.setFixedSize(84, 30)
+        self.name = QtWidgets.QLabel(name)
+        self.name.setObjectName("CheckName")
+        self.name.setMinimumWidth(190)
+        if hint:
+            self.name.setToolTip(hint)
+        self.detail = QtWidgets.QLabel("bez dat")
+        self.detail.setObjectName("CheckDetail")
+        self.detail.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
+        lay.addWidget(self.lamp)
+        lay.addWidget(self.name)
+        lay.addWidget(self.detail, 1)
+        self.level = "idle"
+
+    def set(self, level, detail):
+        self.level = level
+        self.lamp.setText(self.WORDS.get(level, "—"))
+        set_level(self.lamp, level, "kind")
+        self.detail.setText(detail)
 
 
 class TVCWidget(QtWidgets.QWidget):
@@ -723,7 +952,7 @@ class TVCWidget(QtWidgets.QWidget):
         self.y = 0.0
         self.clamp = 0
         self.phase = 0
-        self.setMinimumHeight(150)
+        self.setMinimumSize(150, 150)
 
     def update_tvc(self, x, y, clamp, phase):
         self.x, self.y, self.clamp, self.phase = x, y, clamp, phase
@@ -733,240 +962,66 @@ class TVCWidget(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         rect = self.rect()
-        p.fillRect(rect, QtGui.QColor("#121212"))
+        p.setPen(QtGui.QPen(C("border"), 1))
+        p.setBrush(C("panel"))
+        p.drawRoundedRect(QtCore.QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
 
-        bar_w = 26
-        size = min(rect.width() - bar_w - 24, rect.height() - 26)
+        p.setPen(C("muted"))
+        p.setFont(ui_font(11, QtGui.QFont.Weight.ExtraBold))
+        p.drawText(QtCore.QRectF(10, 4, rect.width() - 20, 16),
+                   QtCore.Qt.AlignmentFlag.AlignLeft, "TVC · CLAMP")
+
+        bar_w = 22
+        top, bottom = 24, 24
+        size = min(rect.width() - bar_w - 34, rect.height() - top - bottom)
         r = max(20, size // 2)
         cx = 12 + r
-        cy = rect.height() // 2
+        cy = top + (rect.height() - top - bottom) // 2
 
         # travel limit and half-travel rings
-        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        p.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90), 2))
+        p.setBrush(C("panel2"))
+        p.setPen(QtGui.QPen(C("text"), 2))
         p.drawEllipse(QtCore.QPointF(cx, cy), float(r), float(r))
-        p.setPen(QtGui.QPen(QtGui.QColor(60, 60, 60), 1, QtCore.Qt.PenStyle.DashLine))
+        p.setPen(QtGui.QPen(C("dim"), 1, QtCore.Qt.PenStyle.DashLine))
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         p.drawEllipse(QtCore.QPointF(cx, cy), r / 2.0, r / 2.0)
         p.drawLine(cx - r, cy, cx + r, cy)
         p.drawLine(cx, cy - r, cx, cy + r)
 
         # the commanded deflection
         mag = math.hypot(self.x, self.y)
-        px = cx + (self.x / self.MAX_DEG) * r
-        py = cy - (self.y / self.MAX_DEG) * r
-        colour = QtGui.QColor("#ff2222") if mag > self.MAX_DEG * 0.9 else QtGui.QColor("#00ff88")
-        p.setPen(QtGui.QPen(colour, 2))
+        px = cx + (max(-1.0, min(1.0, self.x / self.MAX_DEG))) * r
+        py = cy - (max(-1.0, min(1.0, self.y / self.MAX_DEG))) * r
+        colour = C("bad") if mag > self.MAX_DEG * 0.9 else C("ok")
+        p.setPen(QtGui.QPen(colour, 3))
         p.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(px, py))
         p.setBrush(colour)
-        p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.drawEllipse(QtCore.QPointF(px, py), 5.0, 5.0)
+        p.setPen(QtGui.QPen(C("panel"), 2))
+        p.drawEllipse(QtCore.QPointF(px, py), 7.0, 7.0)
 
-        p.setPen(QtGui.QColor(150, 150, 150))
-        p.setFont(QtGui.QFont("Consolas", 8, QtGui.QFont.Weight.Bold))
-        p.drawText(QtCore.QRectF(0, rect.height() - 16, cx * 2, 14),
+        p.setPen(C("text"))
+        p.setFont(ui_font(13, QtGui.QFont.Weight.Bold, mono=True))
+        p.drawText(QtCore.QRectF(4, rect.height() - 22, cx * 2, 18),
                    QtCore.Qt.AlignmentFlag.AlignCenter,
-                   f"TVC {self.x:+.2f} / {self.y:+.2f}")
+                   f"{self.x:+.1f}° {self.y:+.1f}°")
 
         # thrust clamp
-        bx = cx + r + 18
-        by0, by1 = 16, rect.height() - 22
-        p.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90), 2))
-        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        bx = cx + r + 14
+        by0, by1 = top, rect.height() - bottom
+        p.setPen(QtGui.QPen(C("text"), 2))
+        p.setBrush(C("panel2"))
         p.drawRect(bx, by0, bar_w, by1 - by0)
 
         frac = max(0.0, min(1.0, self.clamp / 100.0))
         fh = int((by1 - by0) * frac)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor("#ff8c00") if self.phase == 4 else QtGui.QColor("#555555"))
-        p.drawRect(bx + 2, by1 - fh + 1, bar_w - 4, max(0, fh - 2))
+        p.setBrush(C("accent") if self.phase == PHASE_BURN else C("dim"))
+        p.drawRect(bx + 3, by1 - fh + 2, bar_w - 5, max(0, fh - 3))
 
-        p.setPen(QtGui.QColor(200, 200, 200))
-        p.drawText(QtCore.QRectF(bx - 8, rect.height() - 16, bar_w + 16, 14),
+        p.setPen(C("text"))
+        p.drawText(QtCore.QRectF(bx - 14, rect.height() - 22, bar_w + 28, 18),
                    QtCore.Qt.AlignmentFlag.AlignCenter, f"{self.clamp}%")
-
-
-class NavBallWidget(QtWidgets.QWidget):
-    """Native PyQt6 3D navball. Carried over from the V1 visualiser."""
-
-    def __init__(self):
-        super().__init__()
-        self.pitch = self.roll = self.yaw = 0.0
-        self.speed = 0.0
-        self.setMinimumSize(260, 280)
-
-        self.COLOR_SKY = QtGui.QColor(50, 130, 168)
-        self.COLOR_GROUND = QtGui.QColor(168, 92, 50)
-        self.COLOR_UI_BG = QtGui.QColor(30, 30, 30, 230)
-        self.COLOR_GREEN = QtGui.QColor(50, 255, 50)
-        self.COLOR_WHITE = QtGui.QColor(255, 255, 255)
-        self.COLOR_BLACK = QtGui.QColor(0, 0, 0)
-        self.COLOR_GREY = QtGui.QColor(150, 150, 150)
-        self.COLOR_ORANGE = QtGui.QColor(255, 140, 0)
-        self.COLOR_CHEVRON = QtGui.QColor(255, 180, 0)
-
-    def update_attitude(self, pitch, roll, yaw=0.0, speed=0.0):
-        self.pitch, self.roll = pitch, roll
-        self.yaw = yaw % 360
-        self.speed = speed
-        self.update()
-
-    def _project_3d(self, lat, lon):
-        lat_r, lon_r = math.radians(lat), math.radians(lon)
-        x = math.cos(lat_r) * math.sin(lon_r)
-        y = math.sin(lat_r)
-        z = math.cos(lat_r) * math.cos(lon_r)
-
-        yaw_r = math.radians(-self.yaw)
-        cy, sy = math.cos(yaw_r), math.sin(yaw_r)
-        x1, y1, z1 = x * cy + z * sy, y, -x * sy + z * cy
-
-        pitch_r = math.radians(90 - self.pitch)
-        cp, sp = math.cos(pitch_r), math.sin(pitch_r)
-        x2, y2, z2 = x1, y1 * cp - z1 * sp, y1 * sp + z1 * cp
-
-        roll_r = math.radians(-self.roll)
-        cr, sr = math.cos(roll_r), math.sin(roll_r)
-        return x2 * cr - y2 * sr, x2 * sr + y2 * cr, z2
-
-    def _draw_3d_line(self, painter, cx, cy, radius, pts, color, width=1):
-        painter.setPen(QtGui.QPen(color, width))
-        for i in range(len(pts) - 1):
-            p1, p2 = pts[i], pts[i + 1]
-            if p1[2] > 0 and p2[2] > 0:
-                painter.drawLine(
-                    QtCore.QPointF(float(cx + p1[0] * radius), float(cy - p1[1] * radius)),
-                    QtCore.QPointF(float(cx + p2[0] * radius), float(cy - p2[1] * radius)))
-
-    def _draw_oriented_text(self, painter, text, lat, lon, cx, cy, radius):
-        px, py, pz = self._project_3d(lat, lon)
-        if pz < 0.15:
-            return
-        pl = self._project_3d(lat, lon - 2)
-        pr = self._project_3d(lat, lon + 2)
-        angle = math.degrees(math.atan2((pr[1] - pl[1]) * -radius,
-                                        (pr[0] - pl[0]) * radius))
-
-        painter.save()
-        painter.translate(cx + px * radius, cy - py * radius)
-        painter.rotate(angle)
-        painter.setFont(QtGui.QFont("Consolas", 8, QtGui.QFont.Weight.Bold))
-        m = painter.fontMetrics()
-        tw, th = m.horizontalAdvance(text), m.height()
-        painter.setPen(self.COLOR_BLACK)
-        for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            painter.drawText(QtCore.QRectF(-tw / 2 + ox, -th / 2 + oy, tw, th),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, text)
-        painter.setPen(self.COLOR_WHITE)
-        painter.drawText(QtCore.QRectF(-tw / 2, -th / 2, tw, th),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, text)
-        painter.restore()
-
-    def paintEvent(self, _event):
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        cx, cy = rect.center().x(), rect.center().y()
-        radius = min(cx, cy) - 46
-
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(self.COLOR_SKY)
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-
-        path = QtGui.QPainterPath()
-        path.addEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-        painter.setClipPath(path)
-
-        painter.setBrush(self.COLOR_GROUND)
-        painter.setPen(QtGui.QPen(self.COLOR_GROUND, 1))
-        for lat in range(-90, 0, 5):
-            for lon in range(0, 360, 5):
-                q = [self._project_3d(lat, lon), self._project_3d(lat + 5, lon),
-                     self._project_3d(lat + 5, lon + 5), self._project_3d(lat, lon + 5)]
-                if sum(p[2] for p in q) > 0:
-                    painter.drawPolygon(QtGui.QPolygonF(
-                        [QtCore.QPointF(float(cx + p[0] * radius), float(cy - p[1] * radius))
-                         for p in q]))
-
-        painter.setClipping(False)
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90), 16))
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)),
-                            float(radius + 8), float(radius + 8))
-        painter.setPen(QtGui.QPen(QtGui.QColor(30, 30, 30), 4))
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), float(radius), float(radius))
-        painter.setClipPath(path)
-        painter.setClipping(True)
-
-        for lon in range(0, 360, 45):
-            self._draw_3d_line(painter, cx, cy, radius,
-                               [self._project_3d(lat, lon) for lat in range(-90, 91, 5)],
-                               self.COLOR_GREY, 1)
-        self._draw_3d_line(painter, cx, cy, radius,
-                           [self._project_3d(0, lon) for lon in range(0, 365, 5)],
-                           self.COLOR_ORANGE, 3)
-
-        for lon in range(0, 360, 10):
-            self._draw_3d_line(painter, cx, cy, radius,
-                               [self._project_3d(-2, lon), self._project_3d(2, lon)],
-                               self.COLOR_WHITE, 2)
-            if lon % 30 == 0:
-                txt = {0: "N", 90: "E", 180: "S", 270: "W"}.get(lon, f"{lon:03d}")
-                self._draw_oriented_text(painter, txt, -5, lon, cx, cy, radius)
-
-        for center_lon in (0, 90, 180, 270):
-            for lat in range(-80, 90, 10):
-                if lat == 0:
-                    continue
-                cos_lat = max(math.cos(math.radians(lat)), 0.05)
-                base = 12 if lat % 20 == 0 else 6
-                span = min(base / cos_lat, 40)
-                step = max(1, int(span / 5))
-                self._draw_3d_line(
-                    painter, cx, cy, radius,
-                    [self._project_3d(lat, lon)
-                     for lon in range(int(center_lon - span), int(center_lon + span) + 1, step)],
-                    self.COLOR_WHITE, 2)
-                off = 6.0 / cos_lat
-                self._draw_oriented_text(painter, str(abs(lat)), lat,
-                                         center_lon - span - off, cx, cy, radius)
-                self._draw_oriented_text(painter, str(abs(lat)), lat,
-                                         center_lon + span + off, cx, cy, radius)
-
-        painter.setClipping(False)
-
-        chevron = [QtCore.QPointF(float(cx - 32), float(cy)),
-                   QtCore.QPointF(float(cx - 11), float(cy)),
-                   QtCore.QPointF(float(cx), float(cy + 16)),
-                   QtCore.QPointF(float(cx + 11), float(cy)),
-                   QtCore.QPointF(float(cx + 32), float(cy))]
-        painter.setPen(QtGui.QPen(self.COLOR_CHEVRON, 4))
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.drawPolyline(QtGui.QPolygonF(chevron))
-        painter.setBrush(self.COLOR_CHEVRON)
-        painter.drawEllipse(QtCore.QPointF(float(cx), float(cy)), 4.0, 4.0)
-
-        f_small = QtGui.QFont("Consolas", 8, QtGui.QFont.Weight.Bold)
-        f_large = QtGui.QFont("Consolas", 13, QtGui.QFont.Weight.Bold)
-
-        sr = QtCore.QRectF(cx - 66, cy - radius - 42, 132, 38)
-        painter.setBrush(self.COLOR_UI_BG)
-        painter.setPen(QtGui.QPen(QtGui.QColor(120, 120, 120), 2))
-        painter.drawRoundedRect(sr, 5, 5)
-        painter.setPen(self.COLOR_GREEN)
-        painter.setFont(f_small)
-        painter.drawText(QtCore.QRectF(cx - 66, cy - radius - 39, 132, 14),
-                         QtCore.Qt.AlignmentFlag.AlignHCenter, "Surface")
-        painter.setFont(f_large)
-        painter.drawText(QtCore.QRectF(cx - 66, cy - radius - 26, 132, 20),
-                         QtCore.Qt.AlignmentFlag.AlignHCenter, f"{self.speed:.1f} m/s")
-
-        hr = QtCore.QRectF(cx - 48, cy + radius + 5, 96, 32)
-        painter.setBrush(self.COLOR_UI_BG)
-        painter.setPen(QtGui.QPen(QtGui.QColor(120, 120, 120), 2))
-        painter.drawRoundedRect(hr, 5, 5)
-        painter.setPen(self.COLOR_GREEN)
-        painter.setFont(f_large)
-        painter.drawText(hr, QtCore.Qt.AlignmentFlag.AlignCenter, f"AZI {int(self.yaw):03d}°")
+        p.end()
 
 
 class AltimeterWidget(QtWidgets.QWidget):
@@ -984,7 +1039,7 @@ class AltimeterWidget(QtWidgets.QWidget):
         super().__init__()
         self.altitude = 0.0
         self.max_alt = 500.0
-        self.setMinimumWidth(135)
+        self.setFixedWidth(118)
 
     def update_altitude(self, altitude):
         self.altitude = altitude
@@ -996,47 +1051,146 @@ class AltimeterWidget(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         rect = self.rect()
-        p.fillRect(rect, QtGui.QColor("#121212"))
+        p.setPen(QtGui.QPen(C("border"), 1))
+        p.setBrush(C("panel"))
+        p.drawRoundedRect(QtCore.QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
 
-        top, bottom = 20, 40
+        top, bottom = 34, 18
         height = rect.height() - top - bottom
-        x_axis = 42
+        x_axis = 44
 
-        p.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        p.setPen(C("muted"))
+        p.setFont(ui_font(11, QtGui.QFont.Weight.ExtraBold))
+        p.drawText(QtCore.QRectF(0, 6, rect.width(), 16),
+                   QtCore.Qt.AlignmentFlag.AlignCenter, "VÝŠKA [m]")
+
+        p.setPen(QtGui.QPen(C("text"), 2))
         p.drawLine(x_axis, top, x_axis, top + height)
 
-        p.setPen(QtGui.QColor(150, 150, 150))
-        p.setFont(QtGui.QFont("Consolas", 10, QtGui.QFont.Weight.Bold))
-        p.drawText(QtCore.QRectF(0, rect.height() - 25, rect.width(), 20),
-                   QtCore.Qt.AlignmentFlag.AlignCenter, "ALTITUDE")
-
-        p.setFont(QtGui.QFont("Consolas", 10, QtGui.QFont.Weight.Bold))
-        p.setPen(QtGui.QColor(255, 255, 255))
-        for alt in range(0, int(self.max_alt) + 1, 100):
+        p.setFont(ui_font(12, QtGui.QFont.Weight.Bold, mono=True))
+        step = 100 if self.max_alt <= 900 else 200
+        for alt in range(0, int(self.max_alt) + 1, step):
             y = top + height - int(alt / self.max_alt * height)
-            p.drawLine(x_axis - 5, y, x_axis + 5, y)
-            p.drawText(QtCore.QRectF(0, y - 10, x_axis - 8, 20),
+            p.drawLine(x_axis - 6, y, x_axis, y)
+            p.drawText(QtCore.QRectF(0, y - 10, x_axis - 9, 20),
                        QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
                        f"{alt}")
 
         # guidance handover line
         gy = top + height - int(self.GUIDANCE_ENTRY / self.max_alt * height)
-        p.setPen(QtGui.QPen(QtGui.QColor("#00ff88"), 1, QtCore.Qt.PenStyle.DashLine))
-        p.drawLine(x_axis, gy, rect.width(), gy)
-        p.setPen(QtGui.QColor("#00ff88"))
-        p.setFont(QtGui.QFont("Consolas", 7, QtGui.QFont.Weight.Bold))
-        p.drawText(x_axis + 6, gy - 3, "IGNITION ~56")
+        p.setPen(QtGui.QPen(C("ok"), 2, QtCore.Qt.PenStyle.DashLine))
+        p.drawLine(x_axis, gy, rect.width() - 6, gy)
+        p.setPen(C("ok"))
+        p.setFont(ui_font(11, QtGui.QFont.Weight.ExtraBold))
+        p.drawText(x_axis + 4, gy - 4, "ZÁŽEH ~56")
 
-        y = top + height - int(max(0.0, self.altitude) / self.max_alt * height)
-        p.setBrush(QtGui.QColor("#ff5500"))
-        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        y = top + height - int(max(0.0, min(self.altitude, self.max_alt)) / self.max_alt * height)
+        p.setBrush(C("accent"))
+        p.setPen(QtGui.QPen(C("text"), 1))
         p.drawPolygon(QtGui.QPolygonF([
-            QtCore.QPointF(float(x_axis + 5), float(y)),
-            QtCore.QPointF(float(x_axis + 15), float(y - 6)),
-            QtCore.QPointF(float(x_axis + 15), float(y + 6))]))
-        p.setPen(QtGui.QColor(255, 255, 255))
-        p.setFont(QtGui.QFont("Consolas", 10, QtGui.QFont.Weight.Bold))
-        p.drawText(int(x_axis + 20), int(y + 5), f"{self.altitude:.0f} m")
+            QtCore.QPointF(float(x_axis + 2), float(y)),
+            QtCore.QPointF(float(x_axis + 16), float(y - 9)),
+            QtCore.QPointF(float(x_axis + 16), float(y + 9))]))
+        p.setPen(C("text"))
+        p.setFont(ui_font(14, QtGui.QFont.Weight.Bold, mono=True))
+        p.drawText(QtCore.QRectF(x_axis + 18, y - 11, rect.width() - x_axis - 20, 22),
+                   QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                   f"{self.altitude:.0f}")
+        p.end()
+
+
+class Narrator(QtCore.QObject):
+    """
+    Speaks the countdown and the flight events, in English.
+
+    Uses Qt's own speech module (on Windows the SAPI / WinRT voices that come
+    with the system, nothing to install). Where that is missing it falls
+    back to a long-running PowerShell with System.Speech, so a phrase starts
+    in well under a second - a new process per phrase would be too late for
+    "three".
+    """
+
+    PS_SCRIPT = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "try{$s.SelectVoiceByHints('NotSet','NotSet',0,[Globalization.CultureInfo]'en-US')}catch{};"
+        "$s.Rate=1;"
+        "while(($l=[Console]::In.ReadLine()) -ne $null){"
+        "if($l.StartsWith('!')){$s.SpeakAsyncCancelAll();$l=$l.Substring(1)};"
+        "if($l){[void]$s.SpeakAsync($l)}}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.enabled = False
+        self.backend = "žádný"
+        self._tts = None
+        self._ps = None
+        try:
+            from PyQt6.QtTextToSpeech import QTextToSpeech
+            engines = QTextToSpeech.availableEngines()
+            engine = next((e for e in ("winrt", "sapi", "speechd", "flite", "macos") if e in engines),
+                          engines[0] if engines else None)
+            if engine is not None:
+                tts = QTextToSpeech(engine, self)
+                locs = [l for l in tts.availableLocales()
+                        if l.language() == QtCore.QLocale.Language.English]
+                if locs:
+                    us = [l for l in locs if l.territory() == QtCore.QLocale.Country.UnitedStates]
+                    tts.setLocale((us or locs)[0])
+                    self.backend = f"Qt {engine}"
+                else:
+                    # e.g. a Czech Windows with only the Czech voice: it still
+                    # speaks, with an accent. Add an English voice in Windows
+                    # Settings > Time & language > Speech.
+                    self.backend = f"Qt {engine} (bez anglického hlasu)"
+                if tts.availableVoices():
+                    tts.setRate(0.05)
+                    self._tts = tts
+        except Exception:
+            self._tts = None
+        if self._tts is None and sys.platform == "win32":
+            self._ps = QtCore.QProcess(self)
+            self._ps.start("powershell", ["-NoProfile", "-NonInteractive", "-Command", self.PS_SCRIPT])
+            self.backend = "Windows System.Speech"
+
+    @property
+    def available(self) -> bool:
+        return self._tts is not None or self._ps is not None
+
+    def say(self, text: str, urgent: bool = False, force: bool = False) -> None:
+        """urgent: cut off whatever is being said (countdown numbers)."""
+        if not (self.enabled or force) or not text:
+            return
+        if self._tts is not None:
+            if urgent or not hasattr(self._tts, "enqueue"):
+                self._tts.say(text)
+            else:
+                self._tts.enqueue(text)
+        elif self._ps is not None and self._ps.state() == QtCore.QProcess.ProcessState.Running:
+            self._ps.write((("!" if urgent else "") + text.replace("\n", " ") + "\n").encode("utf-8"))
+
+    def close(self) -> None:
+        if self._ps is not None:
+            self._ps.closeWriteChannel()
+            self._ps.waitForFinished(500)
+            self._ps.kill()
+
+
+# What the narrator says when a flight event bit comes up. APOGEE gets the
+# altitude added.
+EVENT_SPEECH = {
+    "APOGEE": "Apogee",
+    "COVER": "Cover released",
+    "IGN 1": "Ignition",
+    "THRUST": "Thrust confirmed",
+    "IGN 2": "Backup ignition",
+    "LEGS": "Landing legs deployed",
+    "LIDAR": "Lidar lock",
+    "DOWN": "Touchdown",
+}
+COUNTDOWN_SPEECH = ((10, "T minus ten"), (5, "five"), (3, "three"), (0, "Start!"))
+LAUNCH_CD_S = 30                       # the countdown the pre-launch procedure sends
 
 
 # ==============================================================================
@@ -1055,6 +1209,16 @@ class GroundStation(QtWidgets.QMainWindow):
         self.rx_timestamps = []
         self.is_test_mode = False
         self.last_state = None
+        self.last_state_seen = None
+        self.rx_hist = []                      # arrival times of the last real packets
+        self._ul_pending = None                # uplink command waiting for the rocket's ACK
+        self._prep_ok = False
+        self._launch_note = None
+        self._cd_last = None
+        self._st_spoken = None
+        self._ev_prev = None
+        self._los_spoken = False
+        self._rampa_check = ("idle", "bez spojení s rampou")
 
         self.is_recording = False
         self.csv_file = None
@@ -1066,7 +1230,7 @@ class GroundStation(QtWidgets.QMainWindow):
         self.sim_lat, self.sim_lon = self.pad_lat, self.pad_lon
         self.test_t = 0.0
 
-        self.setWindowTitle("Space Carrots — Daidalos / Ariadna V2 Ground Station")
+        self.setWindowTitle("Daidalos · Ariadna V2 — pozemní stanice")
         self.resize(1440, 860)
 
         self.progress_dialog = QtWidgets.QProgressDialog(
@@ -1114,268 +1278,472 @@ class GroundStation(QtWidgets.QMainWindow):
         self.test_data_timer.timeout.connect(self.generate_test_data)
 
     def setup_ui(self):
-        self.setStyleSheet("""
-        QWidget { background-color: #121212; color: white; font-family: Consolas; }
-        QComboBox { background-color: #1e1e1e; border: 1px solid #444; padding: 5px; }
-        QPushButton { background-color: #ff5500; color: white; border: none;
-                      padding: 6px 15px; font-weight: bold; border-radius: 4px; }
-        QPushButton:hover { background-color: #ff7733; }
-        """)
-
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 4)
+        root.setSpacing(6)
 
-        # ---------------- toolbar ----------------
+        # ======== always visible: what the vehicle is doing, and ABORT ========
         bar = QtWidgets.QHBoxLayout()
+        bar.setSpacing(8)
         root.addLayout(bar)
 
-        title = QtWidgets.QLabel("DAIDALOS · ARIADNA V2")
-        title.setStyleSheet("font-size: 19px; font-weight: bold; color: #ff5500;")
-        bar.addWidget(title)
+        brand = QtWidgets.QVBoxLayout()
+        brand.setSpacing(0)
+        b1 = QtWidgets.QLabel("DAIDALOS")
+        b1.setObjectName("Brand")
+        b2 = QtWidgets.QLabel("Ariadna V2 · pozemní stanice")
+        b2.setObjectName("BrandSub")
+        brand.addWidget(b1)
+        brand.addWidget(b2)
+        bar.addLayout(brand)
+        bar.addSpacing(6)
 
-        self.state_banner = QtWidgets.QLabel("— NO DATA —")
-        self.state_banner.setStyleSheet(
-            "font-size: 17px; font-weight: bold; color: white;"
-            "background-color: #333; padding: 5px 18px; border-radius: 5px;")
+        self.state_banner = QtWidgets.QLabel("BEZ DAT")
+        self.state_banner.setObjectName("State")
+        self.state_banner.setProperty("level", "idle")
+        self.state_banner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.state_banner.setMinimumWidth(210)
+        self.state_banner.setToolTip("Stav letového automatu (mission state)")
         bar.addWidget(self.state_banner)
 
-        self.test_mode_label = QtWidgets.QLabel("⚠️ TEST MODE ⚠️")
-        self.test_mode_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: yellow;"
-            "background-color: #aa0000; padding: 5px 15px; border-radius: 5px;")
+        # Before lift-off T- (the rocket's synchronised countdown when there
+        # is one, else the local START T-0); in flight the flight time.
+        self.clock = QtWidgets.QLabel("T  --:--")
+        self.clock.setObjectName("Clock")
+        self.clock.setProperty("level", "")
+        self.clock.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.clock.setMinimumWidth(190)
+        self.clock.setToolTip("Odpočet do startu (T-) / čas letu (T+)")
+        bar.addWidget(self.clock)
+
+        self.link_badge = badge("LoRa --")
+        self.link_badge.setMinimumWidth(120)
+        self.link_badge.setToolTip("Kvalita rádiového spoje (podíl doručených paketů)")
+        bar.addWidget(self.link_badge)
+
+        self.test_mode_label = badge("SIMULACE · bez signálu", "warn")
+        self.test_mode_label.setToolTip("Není připojená pozemní stanice - zobrazují se simulovaná data")
         self.test_mode_label.setVisible(False)
         bar.addWidget(self.test_mode_label)
 
-        self.los_label = QtWidgets.QLabel("⚠️ LOSS OF SIGNAL ⚠️")
-        self.los_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: white;"
-            "background-color: #ff0000; padding: 5px 15px; border-radius: 5px;")
+        self.los_label = badge("ZTRÁTA SIGNÁLU", "bad")
+        self.los_label.setStyleSheet("font-size:18px; padding:2px 16px;")
         self.los_label.setVisible(False)
         bar.addWidget(self.los_label)
 
         bar.addStretch()
+        self.ul_abort_btn = kbutton("✖  ABORT", "abort",
+                                    "Okamžitě zařadí ABORT do nejbližšího RX okna (včetně nouzového okna T-1 s)")
+        self.ul_abort_btn.clicked.connect(self.send_uplink_abort)
+        bar.addWidget(self.ul_abort_btn)
 
-        # Launch countdown. The vehicle does not know when it will be
-        # launched; the operator does. Set the seconds, press START, and
-        # the T-0 card counts down until the vehicle reports lift-off, at
-        # which point the flight time takes over from the telemetry.
+        # ======== three pages ========
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setDocumentMode(True)
+        root.addWidget(self.tabs, 1)
+
+        corner = QtWidgets.QWidget()
+        cl = QtWidgets.QHBoxLayout(corner)
+        cl.setContentsMargins(0, 0, 0, 4)
+        cl.setSpacing(6)
+        self.record_btn = kbutton("● ZÁZNAM", "", "Nahrávat telemetrii do CSV v Dokumenty\\Daidalos (klávesa R)")
+        self.record_btn.clicked.connect(self.toggle_recording)
+        cl.addWidget(self.record_btn)
+        self.narrator = Narrator(self)
+        self.narr_btn = kbutton("🔊 HLAS", "", "Narátor (anglicky): odpočet 10, 5, 3, Start a události letu; "
+                                             "u apogea výška nad zemí")
+        self.narr_btn.setCheckable(True)
+        self.narr_btn.clicked.connect(self.toggle_narrator)
+        if not self.narrator.available:
+            self.narr_btn.setEnabled(False)
+            self.narr_btn.setToolTip("Hlasový výstup není k dispozici (chybí QtTextToSpeech i Windows hlas)")
+        cl.addWidget(self.narr_btn)
+        self.theme_btn = kbutton("", "", "Přepnout vzhled: VENKU (světlý, na slunce) / NOC (tmavý)")
+        self.theme_btn.setMinimumWidth(92)
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        cl.addWidget(self.theme_btn)
+        self.tabs.setCornerWidget(corner, QtCore.Qt.Corner.TopRightCorner)
+
+        self.tiles = {}
+
+        def tile(key, title, hero=False):
+            t = Tile(title, hero=hero)
+            self.tiles[key] = t
+            return t
+
+        def panel(title):
+            fr = QtWidgets.QFrame()
+            fr.setObjectName("Panel")
+            v = QtWidgets.QVBoxLayout(fr)
+            v.setContentsMargins(10, 6, 10, 10)
+            v.setSpacing(6)
+            cap = QtWidgets.QLabel(title.upper())
+            cap.setObjectName("Caption")
+            v.addWidget(cap)
+            return fr, v
+
+        def page():
+            w = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(w)
+            lay.setContentsMargins(0, 8, 0, 0)
+            lay.setSpacing(10)
+            return w, lay
+
+        # ---------------- 1. LET: only what matters in the air ----------------
+        p1, l1 = page()
+        self.tabs.addTab(p1, "  1 · LET  ")
+
+        col = QtWidgets.QVBoxLayout()
+        col.setSpacing(7)
+        l1.addLayout(col, 26)
+        for key, title, hero in (("ALT", "Výška", True), ("VZ", "Svislá rychlost", True),
+                                 ("NEXT", "Další událost", True), ("TILT", "Náklon", True),
+                                 ("PHASE", "Fáze navedení", False), ("HVEL", "Vodorovná rychlost", False)):
+            col.addWidget(tile(key, title, hero))
+        col.addStretch(1)
+        self.event_strip = IndicatorStrip("Události letu", [n for _, n in EVENT_BITS],
+                                          on_kind="info", off_kind="idle", cols=4)
+        col.addWidget(self.event_strip)
+
+        mid = QtWidgets.QVBoxLayout()
+        mid.setSpacing(7)
+        l1.addLayout(mid, 34)
+        self.rocket_main = RocketView()
+        self.rocket_main.setMinimumSize(220, 240)
+        self.rocket_main.show_readout = False      # the NÁKLON tile says it, larger
+        mid.addWidget(self.rocket_main, 1)
+        self.link_info = QtWidgets.QLabel("rádio nepřipojeno")
+        self.link_info.setObjectName("LinkInfo")
+        self.link_info.setProperty("level", "")
+        self.link_info.setToolTip("Jak dávno přišel poslední paket a jak často chodí")
+        mid.addWidget(self.link_info)
+
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(7)
+        l1.addLayout(right, 40)
+        self.map_widget = RocketMapWidget(self.pad_lat, self.pad_lon, self.pad_src)
+        self.map_widget.setMinimumHeight(220)
+        right.addWidget(self.map_widget, 6)
+        self.alt_plot = pg.PlotWidget()
+        right.addWidget(self.alt_plot, 4)
+
+        self.altimeter = AltimeterWidget()
+        l1.addWidget(self.altimeter, 0)
+
+        # ---------------- 2. START: is it ready, and the countdown ----------------
+        p2, l2 = page()
+        self.tabs.addTab(p2, "  2 · START  ")
+
+        chk, chk_l = panel("Kontrola před startem")
+        l2.addWidget(chk, 56)
+        self.go_banner = QtWidgets.QLabel("BEZ DAT")
+        self.go_banner.setObjectName("State")
+        self.go_banner.setProperty("level", "idle")
+        self.go_banner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.go_banner.setWordWrap(True)
+        chk_l.addWidget(self.go_banner)
+        self.checks = {}
+        for key, name, hint in (
+                ("link", "Rádiový spoj", "Podíl doručených paketů (≥ 90 %) a síla signálu"),
+                ("health", "Subsystémy", "Všechny bity zdraví (POS, NAV, SOLN, FLASH, LOG, SERVO, GPS, POST)"),
+                ("error", "Chyba", "Kód chyby z rakety"),
+                ("batt", "Baterie", "2S Li-ion: < 7,0 V NO-GO, < 7,4 V pozor"),
+                ("gps", "GPS", "≥ 5 satelitů, HDOP ≤ 1,5 (≤ 2,5 pozor)"),
+                ("uwb", "UWB", "≥ 3 kotvy a filtr fixy přijímá"),
+                ("pyro1", "Pyro C1 · přistávací motor", "Kontinuita zapalovače hlavního motoru"),
+                ("pyro2", "Pyro C2 · záložní zapalovač", "Kontinuita záložního zapalovače"),
+                ("arm", "ARM / RBF", "Stav odjištění a Remove-Before-Flight"),
+                ("tilt", "Svislost na rampě", "< 4° OK, < 10° pozor"),
+                ("rampa", "Rampa", "Stav startovací rampy (přes LoRa sync)")):
+            row = CheckRow(name, hint)
+            self.checks[key] = row
+            chk_l.addWidget(row)
+        chk_l.addStretch(1)
+        note = QtWidgets.QLabel("Orientační kontrola z telemetrie. Rozhodnutí o startu dělá vedoucí startu.")
+        note.setObjectName("Caption")
+        chk_l.addWidget(note)
+
+        s_right = QtWidgets.QVBoxLayout()
+        s_right.setSpacing(10)
+        l2.addLayout(s_right, 44)
+
+        proc, proc_l = panel(f"Předstartovní procedura · start za {LAUNCH_CD_S} s")
+        s_right.addWidget(proc)
+        self.proc_rows = {}
+        # (key, text, manual?, button)
+        steps = (
+            ("link", "Spojení s raketou čerstvé (paket < 1 s, ≥ 90 %)", False, None),
+            ("go", "Kontrola před startem bez NO-GO, raketa IDLE/ARMED", False, None),
+            ("prep", "PŘÍPRAVA odeslána a potvrzena raketou", False, ("ODESLAT", self.send_uplink_prep)),
+            ("rampa", "Rampa READY · klíč zapnut · kontinuita C1", False, None),
+            ("rec", "Záznam telemetrie běží", False, ("ZAPNOUT", self.start_recording)),
+            ("area", "Prostor vyklizen, všichni v bezpečné vzdálenosti", True, None),
+            ("rbf", "RBF vytažen, klíč rampy zapnut", True, None),
+            ("lead", "Vedoucí startu dal souhlas", True, None),
+        )
+        for key, text, manual, btn in steps:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            lamp = QtWidgets.QLabel("—")
+            lamp.setObjectName("Lamp")
+            lamp.setProperty("kind", "idle")
+            lamp.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lamp.setFixedSize(54, 26)
+            row.addWidget(lamp)
+            if manual:
+                w = QtWidgets.QCheckBox(text)
+                w.setObjectName("ProcCheck")
+                w.toggled.connect(self.update_procedure)
+            else:
+                w = QtWidgets.QLabel(text)
+                w.setObjectName("ProcText")
+            row.addWidget(w, 1)
+            if btn:
+                b = kbutton(btn[0], "", "")
+                b.clicked.connect(btn[1])
+                b.setFixedWidth(92)
+                row.addWidget(b)
+            proc_l.addLayout(row)
+            self.proc_rows[key] = (lamp, w if manual else None)
+        self.launch_btn = kbutton(f"▶  ODESLAT: START ZA {LAUNCH_CD_S} s", "warn",
+                                  "Pošle raketě synchronizovaný odpočet. Rampa zažehne v T-0. "
+                                  "Vyžaduje potvrzení napsáním START a potvrzení od rakety.")
+        self.launch_btn.setMinimumHeight(46)
+        self.launch_btn.setStyleSheet("font-size:17px;")
+        self.launch_btn.clicked.connect(self.send_launch)
+        proc_l.addWidget(self.launch_btn)
+        self.launch_state = badge("Procedura nezahájena")
+        self.launch_state.setWordWrap(True)
+        proc_l.addWidget(self.launch_state)
+
+        link, link_l = panel("Uplink, rampa a svislost")
+        s_right.addWidget(link, 1)
+        lh = QtWidgets.QHBoxLayout()
+        lh.setSpacing(10)
+        link_l.addLayout(lh, 1)
+        lv = QtWidgets.QVBoxLayout()
+        lv.setSpacing(6)
+        lh.addLayout(lv, 1)
+        self.ul_win_label = badge("RX OKNO: --")
+        lv.addWidget(self.ul_win_label)
+        self.rampa_label = badge("RAMPA: OFFLINE")
+        self.rampa_label.setWordWrap(True)
+        lv.addWidget(self.rampa_label)
+        self.ul_ack_label = QtWidgets.QLabel("ACK: —")
+        self.ul_ack_label.setObjectName("Ack")
+        lv.addWidget(self.ul_ack_label)
+        lv.addStretch(1)
+        self.tilt_bubble = TiltBubble()
+        self.tilt_bubble.setFixedSize(150, 150)
+        self.tilt_bubble.setToolTip("Kam se naklání špička: střed = svisle, kroužky 5 / 10 / 20°")
+        lh.addWidget(self.tilt_bubble)
+        self.rocket_view = self.rocket_main        # one 3-D view, on page 1
+        self.t0_deadline = None
+        self.t0_timer = QtCore.QTimer()
+        self.t0_timer.timeout.connect(self.update_countdown)
+        self.t0_timer.start(100)
+
+
+        # ---------------- 3. DIAGNOSTIKA: everything else ----------------
+        p3, l3 = page()
+        self.tabs.addTab(p3, "  3 · DIAGNOSTIKA  ")
+
+        graphs = QtWidgets.QVBoxLayout()
+        graphs.setSpacing(6)
+        l3.addLayout(graphs, 34)
+        self.accel_plot = pg.PlotWidget()
+        self.vel_plot = pg.PlotWidget()
+        self.tvc_plot = pg.PlotWidget()
+        for plt in (self.accel_plot, self.vel_plot, self.tvc_plot):
+            graphs.addWidget(plt)
+
+        dmid = QtWidgets.QVBoxLayout()
+        dmid.setSpacing(7)
+        l3.addLayout(dmid, 46)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(7)
+        grid.setVerticalSpacing(7)
+        dmid.addLayout(grid)
+        small = [
+            ("ACCEL", "Zrychlení"), ("THRUST", "Tah · clamp"), ("POWER", "Baterie · proud"),
+            ("GPS", "GPS"), ("UWB", "UWB kotvy · fúze"), ("LORA", "LoRa linka"),
+            ("PAD", "Poloha vůči rampě [m]"), ("ERROR", "Chyba"), ("PKT", "Pakety"),
+        ]
+        for i, (key, title) in enumerate(small):
+            grid.addWidget(tile(key, title), i // 3, i % 3)
+        for c_ in range(3):
+            grid.setColumnStretch(c_, 1)
+        self.health_strip = IndicatorStrip("Subsystémy", [n for _, n in HEALTH_BITS],
+                                           on_kind="okline", off_kind="bad")
+        dmid.addWidget(self.health_strip)
+        self.pyro_strip = IndicatorStrip("Pyro · C = kontinuita, F = odpáleno",
+                                         ["C1", "C2", "C3", "F1", "F2", "F3", "ARM", "RBF"],
+                                         on_kind="ok", off_kind="idle")
+        dmid.addWidget(self.pyro_strip)
+        self.tvc_widget = TVCWidget()
+        dmid.addWidget(self.tvc_widget, 1)
+
+        tools, tools_l = panel("Připojení a nástroje")
+        tools.setFixedWidth(270)
+        l3.addWidget(tools)
+        self.port_combo = QtWidgets.QComboBox()
+        self.refresh_ports()
+        tools_l.addWidget(self.port_combo)
+        row = QtWidgets.QHBoxLayout()
+        refresh = kbutton("⟳ Porty", "", "Znovu načíst seznam sériových portů")
+        refresh.clicked.connect(self.refresh_ports)
+        row.addWidget(refresh)
+        self.connect_btn = kbutton("PŘIPOJIT", "primary", "Připojit / odpojit pozemní stanici (USB)")
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        row.addWidget(self.connect_btn, 1)
+        tools_l.addLayout(row)
+        tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("PŘÍKAZY RAKETĚ (LADĚNÍ)")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        self.ul_padref_btn = kbutton("PADREF – změřit rampu", "", "Raketa si znovu změří referenční polohu rampy")
+        self.ul_padref_btn.clicked.connect(lambda: self._send_ul("CMD:PADREF", "PADREF"))
+        tools_l.addWidget(self.ul_padref_btn)
+        self.ul_reboot_btn = kbutton("RESTART rakety", "", "Vzdálený restart rakety (povoleno pouze na zemi)")
+        self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
+        tools_l.addWidget(self.ul_reboot_btn)
+        tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("VLASTNÍ ODPOČET (LADĚNÍ)")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        row = QtWidgets.QHBoxLayout()
         self.t0_spin = QtWidgets.QSpinBox()
         self.t0_spin.setRange(5, 3600)
         self.t0_spin.setValue(60)
         self.t0_spin.setSuffix(" s")
-        self.t0_spin.setStyleSheet("background-color: #1e1e1e; padding: 4px;")
-        bar.addWidget(self.t0_spin)
-        self.t0_btn = QtWidgets.QPushButton("START T-0")
-        self.t0_btn.setStyleSheet("background-color: #555555; color: white;")
+        row.addWidget(self.t0_spin)
+        self.t0_btn = kbutton("T-0 jen zde", "", "Jen místní odpočet na této obrazovce (nic neodesílá)")
         self.t0_btn.clicked.connect(self.toggle_countdown)
-        bar.addWidget(self.t0_btn)
-        self.t0_deadline = None
-        self.t0_timer = QtCore.QTimer()
-        self.t0_timer.timeout.connect(self.update_countdown)
-        self.t0_timer.start(200)
-
-        self.map_btn = QtWidgets.QPushButton("MAP ⭳ PAD")
-        self.map_btn.setToolTip("Download the aerial map (CUZK orthophoto, 15 cm/px) around the current pad "
-                                "for offline use at the field")
-        self.map_btn.setStyleSheet("background-color: #555555; color: white;")
-        self.map_btn.clicked.connect(self.download_map_here)
-        bar.addWidget(self.map_btn)
-
-        self.record_btn = QtWidgets.QPushButton("⏺ RECORD")
-        self.record_btn.setStyleSheet("background-color: #555555; color: white;")
-        self.record_btn.clicked.connect(self.toggle_recording)
-        bar.addWidget(self.record_btn)
-
-        self.port_combo = QtWidgets.QComboBox()
-        self.refresh_ports()
-        bar.addWidget(self.port_combo)
-
-        refresh = QtWidgets.QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_ports)
-        bar.addWidget(refresh)
-
-        self.connect_btn = QtWidgets.QPushButton("CONNECT")
-        self.connect_btn.clicked.connect(self.toggle_connection)
-        bar.addWidget(self.connect_btn)
-
-        # ---------------- uplink & Rampa control bar (fw 3.34) ----------------
-        ul = QtWidgets.QHBoxLayout()
-        root.addLayout(ul)
-
-        self.ul_win_label = QtWidgets.QLabel("RX OKNO: --")
-        self.ul_win_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #cccccc;"
-            "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
-        ul.addWidget(self.ul_win_label)
-
-        self.rampa_label = QtWidgets.QLabel("RAMPA: OFFLINE")
-        self.rampa_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #aaaaaa;"
-            "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
-        ul.addWidget(self.rampa_label)
-
-        self.ul_ack_label = QtWidgets.QLabel("ACK: —")
-        self.ul_ack_label.setStyleSheet(
-            "font-size: 12px; color: #aaaaaa; padding: 4px 8px;")
-        ul.addWidget(self.ul_ack_label)
-
-        ul.addStretch()
-
-        self.ul_prep_btn = QtWidgets.QPushButton("START BRZY (PREP)")
-        self.ul_prep_btn.setStyleSheet("background-color: #2b6cb0; color: white;")
-        self.ul_prep_btn.setToolTip("Odešle pokyn Příprava / Start brzy (čerstvý PADREF + kontrola rampy)")
-        self.ul_prep_btn.clicked.connect(self.send_uplink_prep)
-        ul.addWidget(self.ul_prep_btn)
-
-        self.ul_cd_btn = QtWidgets.QPushButton("START ODPOČET → RAMPA")
-        self.ul_cd_btn.setStyleSheet("background-color: #d97706; color: white;")
-        self.ul_cd_btn.setToolTip("Odešle synchronizovaný odpočet (dle pole s) raketě a přes pupeční I2C rampě")
+        row.addWidget(self.t0_btn, 1)
+        tools_l.addLayout(row)
+        self.ul_cd_btn = kbutton("ODPOČET → RAMPA", "warn",
+                                 "Odešle synchronizovaný odpočet (dle pole výše) raketě a přes pupeční I2C "
+                                 "rampě - mimo předstartovní proceduru")
         self.ul_cd_btn.clicked.connect(self.send_uplink_countdown)
-        ul.addWidget(self.ul_cd_btn)
+        tools_l.addWidget(self.ul_cd_btn)
+        tools_l.addSpacing(8)
+        cap = QtWidgets.QLabel("MAPA")
+        cap.setObjectName("Caption")
+        tools_l.addWidget(cap)
+        self.map_btn = kbutton("MAPA ⭳ stáhnout okolí", "", "Stáhnout letecké snímky (ČÚZK ortofoto, 15 cm/px) okolí "
+                                                          "rampy pro použití offline na místě")
+        self.map_btn.clicked.connect(self.download_map_here)
+        tools_l.addWidget(self.map_btn)
+        tools_l.addStretch(1)
+        keys = QtWidgets.QLabel("F1 / F2 / F3 – záložky\nR – záznam\nPři startu se samo přepne na LET.\n"
+                                f"Hlas: {self.narrator.backend}")
+        keys.setObjectName("Caption")
+        tools_l.addWidget(keys)
 
-        self.ul_abort_btn = QtWidgets.QPushButton("✖ ABORT")
-        self.ul_abort_btn.setStyleSheet("background-color: #cc0000; color: white; font-size: 14px;")
-        self.ul_abort_btn.setToolTip("Okamžitě zařadí ABORT do nejbližšího RX okna (včetně nouzového okna T-1 s)")
-        self.ul_abort_btn.clicked.connect(self.send_uplink_abort)
-        ul.addWidget(self.ul_abort_btn)
-
-        self.ul_padref_btn = QtWidgets.QPushButton("PADREF")
-        self.ul_padref_btn.setStyleSheet("background-color: #444444; color: white;")
-        self.ul_padref_btn.clicked.connect(lambda: self._send_ul("CMD:PADREF", "PADREF"))
-        ul.addWidget(self.ul_padref_btn)
-
-        self.ul_reboot_btn = QtWidgets.QPushButton("RESTART")
-        self.ul_reboot_btn.setStyleSheet("background-color: #6b21a8; color: white;")
-        self.ul_reboot_btn.setToolTip("Vzdálený restart rakety (povoleno pouze na zemi)")
-        self.ul_reboot_btn.clicked.connect(self.send_uplink_reboot)
-        ul.addWidget(self.ul_reboot_btn)
-
-        # ---------------- body ----------------
-        body = QtWidgets.QHBoxLayout()
-        root.addLayout(body, stretch=1)
-
-        # ---- left: the graphs, stacked, each the full width of the column ----
-        # (they used to sit four abreast in the centre, too narrow to read a
-        # trend; the numbers moved to the centre in their place)
-        graphs = QtWidgets.QVBoxLayout()
-        body.addLayout(graphs, stretch=2)
-
-        # ---- centre: cards, indicators, attitude, map ----
-        left = QtWidgets.QVBoxLayout()
-        body.addLayout(left, stretch=3)
-
-        grid = QtWidgets.QGridLayout()
-        grid.setSpacing(5)
-        left.addLayout(grid, stretch=0)
-
-        self.cards = {}
-        card_names = [
-            "ALTITUDE", "MISSION STATE",
-            "VERTICAL SPEED", "HORIZ SPEED",
-            "ACCELERATION", "GUIDANCE PHASE",
-            "THRUST EST", "THRUST CLAMP",
-            "BATTERY", "CURRENT",
-            "TILT", "SATELLITES",
-            "NEXT EVENT", "FLIGHT TIME",
-            "PAD OFFSET", "T-0 COUNTDOWN",
-            "HDOP", "LORA SIGNAL",
-            "LINK QUALITY", "ERROR",
-            # The UWB constellation. Two cards rather than one because the
-            # two facts fail independently: the anchors can be alive and
-            # the filter can still be rejecting every fix they produce,
-            # which is what a survey error looks like from the ground.
-            "UWB ANCHORS", "UWB FIX",
-        ]
-        for i, name in enumerate(card_names):
-            card = TelemetryCard(name)
-            self.cards[name] = card
-            grid.addWidget(card, i // 4, i % 4)
-
-        strips = QtWidgets.QHBoxLayout()
-        left.addLayout(strips)
-        self.health_strip = IndicatorStrip("SUBSYSTEMS", [n for _, n in HEALTH_BITS])
-        strips.addWidget(self.health_strip)
-
-        self.pyro_strip = IndicatorStrip("PYRO  (continuity / fired)",
-                                         ["C1", "C2", "C3", "F1", "F2", "F3",
-                                          "ARM", "RBF"])
-        strips.addWidget(self.pyro_strip)
-
-        self.event_strip = IndicatorStrip("FLIGHT EVENTS", [n for _, n in EVENT_BITS])
-        left.addWidget(self.event_strip)
-
-        # Attitude, three ways: the navball, a 3-D rocket in the pad frame,
-        # and the tilt bull's-eye (where the top of the vehicle leans).
-        lower = QtWidgets.QHBoxLayout()
-        left.addLayout(lower, stretch=1)
-        att = QtWidgets.QHBoxLayout()
-        lower.addLayout(att, stretch=3)
-        self.navball = NavBallWidget()
-        att.addWidget(self.navball, stretch=3)
-        att_r = QtWidgets.QVBoxLayout()
-        att.addLayout(att_r, stretch=2)
-        self.rocket_view = RocketView()
-        att_r.addWidget(self.rocket_view, stretch=3)
-        self.tilt_bubble = TiltBubble()
-        att_r.addWidget(self.tilt_bubble, stretch=2)
-
-        pg.setConfigOption("background", "#1b1b1b")
-        pg.setConfigOption("foreground", "w")
-
-        self.alt_plot = pg.PlotWidget(title="Altitude (m)")
-        self.accel_plot = pg.PlotWidget(title="Acceleration (g)")
-        self.vel_plot = pg.PlotWidget(title="Vertical speed (m/s)")
-        self.tvc_plot = pg.PlotWidget(title="TVC command (deg)")
-
-        self.alt_curve = self.alt_plot.plot(pen=pg.mkPen("#ff5500", width=2))
-        self.accel_curve = self.accel_plot.plot(pen=pg.mkPen("g", width=2))
-        self.vel_curve = self.vel_plot.plot(pen=pg.mkPen("c", width=2))
-        self.tvc_plot.addLegend(offset=(-10, 10))
-        self.tvc_x_curve = self.tvc_plot.plot(pen=pg.mkPen("#ffaa00", width=2), name="X")
-        self.tvc_y_curve = self.tvc_plot.plot(pen=pg.mkPen("#00aaff", width=2), name="Y")
-
-        # Axis captions, so a value can be read off at a glance: the X axis is
-        # seconds before the newest packet, the Y axis is in the plot's unit.
-        for plot, unit in ((self.alt_plot, "m"), (self.accel_plot, "g"),
-                           (self.vel_plot, "m/s"), (self.tvc_plot, "deg")):
-            plot.showGrid(x=True, y=True, alpha=0.25)
-            plot.setLabel("left", unit)
-            plot.setLabel("bottom", "time before now [s]")
-            plot.getAxis("left").setWidth(48)
-            graphs.addWidget(plot)
+        # plot set-up (all four, wherever they sit)
+        self.alt_curve = self.alt_plot.plot()
+        self.accel_curve = self.accel_plot.plot()
+        self.vel_curve = self.vel_plot.plot()
+        self.tvc_plot.addLegend(offset=(-10, 6))
+        self.tvc_x_curve = self.tvc_plot.plot(name="X")
+        self.tvc_y_curve = self.tvc_plot.plot(name="Y")
+        self._plots = ((self.alt_plot, "Výška", "m"), (self.accel_plot, "Zrychlení", "g"),
+                       (self.vel_plot, "Svislá rychlost", "m/s"), (self.tvc_plot, "Výchylka TVC", "°"))
+        for plt, _title, _unit in self._plots:
+            plt.setMenuEnabled(False)
+            plt.getAxis("left").setWidth(44)
         # Altitude and acceleration cannot go negative; vertical speed and
         # TVC very much can, so they keep a symmetric axis.
         self.alt_plot.getPlotItem().setLimits(yMin=0)
         self.accel_plot.getPlotItem().setLimits(yMin=0)
 
-        self.map_widget = RocketMapWidget(self.pad_lat, self.pad_lon, self.pad_src)
-        lower.addWidget(self.map_widget, stretch=3)
-
-        self.tvc_widget = TVCWidget()
-        lower.addWidget(self.tvc_widget, stretch=1)
-
-        # ---- right: altimeter ----
-        self.altimeter = AltimeterWidget()
-        body.addWidget(self.altimeter, stretch=0)
+        for i, key in enumerate((QtCore.Qt.Key.Key_F1, QtCore.Qt.Key.Key_F2, QtCore.Qt.Key.Key_F3)):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            sc.activated.connect(lambda i=i: self.tabs.setCurrentIndex(i))
 
         self.status = self.statusBar()
-        self.status.showMessage("DISCONNECTED")
+        self.status.showMessage("ODPOJENO")
+        self.flight_t = None
+        self.apply_look()
+        if self.narrator.available and str(QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation")
+                                           .value("narrator", "false")).lower() == "true":
+            self.narr_btn.setChecked(True)
+            self.narrator.enabled = True
+            set_level(self.narr_btn, "info", "kind")
+        self.update_procedure()
 
-    # ------------------------------------------------------------ recording
+    # ------------------------------------------------------------- the look
+    def apply_look(self):
+        """Re-colour everything that is not styled by the application style
+        sheet: the plots, the 3-D rocket, the bull's-eye and the map."""
+        fg = T["plot_fg"]
+        axis_font = ui_font(12, QtGui.QFont.Weight.DemiBold)
+        series = {self.alt_curve: T["s_alt"], self.accel_curve: T["s_acc"],
+                  self.vel_curve: T["s_vz"], self.tvc_x_curve: T["s_tx"],
+                  self.tvc_y_curve: T["s_ty"]}
+        for plot, title, unit in self._plots:
+            plot.setBackground(T["plot_bg"])
+            pi = plot.getPlotItem()
+            pi.setTitle(f"<span style='font-weight:800'>{title}</span>"
+                        f" <span style='font-weight:600'>[{unit}]</span>",
+                        color=fg, size="11pt")
+            for name in ("left", "bottom"):
+                ax = pi.getAxis(name)
+                ax.setPen(pg.mkPen(fg, width=1))
+                ax.setTextPen(pg.mkPen(fg))
+                ax.setTickFont(axis_font)
+            pi.getAxis("bottom").setLabel("s před teď", color=fg)
+            pi.getAxis("bottom").label.setFont(axis_font)
+            pi.showGrid(x=True, y=True, alpha=T["grid"])
+        for curve, col in series.items():
+            curve.setPen(pg.mkPen(col, width=3))
+        legend = self.tvc_plot.getPlotItem().legend
+        if legend is not None:
+            legend.setLabelTextColor(fg)
+            for _sample, lab in legend.items:
+                lab.setText(lab.text, color=fg, size="10pt", bold=True)
+            legend.setBrush(pg.mkBrush(T["plot_bg"]))
+            legend.setPen(pg.mkPen(T["border"]))
+
+        for rv in (self.rocket_main,):
+            rv.bg, rv.fg, rv.dim = C("panel"), C("text"), C("dim")
+            rv.accent, rv.good, rv.warn, rv.bad = C("accent"), C("ok"), C("warn"), C("bad")
+        tb = self.tilt_bubble
+        tb.bg, tb.ring, tb.label = C("panel"), C("dim"), C("text")
+        tb.good, tb.warn, tb.bad = C("ok"), C("warn"), C("bad")
+        tb.gate = C("ok", 60)
+        self.map_widget.browser.page().setBackgroundColor(C("panel"))
+        self.theme_btn.setText("☾ NOC" if T["key"] == "light" else "☀ VENKU")
+        for w in (self.rocket_main, self.tilt_bubble, self.altimeter, self.tvc_widget):
+            w.update()
+
+    def toggle_theme(self):
+        key = "dark" if T["key"] == "light" else "light"
+        apply_theme(key)
+        QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation").setValue("theme", key)
+        self.apply_look()
+
+    # ------------------------------------------------------------ countdown
     def toggle_countdown(self):
         if self.t0_deadline is None:
             self.t0_deadline = time.time() + self.t0_spin.value()
             self.t0_btn.setText("STOP T-0")
-            self.t0_btn.setStyleSheet("background-color: #ff5500; color: white;")
+            set_level(self.t0_btn, "primary", "kind")
         else:
             self.t0_deadline = None
-            self.t0_btn.setText("START T-0")
-            self.t0_btn.setStyleSheet("background-color: #555555; color: white;")
+            self.t0_btn.setText("START T-0 (jen zde)")
+            set_level(self.t0_btn, "", "kind")
         self.update_countdown()
 
+    @staticmethod
+    def _fmt_t(left: float) -> str:
+        sign = "−" if left >= 0 else "+"
+        left = abs(left)
+        return f"T{sign}{int(left // 60):02d}:{left % 60:04.1f}"
+
     def update_countdown(self):
-        card = self.cards["T-0 COUNTDOWN"]
         flying = self.last_state is not None and 3 <= self.last_state <= 8
         # Prefer rocket-synchronized countdown when active.
         rocket_rem = None
@@ -1391,37 +1759,244 @@ class GroundStation(QtWidgets.QMainWindow):
             gps_utc = bool(self.last_sync["sync_flags"] & 0x01)
             src = "GPS+UTC" if gps_utc else "SYNC"
             if is_final and win_left >= -0.3:
-                self.ul_win_label.setText(f"⚠ T-1s ABORT OKNO: {max(0.0, win_left):.1f} s ({src})")
-                self.ul_win_label.setStyleSheet(
-                    "font-size: 13px; font-weight: bold; color: white;"
-                    "background-color: #cc0000; border: 1px solid #ff5555; padding: 4px 10px; border-radius: 4px;")
+                self.ul_win_label.setText(f"⚠ T-1 s ABORT OKNO: {max(0.0, win_left):.1f} s ({src})")
+                set_level(self.ul_win_label, "bad")
             elif win_left <= 0.0:
                 self.ul_win_label.setText(f"RX OKNO OTEVŘENO ({src})")
-                self.ul_win_label.setStyleSheet(
-                    "font-size: 13px; font-weight: bold; color: #121212;"
-                    "background-color: #00ff88; border: 1px solid #00ff88; padding: 4px 10px; border-radius: 4px;")
+                set_level(self.ul_win_label, "ok")
             else:
                 self.ul_win_label.setText(f"RX OKNO za {win_left:.1f} s ({src})")
-                self.ul_win_label.setStyleSheet(
-                    "font-size: 13px; font-weight: bold; color: #00d4ff;"
-                    "background-color: #1e1e1e; border: 1px solid #0088aa; padding: 4px 10px; border-radius: 4px;")
+                set_level(self.ul_win_label, "info")
         if flying:
-            card.set_value("LIFT-OFF")
-            card.set_status("#00ff88")
-        elif rocket_rem is not None:
-            sign = "-" if rocket_rem >= 0 else "+"
-            left = abs(rocket_rem)
-            card.set_value(f"T{sign}{int(left // 60):02d}:{left % 60:04.1f} ⚡")
-            card.set_status("#ffaa00" if sign == "-" and left > 10 else "#ff2222")
-        elif self.t0_deadline is None:
-            card.set_value("--")
-            card.set_status("#444444")
+            self._cd_last = None
+            if self.t0_deadline is not None:
+                self.t0_deadline = None
+                self._reset_procedure()
+            ft = self.flight_t
+            self.clock.setText(f"T+{ft:d} s" if ft is not None else "LET")
+            set_level(self.clock, "ok")
+            return
+        if self.t0_deadline is not None and time.time() - self.t0_deadline > 60.0:
+            self.t0_deadline = None            # T-0 long gone and no lift-off
+            self._reset_procedure()
+        if rocket_rem is not None:
+            # follow the rocket's clock; when it stops reporting at T-0 the
+            # local deadline carries on from exactly there (and says "Start")
+            self.t0_deadline = time.time() + rocket_rem
+            left, mark = rocket_rem, " ⚡"
+        elif self.t0_deadline is not None:
+            left, mark = self.t0_deadline - time.time(), ""
         else:
-            left = self.t0_deadline - time.time()
-            sign = "-" if left >= 0 else "+"
-            left = abs(left)
-            card.set_value(f"T{sign}{int(left // 60):02d}:{left % 60:04.1f}")
-            card.set_status("#ffaa00" if sign == "-" and left > 10 else "#ff2222")
+            self._cd_last = None
+            self.clock.setText("T  --:--")
+            set_level(self.clock, "")
+            return
+        self._narrate_countdown(left)
+        self.clock.setText(self._fmt_t(left) + mark)
+        set_level(self.clock, "warn" if left > 10 else "bad")
+
+    # ------------------------------------------------------------ narrator
+    def toggle_narrator(self):
+        on = self.narr_btn.isChecked()
+        self.narrator.enabled = on
+        set_level(self.narr_btn, "info" if on else "", "kind")
+        QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation").setValue("narrator", on)
+        if on:
+            self.narrator.say("Narrator on", urgent=True)
+
+    def _narrate_countdown(self, left):
+        """Say 10 / 5 / 3 / Start as the countdown crosses them. A quarter of
+        a second early, which is about how long a voice takes to start."""
+        lead = 0.25
+        prev = self._cd_last
+        self._cd_last = left
+        if prev is None or left is None:
+            return
+        for th, phrase in COUNTDOWN_SPEECH:
+            if prev > th + lead >= left:
+                self.narrator.say(phrase, urgent=True)
+
+    def _narrate_telemetry(self, d):
+        st = d["STATE"]
+        if self._st_spoken is not None and st != self._st_spoken:
+            if st == 3:
+                self.narrator.say("Liftoff", urgent=True)
+            elif st == 9:
+                self.narrator.say("Abort", urgent=True)
+            elif st == 11:
+                self.narrator.say("Error")
+        self._st_spoken = st
+        ev = d["EVENTS"]
+        if self._ev_prev is None or (st == 2 and ev == 0):
+            self._ev_prev = ev
+            return
+        new = ev & ~self._ev_prev
+        self._ev_prev = ev
+        for bit, name in EVENT_BITS:
+            if new & (1 << bit):
+                phrase = EVENT_SPEECH.get(name, name)
+                if name == "APOGEE":
+                    top = max(self.data_alt) if self.data_alt else d["ALT"]
+                    phrase = f"Apogee. {top:.0f} meters"
+                self.narrator.say(phrase)
+
+    # ------------------------------------------------- pre-launch procedure
+    def start_recording(self):
+        if not self.is_recording:
+            self.toggle_recording()
+
+    def _rampa_ready(self):
+        s = self.last_sync
+        if s is None or time.monotonic() - s["rx_mono"] > 15.0:
+            return False
+        rf = s["rampa_flags"]
+        return s["rampa_state"] == 2 and bool(rf & 0x01) and bool(rf & 0x02) and not s["rampa_fault"]
+
+    def update_procedure(self, *_):
+        if not hasattr(self, "proc_rows"):
+            return
+        age = time.time() - self.last_packet_time
+        auto = {
+            "link": (not self.is_test_mode and age < 1.0 and getattr(self, "_pdr", 0) >= 90),
+            "go": self.go_banner.property("level") in ("ok", "warn"),
+            "prep": self._prep_ok,
+            "rampa": self._rampa_ready(),
+            "rec": self.is_recording,
+        }
+        # a finished attempt (abort / rejected / no ACK) is cleared by starting
+        # to tick the list again
+        if self._launch_note in ("abort", "rejected", "timeout") and any(
+                chk is not None and chk.isChecked() for _l, chk in self.proc_rows.values()):
+            self._launch_note = None
+        all_ok = True
+        for key, (lamp, chk) in self.proc_rows.items():
+            ok = chk.isChecked() if chk is not None else auto.get(key, False)
+            all_ok &= ok
+            lamp.setText("OK" if ok else "—")
+            set_level(lamp, "ok" if ok else "idle", "kind")
+        busy = self._ul_pending is not None and self._ul_pending["kind"] == "cd"
+        counting = self.t0_deadline is not None
+        self.launch_btn.setEnabled(all_ok and not busy and not counting)
+        if not busy and not counting and self._launch_note is None:
+            self.launch_state.setText("Vše splněno – můžeš odeslat start" if all_ok
+                                      else "Čeká se na splnění všech kroků")
+            set_level(self.launch_state, "okline" if all_ok else "")
+
+    def send_launch(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Potvrzení startu")
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.setSpacing(10)
+        head = QtWidgets.QLabel(f"START ZA {LAUNCH_CD_S} s")
+        head.setObjectName("State")
+        head.setProperty("level", "warn")
+        head.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(head)
+        info = QtWidgets.QLabel(
+            f"Raketě se odešle synchronizovaný odpočet T-{LAUNCH_CD_S} s.\n"
+            "• Raketa ho potvrdí v nejbližším RX okně (do ~10 s) a předá čas rampě.\n"
+            "• V T-1 s je poslední nouzové okno pro ABORT.\n"
+            "• V T-0 rampa zažehne motor.\n\n"
+            "Pro potvrzení napiš velkými písmeny START:")
+        info.setStyleSheet("font-size:14px; font-weight:600;")
+        v.addWidget(info)
+        edit = QtWidgets.QLineEdit()
+        edit.setStyleSheet("font-size:20px; font-weight:800; padding:4px;")
+        v.addWidget(edit)
+        row = QtWidgets.QHBoxLayout()
+        cancel = kbutton("ZRUŠIT", "", "")
+        go = kbutton(f"ODESLAT START ZA {LAUNCH_CD_S} s", "warn", "")
+        go.setEnabled(False)
+        edit.textChanged.connect(lambda t: go.setEnabled(t.strip() == "START"))
+        cancel.clicked.connect(dlg.reject)
+        go.clicked.connect(dlg.accept)
+        row.addWidget(cancel)
+        row.addWidget(go, 1)
+        v.addLayout(row)
+        dlg.setMinimumWidth(460)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        if not self._send_ul(f"CMD:CD:{LAUNCH_CD_S}:1", f"START ZA {LAUNCH_CD_S} s", kind="cd"):
+            return
+        self.t0_deadline = time.time() + LAUNCH_CD_S
+        self._launch_note = "sent"
+        self.launch_state.setText("ODESLÁNO – čeká na potvrzení od rakety (nejbližší RX okno)…")
+        set_level(self.launch_state, "warn")
+        self.update_procedure()
+
+    def _resolve_ack(self, s):
+        p = self._ul_pending
+        if p is None:
+            return
+        seq, rc = s["last_cmd_seq"], s["last_cmd_rc"]
+        if (p["seq0"] is None and rc == 0) or seq == p["seq0"]:
+            return
+        self._ul_pending = None
+        ok = rc == 1
+        why = UL_RC_NAMES.get(rc, "?")
+        if p["kind"] == "prep":
+            self._prep_ok = ok
+        elif p["kind"] == "cd":
+            if ok:
+                self._launch_note = "ok"
+                self.launch_state.setText("✔ POTVRZENO RAKETOU – odpočet běží")
+                set_level(self.launch_state, "ok")
+                self.narrator.say("Countdown confirmed")
+            else:
+                self.t0_deadline = None
+                self._launch_note = "rejected"
+                self.launch_state.setText(f"✖ RAKETA ODMÍTLA: {why}")
+                set_level(self.launch_state, "bad")
+                self.narrator.say("Countdown rejected", urgent=True)
+        self.update_procedure()
+
+    def _check_ack_timeout(self):
+        p = self._ul_pending
+        if p is None or time.monotonic() - p["t"] < 25.0:
+            return
+        self._ul_pending = None
+        self.ul_ack_label.setText(f"BEZ POTVRZENÍ: {p['label']} (25 s)")
+        if p["kind"] == "cd":
+            self._launch_note = "timeout"
+            self.launch_state.setText("⚠ Raketa odpočet nepotvrdila do 25 s – zkontroluj spojení, "
+                                      "případně ABORT")
+            set_level(self.launch_state, "bad")
+            self.narrator.say("No confirmation", urgent=True)
+        self.update_procedure()
+
+    def _reset_procedure(self):
+        self._prep_ok = False
+        self._launch_note = None
+        for _lamp, chk in self.proc_rows.values():
+            if chk is not None:
+                chk.setChecked(False)
+        self.update_procedure()
+
+    # --------------------------------------------------- link on page 1
+    def _show_link_info(self):
+        now = time.time()
+        if self.is_test_mode or not getattr(self.serial_thread, "is_running", False):
+            self.link_info.setText("rádio nepřipojeno – zobrazuje se simulace" if self.is_test_mode
+                                   else "rádio nepřipojeno")
+            set_level(self.link_info, "")
+            return
+        if not self.rx_hist:
+            self.link_info.setText("zatím žádný paket")
+            set_level(self.link_info, "bad")
+            return
+        age = now - self.rx_hist[-1]
+        if len(self.rx_hist) >= 2:
+            span = self.rx_hist[-1] - self.rx_hist[0]
+            per = span / (len(self.rx_hist) - 1)
+            rate = f"průměrně každých {per * 1000:.0f} ms ({1.0 / per:.1f} Hz)" if per > 0 else ""
+        else:
+            rate = ""
+        self.link_info.setText(f"poslední paket před {age:.1f} s · {rate} · "
+                               f"doručeno {getattr(self, '_pdr', 0):.0f} %")
+        set_level(self.link_info, "bad" if age > 3.0 else "warn" if age > 1.0 else "")
+        if age > 1.0:
+            self.link_badge.setText(f"LoRa {age:.0f} s bez paketu")
+            set_level(self.link_badge, "bad" if age > 3.0 else "warn")
 
     # ------------------------------------------------- bidirectional LoRa uplink
     def send_utc_sync(self):
@@ -1435,38 +2010,46 @@ class GroundStation(QtWidgets.QMainWindow):
         self.last_sync = s
         rstate = RAMPA_STATE_NAMES.get(s["rampa_state"], "?")
         rf = s["rampa_flags"]
-        key_s = "KLÍČ:OK" if (rf & 0x01) else "KLÍČ:OFF"
+        key_s = "KLÍČ OK" if (rf & 0x01) else "KLÍČ OFF"
         c_s = "".join(str(i + 1) if (rf & (1 << (i + 1))) else "-" for i in range(3))
         det_s = " · ODPOJENO" if (s["sync_flags"] & 0x04) else ""
         if s["rampa_state"] == 0:
             self.rampa_label.setText("RAMPA: OFFLINE")
-            self.rampa_label.setStyleSheet(
-                "font-size: 13px; font-weight: bold; color: #aaaaaa;"
-                "background-color: #1e1e1e; border: 1px solid #444; padding: 4px 10px; border-radius: 4px;")
+            set_level(self.rampa_label, "")
+            self._rampa_check = ("warn", "offline")
         else:
             self.rampa_label.setText(
-                f"RAMPA: {rstate} · {key_s} · C:{c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
-            col = "#00ff88" if s["rampa_state"] in (2, 3, 4) and s["rampa_fault"] == 0 else (
-                "#ff4444" if s["rampa_state"] in (6, 7) or s["rampa_fault"] else "#ffaa00")
-            self.rampa_label.setStyleSheet(
-                f"font-size: 13px; font-weight: bold; color: {col};"
-                f"background-color: #1e1e1e; border: 1px solid {col}; padding: 4px 10px; border-radius: 4px;")
+                f"RAMPA: {rstate} · {key_s} · C {c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
+            lvl = "okline" if s["rampa_state"] in (2, 3, 4) and s["rampa_fault"] == 0 else (
+                "bad" if s["rampa_state"] in (6, 7) or s["rampa_fault"] else "warn")
+            set_level(self.rampa_label, lvl)
+            self._rampa_check = ("ok" if lvl == "okline" else lvl,
+                                 f"{rstate} · {key_s} · C {c_s} · {s['rampa_vbat_v']:.2f} V{det_s}")
 
         rc_txt = UL_RC_NAMES.get(s["last_cmd_rc"], "?")
         self.ul_ack_label.setText(f"ACK #{s['last_cmd_seq']}: {rc_txt}")
+        self._resolve_ack(s)
         self.update_countdown()
+        self.update_procedure()
 
-    def _send_ul(self, line: str, label: str):
+    def _send_ul(self, line: str, label: str, kind: str = "") -> bool:
         if not getattr(self, "serial_thread", None) or not self.serial_thread.is_running:
             self.status.showMessage("UPLINK: Ground Station není připojená")
-            return
+            QtWidgets.QMessageBox.warning(self, "Uplink", "Pozemní stanice není připojená – příkaz nebyl odeslán.")
+            return False
         self.send_utc_sync()
         self.serial_thread.send_line(line)
         self.ul_ack_label.setText(f"VE FRONTĚ → {label} (čeká na RX okno)")
         self.status.showMessage(f"UPLINK zařazen: {label}")
+        # the rocket's ACK is the next change of last_cmd_seq in its sync packet
+        self._ul_pending = {"kind": kind or "other", "label": label, "t": time.monotonic(),
+                            "seq0": self.last_sync["last_cmd_seq"] if self.last_sync else None}
+        return True
 
     def send_uplink_prep(self):
-        self._send_ul("CMD:PREP", "START BRZY / PREP")
+        if self._send_ul("CMD:PREP", "PŘÍPRAVA (PREP)", kind="prep"):
+            self._prep_ok = False
+            self.update_procedure()
 
     def send_uplink_countdown(self):
         sec = int(self.t0_spin.value())
@@ -1479,12 +2062,18 @@ class GroundStation(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No)
         if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.t0_deadline = time.time() + sec
-            self._send_ul(f"CMD:CD:{sec}:1", f"ODPOČET T-{sec} s")
+            if self._send_ul(f"CMD:CD:{sec}:1", f"ODPOČET T-{sec} s", kind="cd"):
+                self.t0_deadline = time.time() + sec
 
     def send_uplink_abort(self):
         self.t0_deadline = None
-        self._send_ul("CMD:ABORT", "ABORT!")
+        self.narrator.say("Abort", urgent=True)
+        self._send_ul("CMD:ABORT", "ABORT!", kind="abort")
+        self._reset_procedure()
+        self.launch_state.setText("ABORT odeslán")
+        set_level(self.launch_state, "bad")
+        self._launch_note = "abort"
+
 
     def send_uplink_reboot(self):
         reply = QtWidgets.QMessageBox.question(
@@ -1516,10 +2105,11 @@ class GroundStation(QtWidgets.QMainWindow):
                     "flags", "error", "rssi", "snr",
                     "uwb_n", "uwb_mode", "uwb_aided", "uwb_alive"])
             self.is_recording = True
-            self.record_btn.setText("⏹ STOP REC")
-            self.record_btn.setStyleSheet("background-color: #ff0000; color: white;")
+            self.record_btn.setText("■ NAHRÁVÁ")
+            set_level(self.record_btn, "danger", "kind")
             self.last_flush_time = time.time()
-            self.status.showMessage(f"RECORDING TO {filename}")
+            self.status.showMessage(f"NAHRÁVÁM DO {filename}")
+            self.update_procedure()
         else:
             self.is_recording = False
             if self.csv_file:
@@ -1528,9 +2118,10 @@ class GroundStation(QtWidgets.QMainWindow):
                 self.csv_file.close()
                 self.csv_file = None
             self.csv_writer = None
-            self.record_btn.setText("⏺ RECORD")
-            self.record_btn.setStyleSheet("background-color: #555555; color: white;")
-            self.status.showMessage("RECORDING STOPPED")
+            self.record_btn.setText("● ZÁZNAM")
+            set_level(self.record_btn, "", "kind")
+            self.status.showMessage("ZÁZNAM UKONČEN")
+            self.update_procedure()
 
     # ----------------------------------------------------------- connection
     def refresh_ports(self):
@@ -1544,18 +2135,18 @@ class GroundStation(QtWidgets.QMainWindow):
     def toggle_connection(self):
         if self.serial_thread.is_running:
             self.serial_thread.disconnect_port()
-            self.connect_btn.setText("CONNECT")
-            self.connect_btn.setStyleSheet("background-color: #ff5500;")
-            self.status.showMessage("DISCONNECTED")
+            self.connect_btn.setText("PŘIPOJIT")
+            set_level(self.connect_btn, "primary", "kind")
+            self.status.showMessage("ODPOJENO")
             self.last_packet_time = time.time()
             self.los_label.setVisible(False)
         else:
             port = self.port_combo.currentText()
             if port and "No serial" not in port:
                 if self.serial_thread.connect_port(port):
-                    self.connect_btn.setText("DISCONNECT")
-                    self.connect_btn.setStyleSheet("background-color: #aa0000;")
-                    self.status.showMessage(f"CONNECTED TO {port}")
+                    self.connect_btn.setText("ODPOJIT")
+                    set_level(self.connect_btn, "", "kind")
+                    self.status.showMessage(f"PŘIPOJENO K {port}")
                     self.last_packet_time = time.time()
                     self.rx_timestamps.clear()
                     self.enable_test_mode(False)
@@ -1575,16 +2166,62 @@ class GroundStation(QtWidgets.QMainWindow):
             # not survive the flight.
             expected = 3.0 * TLM_HZ     # 3 s window
             pdr = min(100.0, len(self.rx_timestamps) / expected * 100.0)
-            self.cards["LINK QUALITY"].set_value(f"{pdr:.0f} %")
-            self.cards["LINK QUALITY"].set_status(
-                "#ff2222" if pdr < 50 else "#ffaa00" if pdr < 90 else "#00ff88")
+            self._pdr = pdr
+            self._show_link()
 
+        self._show_link_info()
+        self._check_ack_timeout()
+        self.update_procedure()
         if getattr(self.serial_thread, "is_running", False):
-            self.los_label.setVisible(now - self.last_packet_time > 3.0)
+            lost = now - self.last_packet_time > 3.0
+            self.los_label.setVisible(lost)
+            if lost != self._los_spoken:
+                self.narrator.say("Signal lost" if lost else "Signal regained", urgent=lost)
+                self._los_spoken = lost
         else:
             self.los_label.setVisible(False)
             if now - self.boot_time > 5.0 and not self.is_test_mode:
                 self.enable_test_mode(True)
+
+    def _show_link(self):
+        """LoRa tile: packet delivery ratio (measured here) and RSSI/SNR
+        (reported by the receiver). The worse of the two sets the colour."""
+        pdr = None if self.is_test_mode else getattr(self, "_pdr", None)
+        lora = getattr(self, "_lora", None)
+        sub = f"{lora[0]} dBm · SNR {lora[1]} dB" if lora else " "
+        tile = self.tiles["LORA"]
+        main = "SIM" if pdr is None else f"{pdr:.0f} %"
+        tile.set_value(main, sub)
+        rank = 0
+        if pdr is not None:
+            rank = max(rank, 2 if pdr < 50 else 1 if pdr < 90 else 0)
+        if lora:
+            rank = max(rank, 0 if lora[0] > -90 else 1 if lora[0] > -110 else 2)
+        level = ("ok", "warn", "bad")[rank]
+        tile.set_level(level)
+        self.link_badge.setText(f"LoRa {main}")
+        set_level(self.link_badge, "okline" if level == "ok" else level)
+        self.checks["link"].set(level, f"{main} paketů · {sub}")
+
+    def _update_go(self, state):
+        """The banner over the check list: GO / NO-GO and why."""
+        lvl, txt = self._rampa_check
+        self.checks["rampa"].set(lvl, txt)
+        if state not in (1, 2):
+            self.go_banner.setText(f"{STATE_NAMES.get(state, '?')} – kontrola jen na rampě")
+            set_level(self.go_banner, "idle")
+            return
+        bad = [r.name.text() for r in self.checks.values() if r.level == "bad"]
+        warn = [r.name.text() for r in self.checks.values() if r.level == "warn"]
+        if bad:
+            self.go_banner.setText("NO-GO: " + ", ".join(bad))
+            set_level(self.go_banner, "bad")
+        elif warn:
+            self.go_banner.setText("GO s výhradou: " + ", ".join(warn))
+            set_level(self.go_banner, "warn")
+        else:
+            self.go_banner.setText("GO – vše v pořádku")
+            set_level(self.go_banner, "ok")
 
     def enable_test_mode(self, enabled):
         if self.is_test_mode == enabled:
@@ -1593,7 +2230,7 @@ class GroundStation(QtWidgets.QMainWindow):
         self.test_mode_label.setVisible(enabled)
         if enabled:
             self.test_data_timer.start(50)
-            self.status.showMessage("NO SIGNAL — LOCAL SIMULATION")
+            self.status.showMessage("ŽÁDNÝ SIGNÁL — MÍSTNÍ SIMULACE")
             self.sim_lat, self.sim_lon = self.pad_lat, self.pad_lon
             self.test_t = 0.0
         else:
@@ -1696,6 +2333,8 @@ class GroundStation(QtWidgets.QMainWindow):
         if not is_simulated:
             self.last_packet_time = time.time()
             self.rx_timestamps.append(self.last_packet_time)
+            self.rx_hist.append(self.last_packet_time)
+            del self.rx_hist[:-21]
             self.enable_test_mode(False)
 
             if self.is_recording and self.csv_writer:
@@ -1746,81 +2385,112 @@ class GroundStation(QtWidgets.QMainWindow):
         self.vel_plot.setYRange(min(-10, min(self.data_vel)), max(10, max(self.data_vel)))
         self.tvc_plot.setYRange(-TVCWidget.MAX_DEG, TVCWidget.MAX_DEG)
 
-        c = self.cards
-        c["ALTITUDE"].set_value(f"{d['ALT']:.1f} m")
-        c["MISSION STATE"].set_value(STATE_NAMES.get(d["STATE"], "?"))
-        c["VERTICAL SPEED"].set_value(f"{d['VZ']:+.1f} m/s")
-        c["HORIZ SPEED"].set_value(f"{d['HVEL']:.1f} m/s")
-        c["ACCELERATION"].set_value(f"{d['ACCEL']:.2f} g")
-        c["GUIDANCE PHASE"].set_value(PHASE_NAMES.get(d["PHASE"], "?"))
-        c["THRUST EST"].set_value(f"{d['THRUST']:.0f} N")
-        c["THRUST CLAMP"].set_value(f"{d['CLAMP']} %")
-        c["BATTERY"].set_value(f"{d['BATTERY']:.2f} V")
-        c["CURRENT"].set_value(f"{d['CURRENT']:.1f} A")
+        c = self.tiles
         att = attitude_summary(*d["QUAT"])
-        c["TILT"].set_value(f"{att['tilt']:.1f}°  {'▲' if att['nose_up'] else '▼'}")
-        c["TILT"].set_status("#00ff88" if att["tilt"] < 4 else
-                             "#ffaa00" if att["tilt"] < 10 else "#ff2222")
+        self.flight_t = d["T_FLIGHT"] if d["STATE"] >= 3 else None
+
+        # page 1 follows the flight on its own at lift-off
+        if d["STATE"] == 3 and self.last_state_seen is not None and self.last_state_seen < 3:
+            self.tabs.setCurrentIndex(0)
+        self.last_state_seen = d["STATE"]
+
+        c["ALT"].set_value(f"{d['ALT']:.1f} m", f"max {max(self.data_alt):.0f} m")
+        c["ALT"].set_level("ok" if d["STATE"] >= 1 else "idle")
+        vz = d["VZ"]
+        c["VZ"].set_value(f"{vz:+.1f} m/s", "↑ stoupá" if vz > 0.5 else "↓ klesá" if vz < -0.5 else "—")
+        c["VZ"].set_level("ok")
+        c["TILT"].set_value(f"{att['tilt']:.1f}°",
+                            f"špička {'NAHORU' if att['nose_up'] else 'DOLŮ'} · směr {att['tilt_az']:.0f}°")
+        c["TILT"].set_level("ok" if att["tilt"] < 4 else "warn" if att["tilt"] < 10 else "bad")
         # The countdown the vehicle itself computes: to the ignition command
         # while it descends, to the planned touchdown once the command is out.
         if d["T_EVENT"] is None:
-            c["NEXT EVENT"].set_value("--")
-            c["NEXT EVENT"].set_status("#444444")
+            c["NEXT"].set_value("--", " ")
+            c["NEXT"].set_level("idle")
         elif d["PHASE"] == 2:
-            c["NEXT EVENT"].set_value(f"IGNITION {d['T_EVENT']:.1f} s")
-            c["NEXT EVENT"].set_status("#ffaa00")
+            c["NEXT"].set_value(f"{d['T_EVENT']:.1f} s", "do ZÁŽEHU")
+            c["NEXT"].set_level("warn")
         else:
-            c["NEXT EVENT"].set_value(f"LANDING {d['T_EVENT']:.1f} s")
-            c["NEXT EVENT"].set_status("#ff8c00")
-        c["FLIGHT TIME"].set_value(f"T+{d['T_FLIGHT']} s" if d["STATE"] >= 3 else "--")
-        c["PAD OFFSET"].set_value(f"E {d['PX']:+d}  N {d['PY']:+d} m")
-        c["SATELLITES"].set_value(f"{d['SATS']}")
-        c["HDOP"].set_value(f"{d['HDOP']:.1f}")
-        c["ERROR"].set_value(ERROR_NAMES.get(d["ERROR"], "?"))
+            c["NEXT"].set_value(f"{d['T_EVENT']:.1f} s", "do PŘISTÁNÍ")
+            c["NEXT"].set_level("accent")
+        c["PHASE"].set_value(PHASE_NAMES.get(d["PHASE"], "?"), " ")
+        c["PHASE"].set_level("accent" if d["PHASE"] in (3, 4) else
+                             "info" if d["PHASE"] == 2 else "idle")
+        c["HVEL"].set_value(f"{d['HVEL']:.1f} m/s", f"celková {d['TOTVEL']:.1f} m/s")
+        c["HVEL"].set_level("ok")
 
-        # UWB. "n/4 anchors" and what the filter is doing with them.
-        c["UWB ANCHORS"].set_value(f"{d['UWB_N']} / 4")
-        if not d["UWB_ALIVE"]:
-            c["UWB FIX"].set_value("OFFLINE")
-        elif d["UWB_AIDED"]:
-            c["UWB FIX"].set_value(f"FUSED {UWB_MODE_NAMES.get(d['UWB_MODE'], '?')}")
-        else:
-            c["UWB FIX"].set_value("GATED OUT")
-
-        c["LORA SIGNAL"].value_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        c["LORA SIGNAL"].set_value(
-            f"<b>{d['RSSI']}</b><span style='font-size:10px;color:#aaa;'> dBm</span> "
-            f"<b>{d['SNR']}</b><span style='font-size:10px;color:#aaa;'> dB</span>")
-
+        c["ACCEL"].set_value(f"{d['ACCEL']:.2f} g", " ")
+        c["ACCEL"].set_level("warn" if d["ACCEL"] > 8 else "ok")
+        burn = d["PHASE"] == PHASE_BURN
+        c["THRUST"].set_value(f"{d['THRUST']:.0f} N", f"clamp {d['CLAMP']} %")
+        c["THRUST"].set_level("accent" if burn else "idle")
         # 2S lithium: 7.4 V nominal, 8.4 V full, 6.6 V empty.
-        c["BATTERY"].set_status("#ff2222" if d["BATTERY"] < 7.0
-                                else "#ffaa00" if d["BATTERY"] < 7.4 else "#00ff88")
-        c["SATELLITES"].set_status("#ff2222" if d["SATS"] < 5 else "#00ff88")
-        c["ERROR"].set_status("#ff2222" if d["ERROR"] else "#00ff88")
-        c["HDOP"].set_status("#ff2222" if d["HDOP"] > 2.5
-                             else "#ffaa00" if d["HDOP"] > 1.5 else "#00ff88")
-        # Three anchors still navigates; two is a warning; one or none is
-        # not a constellation any more.
-        c["UWB ANCHORS"].set_status("#00ff88" if d["UWB_N"] >= 3
-                                    else "#ffaa00" if d["UWB_N"] == 2 else "#ff2222")
-        # Green only when the filter is ACCEPTING fixes. Alive but gated
-        # out is amber, and it is the state worth acting on before launch.
-        c["UWB FIX"].set_status("#00ff88" if d["UWB_AIDED"]
-                                else "#ffaa00" if d["UWB_ALIVE"] else "#444444")
-        c["LORA SIGNAL"].set_status("#00ff88" if d["RSSI"] > -90
-                                    else "#ffaa00" if d["RSSI"] > -110 else "#ff2222")
-        c["GUIDANCE PHASE"].set_status("#ff8c00" if d["PHASE"] in (3, 4) else
-                                       "#00aacc" if d["PHASE"] == 2 else "#444444")
-        c["ACCELERATION"].set_status("#ffaa00" if d["ACCEL"] > 8 else "#444444")
+        batt_lvl = "bad" if d["BATTERY"] < 7.0 else "warn" if d["BATTERY"] < 7.4 else "ok"
+        c["POWER"].set_value(f"{d['BATTERY']:.2f} V", f"{d['CURRENT']:.1f} A")
+        c["POWER"].set_level(batt_lvl)
+        gps_lvl = ("bad" if d["SATS"] < 5 or d["HDOP"] > 2.5 else
+                   "warn" if d["HDOP"] > 1.5 else "ok")
+        c["GPS"].set_value(f"{d['SATS']} sat", f"HDOP {d['HDOP']:.1f}")
+        c["GPS"].set_level(gps_lvl)
+        # Green only when the filter is ACCEPTING fixes. Alive but gated out
+        # is amber, and it is the state worth acting on before launch. Three
+        # anchors still navigates; two is a warning; fewer is not a
+        # constellation any more.
+        if not d["UWB_ALIVE"]:
+            fix = "OFFLINE"
+        elif d["UWB_AIDED"]:
+            fix = f"FUSED {UWB_MODE_NAMES.get(d['UWB_MODE'], '?')}"
+        else:
+            fix = "GATED OUT"
+        if not d["UWB_ALIVE"]:
+            uwb_lvl = "idle"
+        elif d["UWB_N"] < 2:
+            uwb_lvl = "bad"
+        elif d["UWB_N"] == 2 or not d["UWB_AIDED"]:
+            uwb_lvl = "warn"
+        else:
+            uwb_lvl = "ok"
+        c["UWB"].set_value(f"{d['UWB_N']} / 4", fix)
+        c["UWB"].set_level(uwb_lvl)
+        self._lora = (d["RSSI"], d["SNR"])
+        self._show_link()
+        c["PAD"].set_value(f"E{d['PX']:+d} N{d['PY']:+d}", " ")
+        c["PAD"].set_level("ok")
+        err_txt = "žádná" if not d["ERROR"] else ERROR_NAMES.get(d["ERROR"], "?")
+        c["ERROR"].set_value(err_txt, f"kód {d['ERROR']}" if d["ERROR"] else " ")
+        c["ERROR"].set_level("bad" if d["ERROR"] else "ok")
+        c["PKT"].set_value(f"{self.packet_count}", f"zahozeno {getattr(self, '_link_bad', 0)}")
+        c["PKT"].set_level("idle" if is_simulated else "ok")
+
+        # ---- page 2: the pre-launch check ----
+        k = self.checks
+        failed = [n for b, n in HEALTH_BITS if not d["HEALTH"] & (1 << b)]
+        k["health"].set("bad" if failed else "ok",
+                        "chybí: " + ", ".join(failed) if failed else "všech 8 v pořádku")
+        k["error"].set("bad" if d["ERROR"] else "ok", err_txt)
+        k["batt"].set(batt_lvl, f"{d['BATTERY']:.2f} V · {d['CURRENT']:.1f} A")
+        k["gps"].set(gps_lvl, f"{d['SATS']} satelitů · HDOP {d['HDOP']:.1f}")
+        k["uwb"].set("bad" if uwb_lvl == "idle" else uwb_lvl, f"{d['UWB_N']} / 4 kotvy · {fix}")
+        for i, key in ((0, "pyro1"), (1, "pyro2")):
+            cont = bool(d["PYRO_CONT"] & (1 << i))
+            fired = bool(d["PYRO_FIRED"] & (1 << i))
+            if fired:
+                k[key].set("info", "odpáleno")
+            else:
+                k[key].set("ok" if cont else ("bad" if i == 0 else "warn"),
+                           "kontinuita OK" if cont else "BEZ KONTINUITY")
+        arm, rbf = bool(d["FLAGS"] & 0x01), bool(d["FLAGS"] & 0x02)
+        k["arm"].set("info", f"ARM {'ANO' if arm else 'ne'} · RBF {'ANO' if rbf else 'ne'}")
+        k["tilt"].set("ok" if att["tilt"] < 4 else "warn" if att["tilt"] < 10 else "bad",
+                      f"{att['tilt']:.1f}° · směr {att['tilt_az']:.0f}°")
+        self._update_go(d["STATE"])
 
         # state banner
         name = STATE_NAMES.get(d["STATE"], "?")
-        colour = {6: "#ff8c00", 7: "#00aa44", 8: "#0088cc",
-                  9: "#cc0000", 11: "#cc0000"}.get(d["STATE"], "#333333")
-        self.state_banner.setText(f"  {name}  ")
-        self.state_banner.setStyleSheet(
-            f"font-size:17px; font-weight:bold; color:white; background-color:{colour};"
-            "padding:5px 18px; border-radius:5px;")
+        level = {2: "plain", 3: "accent", 4: "accent", 5: "accent", 6: "accent", 7: "ok",
+                 8: "info", 9: "bad", 10: "warn", 11: "bad"}.get(d["STATE"], "idle")
+        self.state_banner.setText(name)
+        set_level(self.state_banner, level)
 
         # subsystem lights
         for bit, label in HEALTH_BITS:
@@ -1839,12 +2509,10 @@ class GroundStation(QtWidgets.QMainWindow):
         for bit, label in EVENT_BITS:
             self.event_strip.set(label, bool(d["EVENTS"] & (1 << bit)))
 
-        # The navball shows the NOSE: +90 pitch on the pad, -90 falling
-        # nose-first. The 3-D view and the bull's-eye need no convention.
-        self.navball.update_attitude(att["pitch"], 0.0, att["heading"], d["TOTVEL"])
-        self.rocket_view.set_quaternion(*d["QUAT"])
-        self.rocket_view.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]),
-                                       burning=(d["PHASE"] == PHASE_BURN))
+        self._narrate_telemetry(d)
+        for rv in (self.rocket_main,):
+            rv.set_quaternion(*d["QUAT"])
+            rv.set_actuators(tvc=(d["TVC_X"], d["TVC_Y"]), burning=(d["PHASE"] == PHASE_BURN))
         self.tilt_bubble.set_tilt(att["tilt"], att["tilt_az"])
         self.altimeter.update_altitude(d["ALT"])
         self.tvc_widget.update_tvc(d["TVC_X"], d["TVC_Y"], d["CLAMP"], d["PHASE"])
@@ -1855,10 +2523,10 @@ class GroundStation(QtWidgets.QMainWindow):
                 self.track_pad(d)
 
         if not self.is_recording:
-            src = "SIMULATION" if is_simulated else self.port_combo.currentText()
+            src = "SIMULACE" if is_simulated else self.port_combo.currentText()
             bad = getattr(self, "_link_bad", 0)
             self.status.showMessage(
-                f"{src} | PACKETS: {self.packet_count} | DROPPED: {bad}")
+                f"{src}  ·  paketů: {self.packet_count}  ·  zahozeno: {bad}")
 
     # ------------------------------------------------------------------ pad
     def track_pad(self, d):
@@ -1881,14 +2549,14 @@ class GroundStation(QtWidgets.QMainWindow):
             self.map_widget.set_pad(lat, lon, "rocket")
             save_pad(lat, lon, "rocket")
             if moved > 300.0:
-                self.status.showMessage("Pad moved >300 m - press MAP ⭳ PAD for the offline map there")
+                self.status.showMessage("Rampa se posunula o >300 m - stiskni MAPA ⭳ pro offline mapu tam")
 
     def download_map_here(self):
         if getattr(self, "map_dl", None) is not None and self.map_dl.isRunning():
             return
         self.map_dl = MapDownloader(self.pad_lat, self.pad_lon, ZOOM_STRATEGY)
-        self.map_dl.progress.connect(lambda v, t: self.map_btn.setText(f"MAP {v} %"))
-        self.map_dl.finished.connect(lambda: self.map_btn.setText("MAP ⭳ PAD"))
+        self.map_dl.progress.connect(lambda v, t: self.map_btn.setText(f"MAPA {v} %"))
+        self.map_dl.finished.connect(lambda: self.map_btn.setText("MAPA ⭳"))
         self.map_dl.start()
 
     def closeEvent(self, event):
@@ -1898,6 +2566,8 @@ class GroundStation(QtWidgets.QMainWindow):
             self.csv_file.close()
         if hasattr(self, "serial_thread"):
             self.serial_thread.disconnect_port()
+        if hasattr(self, "narrator"):
+            self.narrator.close()
         super().closeEvent(event)
 
 
@@ -1923,6 +2593,10 @@ if __name__ == "__main__":
             pass
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    _f = QtGui.QFont(UI_FONT)
+    _f.setPixelSize(13)
+    app.setFont(_f)
+    apply_theme(str(QtCore.QSettings("VoltinoLabs", "DaidalosGroundStation").value("theme", "light")))
     _ico_path = _find_app_icon()
     _icon = QtGui.QIcon(_ico_path) if _ico_path else QtGui.QIcon()
     if not _icon.isNull():
@@ -1930,5 +2604,5 @@ if __name__ == "__main__":
     window = GroundStation()
     if not _icon.isNull():
         window.setWindowIcon(_icon)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())

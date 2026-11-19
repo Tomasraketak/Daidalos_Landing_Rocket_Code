@@ -147,6 +147,7 @@ class RocketView(QtWidgets.QWidget):
         self.good = QtGui.QColor("#35d07f")
         self.warn = QtGui.QColor("#ffb020")
         self.bad = QtGui.QColor("#ff4d4d")
+        self.show_readout = True               # the text in the corners; a host may hide it
 
     # -- inputs ---------------------------------------------------------------
     def set_quaternion(self, w, x, y, z, valid=True):
@@ -264,6 +265,9 @@ class RocketView(QtWidgets.QWidget):
             line(tip, body((sx * 0.35, sy * 0.35, 1.45)), flame)
 
         # read-outs
+        if not self.show_readout:
+            p.end()
+            return
         f.setPointSize(10)
         f.setBold(True)
         p.setFont(f)
@@ -302,6 +306,14 @@ class TiltBubble(QtWidgets.QWidget):
         self._az = 0.0
         self._valid = False
         self._cmd = None                       # commanded tilt, deg (optional)
+        # colours; a host may re-theme them (the ground station does)
+        self.bg = QtGui.QColor("#101418")
+        self.ring = QtGui.QColor("#5c6b76")
+        self.label = QtGui.QColor("#9fb0bb")
+        self.gate = QtGui.QColor(53, 208, 127, 50)
+        self.good = QtGui.QColor("#35d07f")
+        self.warn = QtGui.QColor("#ffb020")
+        self.bad = QtGui.QColor("#ff4d4d")
 
     def set_tilt(self, tilt_deg, az_deg, valid=True, cmd_deg=None):
         self._tilt, self._az, self._valid, self._cmd = tilt_deg, az_deg, valid, cmd_deg
@@ -310,14 +322,14 @@ class TiltBubble(QtWidgets.QWidget):
     def paintEvent(self, _):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QtGui.QColor("#101418"))
+        p.fillRect(self.rect(), self.bg)
         w, h = self.width(), self.height()
         cx, cy = w / 2.0, h / 2.0
         rad = min(w, h) / 2.0 - 12
         full = self.RINGS[-1]
 
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor(53, 208, 127, 50))
+        p.setBrush(self.gate)
         g = rad * 4.0 / full
         p.drawEllipse(QtCore.QPointF(cx, cy), g, g)
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
@@ -326,12 +338,12 @@ class TiltBubble(QtWidgets.QWidget):
         p.setFont(f)
         for ring in self.RINGS:
             rr = rad * ring / full
-            p.setPen(QtGui.QPen(QtGui.QColor("#5c6b76"), 1))
+            p.setPen(QtGui.QPen(self.ring, 1))
             p.drawEllipse(QtCore.QPointF(cx, cy), rr, rr)
             p.drawText(QtCore.QPointF(cx + 3, cy - rr + 9), f"{ring:.0f}°")
         p.drawLine(QtCore.QPointF(cx - rad, cy), QtCore.QPointF(cx + rad, cy))
         p.drawLine(QtCore.QPointF(cx, cy - rad), QtCore.QPointF(cx, cy + rad))
-        p.setPen(QtGui.QColor("#9fb0bb"))
+        p.setPen(self.label)
         p.drawText(QtCore.QRectF(cx - 8, 0, 16, 12), QtCore.Qt.AlignmentFlag.AlignCenter, "N")
         p.drawText(QtCore.QRectF(w - 12, cy - 6, 12, 12), QtCore.Qt.AlignmentFlag.AlignCenter, "E")
 
@@ -345,10 +357,10 @@ class TiltBubble(QtWidgets.QWidget):
             a = math.radians(self._az)
             x = cx + rad * t / full * math.sin(a)
             y = cy - rad * t / full * math.cos(a)
-            col = "#35d07f" if self._tilt < 4 else ("#ffb020" if self._tilt < 10 else "#ff4d4d")
-            p.setPen(QtGui.QPen(QtGui.QColor(col), 2))
+            col = self.good if self._tilt < 4 else (self.warn if self._tilt < 10 else self.bad)
+            p.setPen(QtGui.QPen(col, 2))
             p.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(x, y))
-            p.setBrush(QtGui.QColor(col))
+            p.setBrush(col)
             p.drawEllipse(QtCore.QPointF(x, y), 5, 5)
         p.end()
 
