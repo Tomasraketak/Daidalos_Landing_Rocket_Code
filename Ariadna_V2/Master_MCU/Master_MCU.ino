@@ -325,6 +325,8 @@ static bool params_synced(void);
 static inline bool pos_status_fresh(void);
 static void usb_service(void);
 static void test_service(void);
+static void hil_enter(bool pyro_en);
+static void hil_leave(void);
 static void diag_emit(void);
 static void pyro_bridge_send(uint8_t cmd, uint8_t ch, uint16_t pulse_ms, uint8_t repeats);
 static inline bool pyro_rep_fresh(void);
@@ -388,6 +390,12 @@ static bool     s_params_from_flash = false;
 
 // TEST mode: the diagnostic GUI drives the actuators directly
 static bool     s_test        = false;
+// HIL (Hardware-in-the-Loop) simulation mode: synthetic sensor flight from PC
+static bool     s_hil         = false;
+static bool     s_hil_pyro    = false;
+// Bench TVC+fin polarity check on real IMU attitude (ground IDLE, pyros OFF)
+static bool     s_polarity    = false;
+static float    s_pol_thrust_n = 0.0f;  // 0 = default avg(mean, median); 10..250 N override
 static float    s_pwm_hz      = 339.0f;          // PCA_PWM_HZ outside TEST
 static uint16_t s_test_us[16];                   // commanded pulse, 0 = off
 static bool     s_test_awake[16];
@@ -1329,6 +1337,7 @@ static void set_state(uint8_t s)
     if (s == s_state) return;
     MASTER_PRINT("# state %u -> %u at t=%lu h=%.1f vz=%.1f\n",
                  s_state, s, (unsigned long)millis(), s_nav.pz, s_nav.vz);
+    if (s != ARIADNA_STATE_IDLE) s_polarity = false;
     s_state = s;
     s_state_since = millis();
 }
@@ -1395,7 +1404,7 @@ static void batt_service(void)
     if (s_batt.learn_events != seen_events) {
         seen_events = s_batt.learn_events;
         if (fabsf(s_batt.learn - s_learn_stored) >= 0.01f &&
-            (s_state == ARIADNA_STATE_IDLE) && !s_test &&
+            (s_state == ARIADNA_STATE_IDLE) && !s_test && !s_hil &&
             (last_save_ms == 0 || now - last_save_ms > 600000u)) {
             if (ariadna_param_set(&s_params, ARIADNA_P_BATT_LEARN, s_batt.learn)) {
                 s_learn_stored = PRM(BATT_LEARN);
@@ -1427,6 +1436,15 @@ static void state_machine(void)
     if (s_rbf_out) s_flags |= ARIADNA_MST_RBF_OUT;
     else           s_flags &= (uint8_t)~ARIADNA_MST_RBF_OUT;
 
+    // Hardware RBF kill-switch for HIL with live pyrotechnics: reinserting
+    // the RBF pin immediately inhibits pyros even mid-simulation.
+    if (s_hil && s_hil_pyro && !s_rbf_out) {
+        s_hil_pyro = false;
+        s_flags |= ARIADNA_MST_PYRO_INHIBIT;
+        send_master_state();
+        usb_printf("# HIL RBF reinserted - pyros inhibited\n");
+    }
+
     switch (s_state) {
 
     case ARIADNA_STATE_BOOT:
@@ -1435,7 +1453,7 @@ static void state_machine(void)
         break;
 
     case ARIADNA_STATE_IDLE: {
-        s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_TEST);
+        s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_TEST | ARIADNA_MST_PYRO_INHIBIT);
         s_cover_open = false;                   // the latch re-engages on the ground
         // Servo connection check when the RBF tag comes out (section 3b).
         static bool rbf_was_out = true;          // no check for a tag already out at boot
@@ -1463,7 +1481,7 @@ static void state_machine(void)
 
     case ARIADNA_STATE_ARMED:
         s_flags |= ARIADNA_MST_ARMED;
-        if (!s_rbf_out) {                       // tag went back in
+        if (!s_hil && !s_rbf_out) {             // tag went back in (real flight)
             s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
             broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
             set_state(ARIADNA_STATE_IDLE);
@@ -1472,8 +1490,10 @@ static void state_machine(void)
         // Launch: the breakwire parts, or the vehicle is simply gone. The
         // second test exists because a breakwire that fails to part is a
         // known failure and it must not strand the state machine on the
-        // pad while the rocket is in the air.
-        if (bw_open || (nav_ok && s_nav.accel_mag > PRM(MST_LAUNCH_G)) ||
+        // pad while the rocket is in the air. In HIL on a bench the physical
+        // breakwire is usually unplugged (HIGH), so launch relies solely on
+        // the synthetic IMU acceleration or altitude.
+        if ((!s_hil && bw_open) || (nav_ok && s_nav.accel_mag > PRM(MST_LAUNCH_G)) ||
             (nav_ok && s_nav.pz > 15.0f)) {
             s_t_launch_ms = millis();
             broadcast_cmd(ARIADNA_CMD_ZERO_CLOCK, 0, s_t_launch_ms);
@@ -1779,6 +1799,10 @@ static bool self_test(void)
 //                                flight log: LOGR <n> <96 bytes hex> lines,
 //                                then OK LOG DUMP <n>; not while logging
 //    FLIGHTARM 1 | 0             arm request when mst.auto_arm = 0 / disarm
+//    HIL 1 [0|1] | HIL 0 | HIL STATUS
+//                                enter / leave Hardware-in-the-Loop flight
+//                                simulation (2nd arg: 1 enables physical pyros,
+//                                requires RBF removed; default 0 = inhibited)
 //    HB                          heartbeat (any line counts)
 //   TEST mode only - the Actuator Console's own commands, unchanged:
 //    PWM <hz>, LIM <ch> <min> <max>, SET <ch> <us>, OFF <ch>|ALL,
@@ -1788,6 +1812,8 @@ static bool self_test(void)
 //    T {..}  actuators, in exactly the Actuator Console's format
 //    M {..}  this board        N {..}  navigation state (Position MCU)
 //    P {..}  Position status   G {..}  guidance / Navigation status
+//  During HIL mode an extra 50 Hz line is emitted every 20 ms:
+//    H {..}  high-rate HIL snapshot (state, nav, actuator commands + servo us)
 // =====================================================================
 
 // ---- parameter store: the W25Q128, not EEPROM -----------------------------
@@ -2215,6 +2241,7 @@ static void usb_service(void)
         s_usb_tail = s_usb_head;
         s_gui_alive = false;
         s_raw_on = false;
+        if (s_hil) hil_leave();
         len = 0;
         return;
     }
@@ -2263,7 +2290,14 @@ static void usb_service(void)
     if (s_gui_alive && millis() - s_gui_last > 1500) {
         s_gui_alive = false;
         if (s_test) pyro_bridge_send(ACTCON_CMD_DISARM, 0, 0, 3);
-        usb_printf("# GUI silent - bench pyros disarmed, servos hold\n");
+        if (s_hil)  hil_leave();
+        if (s_polarity) {
+            s_polarity = false;
+            send_master_state();
+            servos_park();
+            servos_write();
+        }
+        usb_printf("# GUI silent - bench pyros disarmed, HIL/polarity stopped, servos hold\n");
     }
 }
 
@@ -2351,6 +2385,59 @@ static void test_leave(void)
     broadcast_cmd(ARIADNA_CMD_TEST_MODE, 0, 0);
     broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
     set_state(s_post_pass ? ARIADNA_STATE_IDLE : ARIADNA_STATE_ERROR);
+}
+
+/**
+ * Enter Hardware-in-the-Loop flight simulation.
+ *
+ * All three MCUs execute the real flight pipeline (state machine, guidance,
+ * sequencer, PCA9685 servos), fed by synthetic sensor packets injected into
+ * the Position MCU over USB. By default physical pyro channels are inhibited
+ * via ARIADNA_MST_PYRO_INHIBIT unless pyro_en is true (which requires the
+ * hardware RBF pin removed).
+ */
+static void hil_enter(bool pyro_en)
+{
+    if (s_test) test_leave();
+    s_hil      = true;
+    s_hil_pyro = pyro_en;
+    s_cover_open  = false;
+    s_t_launch_ms = 0;
+    s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_TEST | ARIADNA_MST_LOGGING);
+    if (s_hil_pyro) s_flags &= (uint8_t)~ARIADNA_MST_PYRO_INHIBIT;
+    else            s_flags |= ARIADNA_MST_PYRO_INHIBIT;
+
+    // Put both slave MCUs cleanly back on the ground BEFORE broadcasting
+    // DISARM so Navigation_MCU sees on_ground() == true and rewinds guidance,
+    // sequencer events, and s_fired_mask cleanly.
+    set_state(ARIADNA_STATE_IDLE);
+    send_master_state();
+    broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+    broadcast_cmd(ARIADNA_CMD_SET_PAD_REF, 0, 0);
+
+    servos_park();
+    servos_write();
+
+    s_flags |= ARIADNA_MST_ARMED;
+    set_state(ARIADNA_STATE_ARMED);
+    broadcast_cmd(ARIADNA_CMD_ARM, 0, 0);
+    send_master_state();
+}
+
+static void hil_leave(void)
+{
+    if (!s_hil) return;
+    s_hil      = false;
+    s_hil_pyro = false;
+    s_cover_open = false;
+    s_flags &= (uint8_t)~(ARIADNA_MST_ARMED | ARIADNA_MST_PYRO_INHIBIT);
+
+    // Broadcast IDLE/ERROR before DISARM so Navigation_MCU rewinds cleanly.
+    set_state(s_post_pass ? ARIADNA_STATE_IDLE : ARIADNA_STATE_ERROR);
+    send_master_state();
+    broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
+    servos_park();
+    servos_write();
 }
 
 /** Idle-off and the heartbeat to the Navigation MCU's bench pyro logic. */
@@ -2471,6 +2558,10 @@ static void console_line(char *line)
     if (!strcmp(cmd, "TEST")) {
         const bool on = a1 && a1[0] == '1';
         if (on) {
+            if (s_hil) {
+                usb_printf("ERR TEST leave HIL first (send HIL 0)\n");
+                return;
+            }
             if (s_state != ARIADNA_STATE_IDLE && s_state != ARIADNA_STATE_ARMED &&
                 s_state != ARIADNA_STATE_BOOT && s_state != ARIADNA_STATE_ERROR &&
                 s_state != ARIADNA_STATE_TEST) {
@@ -2485,8 +2576,127 @@ static void console_line(char *line)
         }
         return;
     }
+    if (!strcmp(cmd, "HIL")) {
+        if (a1) {
+            for (char *q = a1; *q; q++) *q = (char)toupper((unsigned char)*q);
+        }
+        if (!a1 || !strcmp(a1, "STATUS")) {
+            usb_printf("OK HIL STATUS %d %d %u\n", s_hil ? 1 : 0, s_hil_pyro ? 1 : 0, s_state);
+            return;
+        }
+        if (a1[0] == '0') {
+            hil_leave();
+            usb_printf("OK HIL 0\n");
+            return;
+        }
+        if (a1[0] == '1') {
+            if (s_hil) { usb_printf("ERR HIL already active (send HIL 0 first)\n"); return; }
+            if (!on_ground_state()) {
+                usb_printf("ERR HIL not on the ground (state %u)\n", s_state);
+                return;
+            }
+            if (srvchk_active()) { usb_printf("ERR HIL servo check running\n"); return; }
+            const bool pyro_en = a2 && a2[0] == '1';
+            if (pyro_en && !s_rbf_out) {
+                usb_printf("ERR HIL pyro requires RBF pin removed\n");
+                return;
+            }
+            if (!(s_have_nav && link_alive(s_nav_us))) {
+                usb_printf("ERR HIL Position MCU link down\n");
+                return;
+            }
+            if (!(s_have_act && link_alive(s_act_us))) {
+                usb_printf("ERR HIL Navigation MCU link down\n");
+                return;
+            }
+            if (!(s_nav.flags & ARIADNA_NAV_VALID)) {
+                usb_printf("ERR HIL navigation not valid (stream HIL frames first)\n");
+                return;
+            }
+            if (!params_synced()) {
+                usb_printf("ERR HIL parameters not synced\n");
+                return;
+            }
+            hil_enter(pyro_en);
+            usb_printf("OK HIL 1 %d\n", s_hil_pyro ? 1 : 0);
+            return;
+        }
+        usb_printf("ERR HIL 1 [0|1] | 0 | STATUS\n");
+        return;
+    }
+    if (!strcmp(cmd, "POLARITY")) {
+        if (a1) {
+            for (char *q = a1; *q; q++) *q = (char)toupper((unsigned char)*q);
+        }
+        if (!a1 || !strcmp(a1, "STATUS")) {
+            usb_printf("OK POLARITY STATUS %d %.0f\n", s_polarity ? 1 : 0, (double)s_pol_thrust_n);
+            return;
+        }
+        if (!strcmp(a1, "THRUST")) {
+            if (!a2) {
+                usb_printf("ERR POLARITY THRUST <0|10..250>\n");
+                return;
+            }
+            float v = (float)atof(a2);
+            if (v <= 0.0f) {
+                s_pol_thrust_n = 0.0f;
+            } else {
+                if (v < 10.0f) v = 10.0f;
+                if (v > 250.0f) v = 250.0f;
+                s_pol_thrust_n = v;
+            }
+            if (s_polarity) send_master_state();
+            usb_printf("OK POLARITY THRUST %.0f\n", (double)s_pol_thrust_n);
+            return;
+        }
+        if (a1[0] == '0') {
+            s_polarity = false;
+            send_master_state();
+            if (!s_test && !srvchk_active()) {
+                servos_park();
+                servos_write();
+            }
+            usb_printf("OK POLARITY 0\n");
+            return;
+        }
+        if (a1[0] == '1') {
+            if (s_test) { usb_printf("ERR POLARITY leave TEST first\n"); return; }
+            if (s_hil)  { usb_printf("ERR POLARITY leave HIL first\n"); return; }
+            if (s_state != ARIADNA_STATE_IDLE) {
+                usb_printf("ERR POLARITY only in IDLE (state %u)\n", s_state);
+                return;
+            }
+            if (srvchk_active()) { usb_printf("ERR POLARITY servo check running\n"); return; }
+            if (!(s_have_nav && link_alive(s_nav_us))) {
+                usb_printf("ERR POLARITY Position MCU link down\n");
+                return;
+            }
+            if (!(s_nav.flags & ARIADNA_NAV_IMU_OK)) {
+                usb_printf("ERR POLARITY IMU not ready\n");
+                return;
+            }
+            if (!(s_have_act && link_alive(s_act_us))) {
+                usb_printf("ERR POLARITY Navigation MCU link down\n");
+                return;
+            }
+            if (a2) {
+                float v = (float)atof(a2);
+                if (v <= 0.0f) s_pol_thrust_n = 0.0f;
+                else           s_pol_thrust_n = (v < 10.0f) ? 10.0f : (v > 250.0f ? 250.0f : v);
+            }
+            s_polarity = true;
+            send_master_state();
+            usb_printf("OK POLARITY 1\n");
+            return;
+        }
+        usb_printf("ERR POLARITY 1 [N] | 0 | THRUST <0|10..250> | STATUS\n");
+        return;
+    }
     if (!strcmp(cmd, "SERVOCHECK")) {
-        if (s_state != ARIADNA_STATE_IDLE) { usb_printf("ERR SERVOCHECK only in IDLE (leave TEST first)\n"); return; }
+        if (s_state != ARIADNA_STATE_IDLE || s_polarity) {
+            usb_printf("ERR SERVOCHECK only in IDLE (leave TEST/POLARITY first)\n");
+            return;
+        }
         srvchk_start();
         usb_printf("OK SERVOCHECK\n");
         return;
@@ -2567,7 +2777,9 @@ static void console_line(char *line)
             usb_printf("OK FLIGHTARM requested - arms when RBF is out and navigation is ready\n");
         } else {
             s_arm_request = false;
-            if (s_state == ARIADNA_STATE_ARMED) {
+            if (s_hil) {
+                hil_leave();
+            } else if (s_state == ARIADNA_STATE_ARMED) {
                 s_flags &= (uint8_t)~ARIADNA_MST_ARMED;
                 broadcast_cmd(ARIADNA_CMD_DISARM, 0, 0);
                 set_state(ARIADNA_STATE_IDLE);
@@ -2713,6 +2925,46 @@ static void diag_emit(void)
         if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
         n = 0;
     }
+    if (s_hil) {
+        // H: 50 Hz HIL telemetry snapshot (every 20 ms tick) with nav state,
+        // guidance commands, pyro events/state, and exact PCA9685 servo pulses
+        // for all 8 flight servos [TVC_X, TVC_Y, CLAMP, COVER, FIN_0..3].
+        n = snprintf(b, sizeof(b),
+            "H {\"t\":%lu,\"st\":%u,\"ph\":%u,\"fl\":%u,\"ev\":%u,\"pa\":%u,\"pf\":%u,\"cov\":%d,"
+            "\"p\":[%.2f,%.2f,%.2f],\"v\":[%.2f,%.2f,%.2f],\"q\":[%.4f,%.4f,%.4f,%.4f],"
+            "\"tvc\":[%.2f,%.2f],\"cl\":%.2f,\"fin\":[%.1f,%.1f,%.1f,%.1f],\"afl\":%u,"
+            "\"us\":[%u,%u,%u,%u,%u,%u,%u,%u],"
+            "\"hign\":%.1f,\"thr\":%.1f,\"k\":%.2f,\"tign\":%.2f,\"ttd\":%.2f,"
+            "\"tc\":%.3f,\"te\":%.3f}\n",
+            (unsigned long)millis(), s_state,
+            s_have_nav_status ? s_nav_status.phase : 0u,
+            s_flags,
+            s_have_nav_status ? s_nav_status.events : s_act.events,
+            s_have_nav_status ? s_nav_status.pyro_active : 0u,
+            s_have_nav_status ? s_nav_status.pyro_fired  : 0u,
+            s_cover_open ? 1 : 0,
+            s_nav.px, s_nav.py, s_nav.pz,
+            s_nav.vx, s_nav.vy, s_nav.vz,
+            s_nav.qw, s_nav.qx, s_nav.qy, s_nav.qz,
+            s_act.tvc_x_deg, s_act.tvc_y_deg, s_act.clamp,
+            s_act.fin_deg[0], s_act.fin_deg[1], s_act.fin_deg[2], s_act.fin_deg[3],
+            s_act.flags,
+            counts_to_us(srv_get(SV_TVC_X)), counts_to_us(srv_get(SV_TVC_Y)),
+            counts_to_us(srv_get(SV_CLAMP)), counts_to_us(srv_get(SV_COVER)),
+            counts_to_us(srv_get(SV_FIN_0)),
+            counts_to_us(srv_get((uint8_t)(SV_FIN_0 + 1))),
+            counts_to_us(srv_get((uint8_t)(SV_FIN_0 + 2))),
+            counts_to_us(srv_get((uint8_t)(SV_FIN_0 + 3))),
+            s_have_nav_status ? s_nav_status.h_ignite   : 0.0f,
+            s_have_nav_status ? s_nav_status.thrust_est : 0.0f,
+            s_have_nav_status ? s_nav_status.k_plan     : 0.0f,
+            s_have_nav_status ? s_nav_status.t_to_ign   : -1.0f,
+            s_have_nav_status ? s_nav_status.t_to_td    : -1.0f,
+            s_have_nav_status ? s_nav_status.tilt_cmd   : 0.0f,
+            s_have_nav_status ? s_nav_status.tilt_err   : 0.0f);
+        if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
+        n = 0;
+    }
     switch (which) {
     case 0: {       // T: the Actuator Console's line, key for key
         uint16_t on = 0, us[PCA_N_CH];
@@ -2749,7 +3001,7 @@ static void diag_emit(void)
             "\"rbf\":%d,\"bw\":%d,\"post\":%d,\"servo\":%d,\"flash\":%d,\"lora\":%d,\"log\":%lu,"
             "\"logdrop\":%lu,\"tlm\":[%lu,%lu],\"pos\":[%lu,%lu,%d],\"nav\":[%lu,%lu,%d],"
             "\"pcrc\":%u,\"psync\":%d,\"peep\":%d,\"cover\":%d,\"hl\":%u,\"usbdrop\":%lu,"
-            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.2f,%.3f,%.2f,%u],\"su\":[%u,%u]}\n",
+            "\"bat\":[%u,%.1f,%.1f,%.1f,%u,%.1f,%.0f,%.2f,%.3f,%.2f,%u],\"su\":[%u,%u],\"hil\":%d,\"pol\":%d}\n",
             (unsigned long)millis(), ARIADNA_FW_VERSION, DG_VERSION, s_state, s_flags,
             (unsigned long)s_t_launch_ms, s_vbat, s_current, s_rbf_out ? 1 : 0,
             digitalRead(PIN_BREAKWIRE) == HIGH ? 1 : 0, s_post_pass ? 1 : 0, s_servo_ok ? 1 : 0,
@@ -2764,7 +3016,8 @@ static void diag_emit(void)
             (unsigned)s_batt.status, s_batt.soc_pct, s_batt.minutes, s_batt.v_oc,
             (unsigned)s_batt.win_s, s_batt.t_avg, s_batt.cap_eff_mah, s_batt.i_avg,
             s_batt.learn, s_batt.last_k, (unsigned)s_batt.learn_events,
-            (unsigned)s_su_res, (unsigned)s_su_mask);
+            (unsigned)s_su_res, (unsigned)s_su_mask, s_hil ? (s_hil_pyro ? 2 : 1) : 0,
+            s_polarity ? 1 : 0);
         break;
     case 2:         // N: the navigation state
         n = snprintf(b, sizeof(b),
@@ -2839,8 +3092,12 @@ static void send_master_state(void)
     ms.state       = s_state;
     ms.flags       = s_flags;
     ms.nav_events  = s_act.events;
-    if (s_flash_ok) ms.flags |= ARIADNA_MST_LOGGING;
+    if (s_flash_ok && !s_hil) ms.flags |= ARIADNA_MST_LOGGING;
     if (s_raw_on && on_ground_state()) ms.flags |= ARIADNA_MST_RAW_IMU;
+    if (s_polarity && s_state == ARIADNA_STATE_IDLE) {
+        ms.flags2 |= ARIADNA_MST2_POLARITY_TEST;
+        ms.flags2 |= ariadna_pol_thrust_encode(s_pol_thrust_n);
+    }
     send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
     send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
 }
@@ -2992,10 +3249,11 @@ void loop()
     }
 
     // Flight: every tick. Ground: 10 Hz, while there is more than the
-    // flight reserve left. Not while the log is being read or erased.
+    // flight reserve left. Not while the log is being read or erased, and
+    // not during HIL simulation (the PC records the full HIL trace).
     const bool in_flight = s_state >= ARIADNA_STATE_ASCENT && s_state <= ARIADNA_STATE_LANDED;
     const bool ground_ok = s_log_addr + LOG_FLIGHT_RESERVE < FLASH_SIZE && !log_service_busy();
-    if (s_flash_ok && millis() >= next_log_ms && (in_flight || ground_ok)) {
+    if (s_flash_ok && !s_hil && millis() >= next_log_ms && (in_flight || ground_ok)) {
         next_log_ms = millis() + 1000 / (in_flight ? LOG_HZ_FLIGHT : LOG_HZ_GROUND);
         if (in_flight) next_log_ms = millis();          // every 200 Hz tick
         s_flags |= ARIADNA_MST_LOGGING;

@@ -56,6 +56,8 @@ from daidalos_widgets import (RocketView, TiltBubble, StripChart, PadMap,   # no
 from diag_log import LogTab                            # noqa: E402
 from diag_ignition import IgnitionTab                # noqa: E402
 from diag_calib import CalibTab, parse_srvchk          # noqa: E402
+from diag_hil import HilTab                            # noqa: E402
+import hil_sim as hs                                   # noqa: E402
 
 APP_NAME = "Daidalos · Diagnostika"
 
@@ -72,7 +74,8 @@ NAV_FLAGS = [(0, "VALID"), (1, "BARO"), (2, "IMU"), (3, "MAG"), (4, "GPS fix"), 
              (11, "GPS aided"), (12, "ZUPT"), (13, "UWB aided")]
 SENS_BITS = [(0, "IMU"), (1, "BARO"), (2, "MAG"), (3, "GPS"), (4, "UWB"), (5, "LIDAR"), (6, "INS"),
              (7, "LIDAR povolen")]
-INS_MODES = {0: "žádný", 1: "jen orientace", 2: "bez GPS (coasting)", 3: "plný (GPS)", 255: "nezkompilováno"}
+INS_MODES = {0: "žádný", 1: "jen orientace", 2: "bez GPS (coasting)", 3: "plný (GPS)",
+             254: "HIL simulace", 255: "nezkompilováno"}
 UWB_MODES = {0: "—", 1: "1 kotva (LOS)", 2: "2-D", 3: "3-D"}
 HEALTH_ERR = {1: "POST selhal", 2: "spoj s Position MCU", 3: "spoj s Navigation MCU",
               4: "flash log", 5: "sběrnice serv", 6: "nízká baterie", 7: "parametry nesouhlasí"}
@@ -306,8 +309,8 @@ def crc16(data: bytes) -> int:
 # ---------------------------------------------------------------------------
 class FlightSimBoard(ag.SimBoard):
     """The Actuator Console's simulated board, extended with the flight
-    firmware's diagnostic protocol: TEST mode, the parameter table, and the
-    M / N / P / G status lines of a vehicle standing on the pad."""
+    firmware's diagnostic protocol: TEST mode, HIL simulation mode, the
+    parameter table, and the M / N / P / G / H status lines."""
 
     def __init__(self):
         super().__init__()
@@ -323,12 +326,165 @@ class FlightSimBoard(ag.SimBoard):
         self.srv_t0 = None
         self.srv_last = -1
 
+        # HIL simulation state (emulates Position + Master + Navigation in --demo)
+        import threading
+        self._hil_lock = threading.Lock()
+        self.hil = False
+        self.hil_pyro = False
+        self.polarity = False
+        self._pol_uz = -1.0
+        self._pol_thrust_n = 0.0
+        self._pol_demo_tilt: tuple[float, float, bool] | None = None
+        self.next_h = 0.0
+        self._hil_pos_t = 0.0
+        self._hil_last_t = 0.0
+        self._hil_t = 0.0
+        self._hil_p0 = 97230.0
+        self._hil_lat0 = 49.7985411
+        self._hil_lon0 = 16.6912772
+        self._hil_pos = [0.0, 0.0, 0.0]
+        self._hil_vel = [0.0, 0.0, 0.0]
+        self._hil_acc = [0.0, 0.0, 0.0]
+        self._hil_q = [0.70710678, -0.70710678, 0.0, 0.0]
+        self._hil_w = [0.0, 0.0, 0.0]
+        self._hil_g = 1.0
+        self._hil_lidar_m = 0.0
+        self._hil_lat_1e7 = 497985411
+        self._hil_lon_1e7 = 166912772
+        self._hil_alt_msl = 412.3
+        self._hil_temp = 21.4
+        self._hil_guid: hs.ReferenceGuidance | None = None
+        self._hil_out: dict = self._idle_hil_out()
+
+    @staticmethod
+    def _idle_hil_out() -> dict:
+        return {
+            "mst_state": 1, "nav_phase": 0, "nav_events": 0,
+            "pyro_active": 0, "pyro_fired": 0, "cover_open": 0,
+            "tvc_deg": (0.0, 0.0), "clamp": 1.0,
+            "fin_deg": (0.0, 0.0, 0.0, 0.0), "act_flags": 1,
+            "h_ign": 0.0, "thr_est": 0.0, "k_plan": 1.0,
+            "t_to_ign": -1.0, "t_to_td": -1.0, "tilt_cmd": 0.0, "tilt_err": 0.0,
+        }
+
+    def _hil_servo_us(self, out: dict) -> list[int]:
+        tvc = out.get("tvc_deg", (0.0, 0.0))
+        cl = out.get("clamp", 1.0)
+        cov = out.get("cover_open", 0)
+        fin = out.get("fin_deg", (0.0, 0.0, 0.0, 0.0))
+        return [
+            int(round(1500.0 + tvc[0] * 10.0)),
+            int(round(1500.0 + tvc[1] * 10.0)),
+            int(round(1100.0 + cl * 800.0)),
+            1900 if cov else 1100,
+            int(round(1500.0 + fin[0] * 10.0)),
+            int(round(1500.0 + fin[1] * 10.0)),
+            int(round(1500.0 + fin[2] * 10.0)),
+            int(round(1500.0 + fin[3] * 10.0)),
+        ]
+
+    def _hil_pos_fresh(self, now: float) -> bool:
+        return (now - self._hil_pos_t) < 0.5
+
+    def hil_feed_pos(self, sample: hs.HilSensorSample) -> None:
+        """Emulate Position MCU receiving a binary ARIADNA_PKT_HIL_IN frame,
+        running its estimator, and forwarding nav state to Master + Navigation."""
+        now = time.monotonic()
+        with self._hil_lock:
+            dt = 0.01 if self._hil_last_t <= 0.0 else min(0.05, max(0.002, now - self._hil_last_t))
+            self._hil_last_t = now
+            self._hil_pos_t = now
+
+            if sample.flags & hs.HIL_FLAG_SET_PAD_REF:
+                self._hil_p0 = max(1000.0, float(sample.pressure_pa))
+                self._hil_lat0 = sample.gps_lat_1e7 * 1e-7
+                self._hil_lon0 = sample.gps_lon_1e7 * 1e-7
+            if sample.flags & hs.HIL_FLAG_RESET_EST:
+                self._hil_pos = [0.0, 0.0, 0.0]
+                self._hil_vel = [0.0, 0.0, 0.0]
+                self._hil_acc = [0.0, 0.0, 0.0]
+
+            # Rotate synthetic body-frame IMU into pad-ENU (mirrors ariadna_hil_apply_imu)
+            q = (sample.qw, sample.qx, sample.qy, sample.qz)
+            qn = math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]) or 1.0
+            q = (q[0] / qn, q[1] / qn, q[2] / qn, q[3] / qn)
+            R = hs.rot_from_quat(q)
+            ab = sample.acc_body
+            gb = sample.gyr_body
+            sf_pad = (
+                R[0][0] * ab[0] + R[0][1] * ab[1] + R[0][2] * ab[2],
+                R[1][0] * ab[0] + R[1][1] * ab[1] + R[1][2] * ab[2],
+                R[2][0] * ab[0] + R[2][1] * ab[1] + R[2][2] * ab[2],
+            )
+            a_pad = (sf_pad[0], sf_pad[1], sf_pad[2] - hs.G_ACCEL)
+            w_pad = (
+                R[0][0] * gb[0] + R[0][1] * gb[1] + R[0][2] * gb[2],
+                R[1][0] * gb[0] + R[1][1] * gb[1] + R[1][2] * gb[2],
+                R[2][0] * gb[0] + R[2][1] * gb[1] + R[2][2] * gb[2],
+            )
+            self._hil_q = list(q)
+            self._hil_acc = list(a_pad)
+            self._hil_w = list(w_pad)
+            self._hil_g = math.sqrt(ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]) / hs.G_ACCEL
+            self._hil_lat_1e7 = sample.gps_lat_1e7
+            self._hil_lon_1e7 = sample.gps_lon_1e7
+            self._hil_alt_msl = sample.gps_alt_msl
+            self._hil_temp = sample.temp_c_x10 * 0.1
+            self._hil_lidar_m = sample.lidar_mm * 0.001 if (sample.flags & hs.HIL_FLAG_LIDAR_VALID) else 0.0
+
+            # Lightweight complementary KF (fuses IMU + baro + GPS + lidar)
+            for i in range(3):
+                self._hil_vel[i] += a_pad[i] * dt
+                self._hil_pos[i] += self._hil_vel[i] * dt
+            if sample.flags & hs.HIL_FLAG_BARO_FRESH and sample.pressure_pa > 1000.0:
+                h_baro = 44330.0 * (1.0 - (sample.pressure_pa / max(self._hil_p0, 1000.0)) ** 0.19029495)
+                err_z = h_baro - self._hil_pos[2]
+                self._hil_pos[2] += 0.22 * err_z
+                self._hil_vel[2] += 0.04 * err_z
+            if sample.flags & hs.HIL_FLAG_LIDAR_VALID and sample.lidar_mm > 0:
+                cos_t = abs(R[2][1])
+                if cos_t > 0.7:
+                    h_lid = (sample.lidar_mm * 0.001) * cos_t
+                    self._hil_pos[2] += 0.35 * (h_lid - self._hil_pos[2])
+            if sample.flags & hs.HIL_FLAG_GPS_FRESH:
+                m_lat, m_lon = hs.wgs84_radii(self._hil_lat0)
+                pe = math.radians(sample.gps_lon_1e7 * 1e-7 - self._hil_lon0) * m_lon
+                pn = math.radians(sample.gps_lat_1e7 * 1e-7 - self._hil_lat0) * m_lat
+                self._hil_pos[0] += 0.25 * (pe - self._hil_pos[0])
+                self._hil_pos[1] += 0.25 * (pn - self._hil_pos[1])
+                self._hil_vel[0] += 0.20 * (sample.gps_ve_cms * 0.01 - self._hil_vel[0])
+                self._hil_vel[1] += 0.20 * (sample.gps_vn_cms * 0.01 - self._hil_vel[1])
+            if not self.hil and abs(self._hil_pos[2]) < 0.5 and math.hypot(*a_pad) < 0.8:
+                # Pad ZUPT while waiting for launch
+                for i in range(3):
+                    self._hil_vel[i] *= 0.6
+                    self._hil_pos[i] *= 0.85
+
+            if self.hil and self._hil_guid is not None:
+                self._hil_t += dt
+                b_vec = (R[0][1], R[1][1], R[2][1])
+                g_vec = (R[0][0], R[1][0], R[2][0])
+                out = self._hil_guid.step(
+                    self._hil_t, dt, self._hil_pos, self._hil_vel,
+                    b_vec, g_vec, w_pad, ab[1], pyro_permitted=self.hil_pyro,
+                )
+                self._hil_out = out
+                self.state = out["mst_state"]
+
     def crc(self) -> int:
         import struct
         v = [0.0] * PARAM_ID_MAX
         for p in self.params:
             v[p["id"]] = p["val"]
         return crc16(struct.pack(f"<{PARAM_ID_MAX}f", *v))
+
+    def _hil_leave(self) -> None:
+        with self._hil_lock:
+            self.hil = False
+            self.hil_pyro = False
+            self._hil_guid = None
+            self._hil_out = self._idle_hil_out()
+            self.state = 1
 
     def _cmd(self, line: str) -> None:
         if not line:
@@ -337,14 +493,99 @@ class FlightSimBoard(ag.SimBoard):
         c = p[0].upper()
         if c == "HELLO":
             super()._cmd(line)
-            self.q.put("I DAIDALOS 331 FLIGHT guidance 220 params %d" % len(self.params))
+            self.q.put("I DAIDALOS 332 FLIGHT guidance 220 params %d" % len(self.params))
             return
         if c == "TEST":
-            self.test = len(p) > 1 and p[1] == "1"
+            on = len(p) > 1 and p[1] == "1"
+            if on and self.hil:
+                self.q.put("ERR TEST leave HIL first (send HIL 0)")
+                return
+            self.test = on
             self.state = 10 if self.test else 1
             if not self.test:
                 self.armed_until, self.fire_ch = 0, -1
             self.q.put(f"OK TEST {1 if self.test else 0}")
+            return
+        if c == "HIL":
+            sub = p[1].upper() if len(p) > 1 else "STATUS"
+            if sub == "STATUS":
+                self.q.put(f"OK HIL STATUS {1 if self.hil else 0} {1 if self.hil_pyro else 0} {self.state}")
+                return
+            if sub == "0":
+                self._hil_leave()
+                self.q.put("OK HIL 0")
+                return
+            if sub == "1":
+                if self.hil:
+                    self.q.put("ERR HIL already active (send HIL 0 first)")
+                    return
+                if self.state not in (1, 10):
+                    self.q.put(f"ERR HIL not on the ground (state {self.state})")
+                    return
+                pyro_en = len(p) > 2 and p[2] == "1"
+                with self._hil_lock:
+                    self.test = False
+                    self.polarity = False
+                    self.hil = True
+                    self.hil_pyro = pyro_en
+                    self._hil_t = 0.0
+                    self._hil_guid = hs.ReferenceGuidance(hs.HilConfig())
+                    self._hil_out = self._idle_hil_out()
+                    self._hil_out["mst_state"] = 2
+                    self.state = 2
+                    self.next_h = time.monotonic()
+                self.q.put(f"OK HIL 1 {1 if pyro_en else 0}")
+                return
+            self.q.put("ERR HIL 1 [0|1] | 0 | STATUS")
+            return
+        if c == "POLARITY":
+            sub = p[1].upper() if len(p) > 1 else "STATUS"
+            if sub == "STATUS":
+                self.q.put(f"OK POLARITY STATUS {1 if self.polarity else 0} {self._pol_thrust_n:.0f}")
+                return
+            if sub == "THRUST":
+                if len(p) < 3:
+                    self.q.put("ERR POLARITY THRUST <0|10..250>")
+                    return
+                try:
+                    v = float(p[2])
+                except ValueError:
+                    self.q.put("ERR POLARITY THRUST <0|10..250>")
+                    return
+                self._pol_thrust_n = 0.0 if v <= 0.0 else max(10.0, min(250.0, v))
+                self.q.put(f"OK POLARITY THRUST {self._pol_thrust_n:.0f}")
+                return
+            if sub == "0":
+                self.polarity = False
+                self._pol_demo_tilt = None
+                self.q.put("OK POLARITY 0")
+                return
+            if sub == "1":
+                if self.test:
+                    self.q.put("ERR POLARITY leave TEST first")
+                    return
+                if self.hil:
+                    self.q.put("ERR POLARITY leave HIL first")
+                    return
+                if self.state != 1:
+                    self.q.put(f"ERR POLARITY only in IDLE (state {self.state})")
+                    return
+                if len(p) >= 3:
+                    try:
+                        v = float(p[2])
+                        self._pol_thrust_n = 0.0 if v <= 0.0 else max(10.0, min(250.0, v))
+                    except ValueError:
+                        pass
+                self.polarity = True
+                self.q.put("OK POLARITY 1")
+                return
+            self.q.put("ERR POLARITY 1 [N] | 0 | THRUST <0|10..250> | STATUS")
+            return
+        if c == "POLSIM" and len(p) >= 4:
+            try:
+                self._pol_demo_tilt = (float(p[1]), float(p[2]), p[3] == "1")
+            except ValueError:
+                pass
             return
         if c == "PARAM":
             sub = p[1].upper() if len(p) > 1 else ""
@@ -384,6 +625,8 @@ class FlightSimBoard(ag.SimBoard):
         if c in ("PADREF", "CAL", "FLIGHTARM"):
             if c == "CAL":     # a fresh gyro offset, a little off the last one
                 self.goff = [round(v + random.gauss(0.0, 0.02), 3) for v in self.goff]
+            if c == "FLIGHTARM" and (len(p) < 2 or p[1] == "0") and self.hil:
+                self._hil_leave()
             self.q.put(f"OK {line.upper()}")
             return
         if c in ("SET", "OFF", "IDLE", "LIM", "PWM", "ARM", "FIRE") and not self.test:
@@ -456,6 +699,35 @@ class FlightSimBoard(ag.SimBoard):
             self.q.put("OK LOG ERASING 0")
             self.list_queue.append("OK LOG ERASE")
 
+    def _hil_h_line(self, t: float) -> str:
+        with self._hil_lock:
+            out = dict(self._hil_out)
+            pos = list(self._hil_pos)
+            vel = list(self._hil_vel)
+            q = list(self._hil_q)
+            st = self.state
+            fl = 0x12 | (1 if 2 <= st <= 6 else 0) | (0 if self.hil_pyro else hs.MST_PYRO_INHIBIT)
+        us = self._hil_servo_us(out)
+        tvc = out["tvc_deg"]
+        fin = out["fin_deg"]
+        d = {
+            "t": int(t * 1000), "st": st, "ph": out["nav_phase"], "fl": fl,
+            "ev": out["nav_events"], "pa": out["pyro_active"], "pf": out["pyro_fired"],
+            "cov": out["cover_open"],
+            "p": [round(pos[0], 2), round(pos[1], 2), round(pos[2], 2)],
+            "v": [round(vel[0], 2), round(vel[1], 2), round(vel[2], 2)],
+            "q": [round(q[0], 4), round(q[1], 4), round(q[2], 4), round(q[3], 4)],
+            "tvc": [round(tvc[0], 2), round(tvc[1], 2)],
+            "cl": round(out["clamp"], 2),
+            "fin": [round(fin[0], 1), round(fin[1], 1), round(fin[2], 1), round(fin[3], 1)],
+            "afl": out["act_flags"], "us": us,
+            "hign": round(out["h_ign"], 1), "thr": round(out["thr_est"], 1),
+            "k": round(out["k_plan"], 2), "tign": round(out["t_to_ign"], 2),
+            "ttd": round(out["t_to_td"], 2),
+            "tc": round(out["tilt_cmd"], 3), "te": round(out["tilt_err"], 3),
+        }
+        return "H " + json.dumps(d, separators=(",", ":"))
+
     def readline(self, timeout: float = 0.05):
         now = time.monotonic()
         if self.list_queue:
@@ -473,6 +745,9 @@ class FlightSimBoard(ag.SimBoard):
                 if k >= 8:
                     self.srv_t0 = None
                 return "SRVCHK " + json.dumps(d, separators=(",", ":"))
+        if self.hil and now >= self.next_h:
+            self.next_h = now + 0.02                     # 50 Hz H snapshots, matching Master_MCU.ino
+            return self._hil_h_line(now - self.t0)
         if self.raw and now >= self.next_raw:
             self.next_raw = now + 0.04
             return self._raw(now - self.t0)
@@ -515,43 +790,135 @@ class FlightSimBoard(ag.SimBoard):
 
     def _diag(self, which: int, t: float) -> str:
         crc = self.crc()
-        tilt, az = self._sim_tilt(t)
-        qw, qx, qy, qz = pad_quaternion(tilt, az)
-        # thrust axis u = q applied to board +Y: down on the pad
-        R = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
-             [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
-             [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
-        u = [round(R[i][1], 3) for i in range(3)]
+        now = time.monotonic()
+        with self._hil_lock:
+            pos_hil = self._hil_pos_fresh(now)
+            hil_on = self.hil
+            hil_pyro = self.hil_pyro
+            st = self.state
+            out = dict(self._hil_out)
+            h_pos = list(self._hil_pos)
+            h_vel = list(self._hil_vel)
+            h_acc = list(self._hil_acc)
+            h_q = list(self._hil_q)
+            h_w = list(self._hil_w)
+            h_g = self._hil_g
+            h_lid = self._hil_lidar_m
+            h_lat = self._hil_lat_1e7
+            h_lon = self._hil_lon_1e7
+            h_alt = self._hil_alt_msl
+            h_tmp = self._hil_temp
+            h_p0 = self._hil_p0
+
+        if pos_hil:
+            qw, qx, qy, qz = h_q
+            R = hs.rot_from_quat(h_q)
+            u = [round(R[i][1], 3) for i in range(3)]
+            tilt = math.acos(max(-1.0, min(1.0, abs(R[2][1]))))
+            az = math.atan2(R[1][1], R[0][1])
+        elif self.polarity and self._pol_demo_tilt is not None:
+            tx_deg, ty_deg, nose_down = self._pol_demo_tilt
+            tx, ty = math.radians(tx_deg), math.radians(ty_deg)
+            bz_sign = 1.0 if nose_down else -1.0
+            bx = math.sin(tx)
+            by = math.sin(ty)
+            bz2 = max(0.01, 1.0 - min(0.99, bx * bx + by * by))
+            b_vec = hs._unit((bx, by, bz_sign * math.sqrt(bz2)))
+            g_vec = (1.0, 0.0, 0.0)
+            R = hs.rot_from_bg(b_vec, g_vec)
+            qw, qx, qy, qz = hs.quat_from_rot(R)
+            u = [round(R[i][1], 3) for i in range(3)]
+            tilt = math.acos(max(-1.0, min(1.0, abs(R[2][1]))))
+            az = math.atan2(R[1][1], R[0][1])
+        else:
+            tilt, az = self._sim_tilt(t)
+            qw, qx, qy, qz = pad_quaternion(tilt, az)
+            # thrust axis u = q applied to board +Y: down on the pad
+            R = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+                 [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+                 [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
+            u = [round(R[i][1], 3) for i in range(3)]
+
         if which == 1:
-            d = {"t": int(t * 1000), "fw": 331, "gv": 220, "st": self.state, "fl": 0x12 | (8 if self.test else 0),
+            fl = 0x12 | (8 if self.test else 0)
+            if hil_on:
+                fl |= (1 if 2 <= st <= 6 else 0) | (0 if hil_pyro else hs.MST_PYRO_INHIBIT)
+            d = {"t": int(t * 1000), "fw": 332, "gv": 220, "st": st, "fl": fl,
                  "tl": 0, "vbat": round(7.9 - 0.002 * (t % 100), 2), "i": 0.42, "rbf": 1, "bw": 0, "post": 1,
                  "servo": 1, "flash": 1, "lora": 1, "log": 18432, "logdrop": 0, "tlm": [int(t * 10), 0],
                  "pos": [int(t * 260), 0, 1], "nav": [int(t * 220), 0, 1], "pcrc": crc, "psync": 1,
-                 "peep": 1, "cover": 0, "hl": 0xEF, "usbdrop": 0,
-                 "bat": self._demo_bat(t), "su": [1, 0]}
+                 "peep": 1, "cover": out["cover_open"] if hil_on else 0, "hl": 0xEF, "usbdrop": 0,
+                 "bat": self._demo_bat(t), "su": [1, 0], "hil": (2 if hil_pyro else 1) if hil_on else 0,
+                 "pol": 1 if self.polarity else 0}
             return "M " + json.dumps(d, separators=(",", ":"))
         if which == 2:
-            d = {"p": [round(0.05 * math.sin(t * 0.2), 2), round(0.04 * math.cos(t * 0.17), 2),
-                       round(0.03 * math.sin(t), 2)],
-                 "v": [0.0, 0.0, 0.0], "a": [0.0, 0.0, 0.0],
-                 "q": [round(qw, 4), round(qx, 4), round(qy, 4), round(qz, 4)],
-                 "u": u, "w": [round(0.01 * math.sin(t * 3), 3), 0.0, 0.0],
-                 "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
+            if pos_hil:
+                d = {"p": [round(h_pos[0], 2), round(h_pos[1], 2), round(h_pos[2], 2)],
+                     "v": [round(h_vel[0], 2), round(h_vel[1], 2), round(h_vel[2], 2)],
+                     "a": [round(h_acc[0], 2), round(h_acc[1], 2), round(h_acc[2], 2)],
+                     "q": [round(qw, 4), round(qx, 4), round(qy, 4), round(qz, 4)],
+                     "u": u, "w": [round(h_w[0], 3), round(h_w[1], 3), round(h_w[2], 3)],
+                     "g": round(h_g, 2), "fl": 0x3CF7, "ql": 240, "ok": 1}
+            else:
+                d = {"p": [round(0.05 * math.sin(t * 0.2), 2), round(0.04 * math.cos(t * 0.17), 2),
+                           round(0.03 * math.sin(t), 2)],
+                     "v": [0.0, 0.0, 0.0], "a": [0.0, 0.0, 0.0],
+                     "q": [round(qw, 4), round(qx, 4), round(qy, 4), round(qz, 4)],
+                     "u": u, "w": [round(0.01 * math.sin(t * 3), 3), 0.0, 0.0],
+                     "g": 1.0, "fl": 0x3CF7, "ql": 230, "ok": 1}
             return "N " + json.dumps(d, separators=(",", ":"))
         if which == 3:
-            d = {"ok": 1, "fw": 331, "pcrc": crc, "pseen": len(self.params),
+            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params),
                  "rpy": [0.0, round(90 - math.degrees(tilt), 1), round(math.degrees(az) % 360, 1)],
-                 "lat": 497985411, "lon": 166912772, "galt": 412.3, "sats": 12, "fix": 3, "hdop": 9,
-                 "temp": 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0], "uwbs": [0.14, 0.08],
-                 "trim": 0.21, "lidar": [round(1.2 + 0.01 * math.sin(t), 2), 40], "ins": 3, "att": 1,
-                 "hz": 238, "sens": 0x7F, "ovf": 0, "cal": 1, "rx": [int(t * 10), 0], "pp": 97230}
+                 "lat": h_lat if pos_hil else 497985411,
+                 "lon": h_lon if pos_hil else 166912772,
+                 "galt": round(h_alt, 1) if pos_hil else 412.3, "sats": 12, "fix": 3, "hdop": 9,
+                 "temp": round(h_tmp, 1) if pos_hil else 21.4, "sig": [0.21, 0.05], "uwb": [4, 15, 3, 0],
+                 "uwbs": [0.14, 0.08], "trim": 0.21,
+                 "lidar": [round(h_lid, 2), 40] if pos_hil else [round(1.2 + 0.01 * math.sin(t), 2), 40],
+                 "ins": 254 if pos_hil else 3, "att": 2 if pos_hil else 1,
+                 "hz": 100 if pos_hil else 238, "sens": 0x17F, "ovf": 0, "cal": 1,
+                 "rx": [int(t * 10), 0], "pp": round(h_p0) if pos_hil else 97230}
             return "P " + json.dumps(d, separators=(",", ":"))
-        d = {"ok": 1, "fw": 331, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
-             "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
-             "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
-             "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
-             "tvc": [0.0, 0.0], "cl": 1.0, "fin": [0.0, 0.0, 0.0, 0.0], "afl": 1,
-             "drag": 1.0, "blo": 0.0, "bhi": 0.0}
+        if hil_on:
+            tvc = out["tvc_deg"]
+            fin = out["fin_deg"]
+            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": out["nav_phase"],
+                 "k": round(out["k_plan"], 2), "thr": round(out["thr_est"], 1),
+                 "hign": round(out["h_ign"], 1), "tc": round(out["tilt_cmd"], 3),
+                 "te": round(out["tilt_err"], 3), "roll": 0.0,
+                 "tign": round(out["t_to_ign"], 2), "ttd": round(out["t_to_td"], 2),
+                 "ts": 1.0, "fg": 1.0, "apo": round(self._hil_guid.h_max, 1) if self._hil_guid else 0.0,
+                 "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
+                 "loop": 64, "ovr": 0, "cont": 0x07, "fired": out["pyro_fired"],
+                 "act": out["pyro_active"], "nfl": 0x2F, "ev": out["nav_events"],
+                 "tvc": [round(tvc[0], 2), round(tvc[1], 2)], "cl": round(out["clamp"], 2),
+                 "fin": [round(fin[0], 1), round(fin[1], 1), round(fin[2], 1), round(fin[3], 1)],
+                 "afl": out["act_flags"], "drag": 1.0, "blo": 0.0, "bhi": 0.0}
+        elif self.polarity:
+            b_vec = (R[0][1], R[1][1], R[2][1])
+            g_vec = (R[0][0], R[1][0], R[2][0])
+            pol = hs.polarity_step(b_vec, g_vec, (0.0, 0.0, 0.0),
+                                   uz_hint=self._pol_uz, ref_thrust_n=self._pol_thrust_n)
+            self._pol_uz = pol["uz"]
+            tvc = pol["tvc_deg"]
+            fin = pol["fin_deg"]
+            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0,
+                 "thr": round(pol["ref_thrust_n"], 1),
+                 "hign": 0.0, "tc": 0.0, "te": round(pol["tilt_err"], 3), "roll": round(pol["roll_rate"], 2),
+                 "tign": -1.0, "ttd": -1.0, "ts": 1.0, "fg": 1.0, "apo": 0.0, "res": 0.0,
+                 "rx": [int(t * 240), 0], "plan": int(t * 200), "loop": 64, "ovr": 0, "cont": 0x07,
+                 "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
+                 "tvc": [round(tvc[0], 2), round(tvc[1], 2)], "cl": 1.0,
+                 "fin": [round(fin[0], 1), round(fin[1], 1), round(fin[2], 1), round(fin[3], 1)],
+                 "afl": 3, "drag": 1.0, "blo": 0.0, "bhi": 0.0}
+        else:
+            d = {"ok": 1, "fw": 332, "pcrc": crc, "pseen": len(self.params), "ph": 0, "k": 1.0, "thr": 0.0,
+                 "hign": 0.0, "tc": 0.0, "te": 0.0, "roll": 0.0, "tign": -1.0, "ttd": -1.0, "ts": 1.0,
+                 "fg": 1.0, "apo": 0.0, "res": 0.0, "rx": [int(t * 240), 0], "plan": int(t * 200),
+                 "loop": 64, "ovr": 0, "cont": 0x07, "fired": 0, "act": 0, "nfl": 0x2F, "ev": 0,
+                 "tvc": [0.0, 0.0], "cl": 1.0, "fin": [0.0, 0.0, 0.0, 0.0], "afl": 1,
+                 "drag": 1.0, "blo": 0.0, "bhi": 0.0}
         return "G " + json.dumps(d, separators=(",", ":"))
 
 
@@ -679,6 +1046,9 @@ class DiagWindow(ag.MainWindow):
         outer = root.layout()
         act_scroll = outer.itemAt(1).widget()
         outer.removeWidget(act_scroll)
+        act_body = act_scroll.widget()
+        if act_body is not None and act_body.layout() is not None:
+            act_body.layout().insertWidget(0, self._build_polarity_card())
         outer.addWidget(self._build_diag_bar())
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -694,6 +1064,8 @@ class DiagWindow(ag.MainWindow):
         self.tabs.addTab(self._scroll(self.ign_tab), "Zážeh a LandSim")
         self.log_tab = LogTab(self)
         self.tabs.addTab(self._scroll(self.log_tab), "Letový záznam")
+        self.hil_tab = HilTab(self)
+        self.tabs.addTab(self._scroll(self.hil_tab), "HIL simulace")
         outer.addWidget(self.tabs, 1)
         self.tabs.setStyleSheet(
             f"QTabBar::tab {{ padding: 8px 18px; color: {ag.C['muted']}; border: none; }}"
@@ -731,7 +1103,11 @@ class DiagWindow(ag.MainWindow):
         self.chip_fw = chip("Firmware: —")
         self.chip_sync = chip("Parametry: —")
         self.chip_err = chip("Chyby: —")
-        for c_ in (self.chip_state, self.chip_fw, self.chip_sync, self.chip_err):
+        self.chip_hil = chip("")
+        self.chip_hil.setVisible(False)
+        self.chip_pol = chip("")
+        self.chip_pol.setVisible(False)
+        for c_ in (self.chip_state, self.chip_fw, self.chip_sync, self.chip_err, self.chip_hil, self.chip_pol):
             lay.addWidget(c_)
         lay.addStretch(1)
         self.test_btn = button("TEST režim", "primary",
@@ -777,6 +1153,207 @@ class DiagWindow(ag.MainWindow):
         on = self.test_btn.isChecked()
         self._cmd(f"TEST {1 if on else 0}")
 
+    # ------------------------------------------------------------ polarity test card
+    def _build_polarity_card(self) -> QtWidgets.QWidget:
+        c, cl = card(
+            "Test směru TVC a křidélek (polarita)",
+            "Čte reálný náklon z IMU Position MCU. TVC se naklání jako při přistání na 0° náklon, "
+            "křidélka jako při startu na 0° náklon (+ tlumení rollu). Pyro je po celou dobu VYPNUTO.",
+        )
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(10)
+        self.pol_btn = button(
+            "Spustit test směru TVC + křidélek", "primary",
+            "Zapne/vypne režim POLARITY (vyžaduje stav IDLE, mimo TEST/HIL). "
+            "Nakloň raketu rukou a ověř, že TVC i křidélka tlačí raketu zpět do svislé polohy 0°.",
+        )
+        self.pol_btn.setCheckable(True)
+        self.pol_btn.clicked.connect(self._toggle_polarity)
+        self.pol_chip = chip("NEAKTIVNÍ")
+        self.pol_orient_chip = chip("Orientace: —")
+        top.addWidget(self.pol_btn)
+        top.addWidget(self.pol_chip)
+        top.addWidget(self.pol_orient_chip)
+        top.addStretch(1)
+        cl.addLayout(top)
+
+        self._pol_default_thrust = hs.pol_ref_thrust()
+        self._pol_thrust_custom = False
+        self._pol_thr_timer = QtCore.QTimer(self)
+        self._pol_thr_timer.setSingleShot(True)
+        self._pol_thr_timer.setInterval(60)
+        self._pol_thr_timer.timeout.connect(self._send_pol_thrust)
+
+        thr_row = QtWidgets.QHBoxLayout()
+        thr_row.setSpacing(10)
+        thr_lbl_title = QtWidgets.QLabel("Referenční tah TVC:")
+        thr_lbl_title.setToolTip(
+            "Tah použitý pro výpočet výchylky TVC při testu polarity (10–250 N). "
+            "Výchozí hodnota je průměr průměrného a mediánového tahu z referenční křivky."
+        )
+        self.pol_thr_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.pol_thr_slider.setRange(10, 250)
+        self.pol_thr_slider.setSingleStep(2)
+        self.pol_thr_slider.setPageStep(10)
+        self.pol_thr_slider.setValue(int(round(self._pol_default_thrust)))
+        self.pol_thr_slider.setFixedWidth(220)
+        self.pol_thr_lbl = QtWidgets.QLabel(f"{self._pol_default_thrust:.1f} N (výchozí)")
+        self.pol_thr_lbl.setMinimumWidth(130)
+        self.pol_thr_reset = button(
+            "Výchozí", "",
+            f"Vrátí referenční tah na výchozí hodnotu ({self._pol_default_thrust:.1f} N).",
+        )
+        self.pol_thr_reset.clicked.connect(self._reset_pol_thrust)
+        self.pol_thr_slider.valueChanged.connect(self._on_pol_thrust_changed)
+        thr_row.addWidget(thr_lbl_title)
+        thr_row.addWidget(self.pol_thr_slider)
+        thr_row.addWidget(self.pol_thr_lbl)
+        thr_row.addWidget(self.pol_thr_reset)
+        thr_row.addStretch(1)
+        cl.addLayout(thr_row)
+
+        self.pol_kv = KV([
+            "Reálný náklon",
+            "Úhlová rychlost roll",
+            "TVC (přistání → 0°)",
+            "Křidélka F1–F4 (start → 0°)",
+        ])
+        cl.addWidget(self.pol_kv)
+
+        hint = QtWidgets.QLabel(
+            "Ověření rukou: nakloň raketu — tryska TVC i křidélka se musí vychýlit tak, aby vracely "
+            "raketu do svislé polohy 0°; při otočení kolem podélné osy musí všechna 4 křidélka brzdit rotaci."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {ag.C['muted']}; font-size: 11px;")
+        cl.addWidget(hint)
+
+        # Demo-only tilt controls (hidden on real hardware)
+        self.pol_demo_box = QtWidgets.QWidget()
+        dl = QtWidgets.QHBoxLayout(self.pol_demo_box)
+        dl.setContentsMargins(0, 4, 0, 0)
+        dl.setSpacing(10)
+        dl.addWidget(QtWidgets.QLabel("DEMO náklon X:"))
+        self.pol_sx = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.pol_sx.setRange(-25, 25)
+        self.pol_sx.setValue(0)
+        self.pol_sx.setFixedWidth(130)
+        self.pol_sx_lbl = QtWidgets.QLabel("0°")
+        self.pol_sx_lbl.setFixedWidth(36)
+        dl.addWidget(self.pol_sx)
+        dl.addWidget(self.pol_sx_lbl)
+        dl.addWidget(QtWidgets.QLabel("Y:"))
+        self.pol_sy = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.pol_sy.setRange(-25, 25)
+        self.pol_sy.setValue(0)
+        self.pol_sy.setFixedWidth(130)
+        self.pol_sy_lbl = QtWidgets.QLabel("0°")
+        self.pol_sy_lbl.setFixedWidth(36)
+        dl.addWidget(self.pol_sy)
+        dl.addWidget(self.pol_sy_lbl)
+        self.pol_down_chk = QtWidgets.QCheckBox("Špičkou dolů (přistání)")
+        dl.addWidget(self.pol_down_chk)
+        dl.addStretch(1)
+        self.pol_sx.valueChanged.connect(self._send_pol_demo)
+        self.pol_sy.valueChanged.connect(self._send_pol_demo)
+        self.pol_down_chk.toggled.connect(self._send_pol_demo)
+        self.pol_demo_box.setVisible(False)
+        cl.addWidget(self.pol_demo_box)
+        return c
+
+    def _on_pol_thrust_changed(self, val: int) -> None:
+        self._pol_thrust_custom = True
+        self.pol_thr_lbl.setText(f"{val} N")
+        self._pol_thr_timer.start()
+
+    def _reset_pol_thrust(self) -> None:
+        self._pol_thrust_custom = False
+        self.pol_thr_slider.blockSignals(True)
+        self.pol_thr_slider.setValue(int(round(self._pol_default_thrust)))
+        self.pol_thr_slider.blockSignals(False)
+        self.pol_thr_lbl.setText(f"{self._pol_default_thrust:.1f} N (výchozí)")
+        self._send_pol_thrust()
+
+    def _send_pol_thrust(self) -> None:
+        if self.link.is_open and self.flight_fw:
+            arg = self.pol_thr_slider.value() if self._pol_thrust_custom else 0
+            self.link.send(f"POLARITY THRUST {arg}")
+
+    def _toggle_polarity(self) -> None:
+        on = self.pol_btn.isChecked()
+        if on:
+            arg = self.pol_thr_slider.value() if self._pol_thrust_custom else 0
+            self._cmd(f"POLARITY 1 {arg}")
+            if self.port_box.currentData() == "DEMO":
+                self._send_pol_demo()
+        else:
+            self._cmd("POLARITY 0")
+
+    def _send_pol_demo(self) -> None:
+        tx = self.pol_sx.value()
+        ty = self.pol_sy.value()
+        down = 1 if self.pol_down_chk.isChecked() else 0
+        self.pol_sx_lbl.setText(f"{tx:+d}°")
+        self.pol_sy_lbl.setText(f"{ty:+d}°")
+        if self.link.is_open and self.port_box.currentData() == "DEMO":
+            self.link.send(f"POLSIM {tx} {ty} {down}")
+
+    def _refresh_polarity(self, M: dict, N: dict, G: dict, hil_mode: int) -> None:
+        pol_on = bool(M.get("pol", 0)) if M else False
+        st = M.get("st", 0) if M else 0
+        can_run = (self.link.is_open and self.flight_fw and hil_mode == 0
+                   and not self.test_on and st == 1)
+        self.pol_btn.blockSignals(True)
+        self.pol_btn.setChecked(pol_on)
+        self.pol_btn.setText("Zastavit test směru" if pol_on else "Spustit test směru TVC + křidélek")
+        self.pol_btn.setEnabled(can_run or pol_on)
+        self.pol_btn.blockSignals(False)
+
+        if pol_on:
+            set_chip(self.pol_chip, "AKTIVNÍ · pyro VYPNUTO", "warn")
+        else:
+            set_chip(self.pol_chip, "NEAKTIVNÍ", "")
+
+        is_demo = self.link.is_open and self.port_box.currentData() == "DEMO"
+        self.pol_demo_box.setVisible(is_demo and pol_on)
+
+        u = N.get("u") if N else None
+        if u and len(u) == 3:
+            uz = float(u[2])
+            if uz >= 0.0:
+                set_chip(self.pol_orient_chip, "Špičkou DOLŮ (přistání / TVC)", "ok")
+            else:
+                set_chip(self.pol_orient_chip, "Špičkou NAHORU (start / křidélka)", "ok")
+        else:
+            set_chip(self.pol_orient_chip, "Orientace: —", "")
+
+        if N and N.get("q"):
+            a = attitude_summary(*N["q"])
+            self.pol_kv.set(
+                "Reálný náklon",
+                f"{a['tilt']:.1f}°  (azimut {a['tilt_az']:.0f}°, {'špička nahoru' if a['nose_up'] else 'špička dolů'})",
+                GOOD if a["tilt"] < 4 else (WARN if a["tilt"] < 15 else BAD),
+            )
+        else:
+            self.pol_kv.set("Reálný náklon", "—", DIM)
+
+        if G and G.get("ok"):
+            rr = math.degrees(float(G.get("roll", 0.0)))
+            self.pol_kv.set("Úhlová rychlost roll", f"{rr:+.1f} °/s")
+            tvc = G.get("tvc", [0.0, 0.0])
+            fin = G.get("fin", [0.0, 0.0, 0.0, 0.0])
+            self.pol_kv.set("TVC (přistání → 0°)", f"X: {tvc[0]:+.2f}°   Y: {tvc[1]:+.2f}°",
+                            WARN if pol_on and (abs(tvc[0]) > 0.2 or abs(tvc[1]) > 0.2) else None)
+            self.pol_kv.set(
+                "Křidélka F1–F4 (start → 0°)",
+                f"F1:{fin[0]:+.1f}°  F2:{fin[1]:+.1f}°  F3:{fin[2]:+.1f}°  F4:{fin[3]:+.1f}°",
+                WARN if pol_on and any(abs(v) > 0.2 for v in fin) else None,
+            )
+        else:
+            self.pol_kv.set("Úhlová rychlost roll", "—", DIM)
+            self.pol_kv.set("TVC (přistání → 0°)", "—", DIM)
+            self.pol_kv.set("Křidélka F1–F4 (start → 0°)", "—", DIM)
+
     def toggle_record(self) -> None:
         if self.rec_file:
             self.rec_file.close()
@@ -808,7 +1385,7 @@ class DiagWindow(ag.MainWindow):
                    "Kontrola po startu", "Proud", "RBF", "Breakwire", "PCA9685", "Flash log", "LoRa", "Spoj Position", "Spoj Navigation", "Aerokryt",
                    "USB zahozeno"]),
             "P": ("Position MCU", "XIAO RP2350 · senzory, odhad polohy",
-                  ["Online", "Firmware", "Parametry", "Senzory", "Orientace", "Fúze Hz",
+                  ["Online", "Firmware", "Parametry", "Senzory", "Lidar kvalita", "Orientace", "Fúze Hz",
                    "IMU přetečení", "Kalibrace", "Rx Master"]),
             "G": ("Navigation MCU", "XIAO RP2350 · navedení, pyro, řízení",
                   ["Online", "Firmware", "Parametry", "Fáze", "Smyčka max", "Přetečení",
@@ -1379,12 +1956,22 @@ class DiagWindow(ag.MainWindow):
             self.raw_btn.setChecked(False)
             self.raw_btn.blockSignals(False)
             self.raw_btn.setText("Zapnout surová data")
+        if hasattr(self, "hil_tab"):
+            self.hil_tab.on_master_link_state(up)
         if up:
             QtCore.QTimer.singleShot(500, lambda: self.link.is_open and self.link.send("PARAM LIST"))
 
     def on_line(self, line: str) -> None:
         if self.rec_writer:
             self.rec_writer.writerow([f"{time.time():.3f}", line[:1], line])
+        if line.startswith("H {"):
+            try:
+                hd = json.loads(line[2:])
+            except ValueError:
+                hd = None
+            if hd is not None and hasattr(self, "hil_tab"):
+                self.hil_tab.on_h_line(hd)
+            return
         if len(line) > 2 and line[0] in "MNPGR" and line[1] == " " and line[2] == "{":
             try:
                 self.d[line[0]] = json.loads(line[2:])
@@ -1441,6 +2028,9 @@ class DiagWindow(ag.MainWindow):
             self.send_limits()
         elif line.startswith("OK TEST 0"):
             self.test_on = False
+        elif line.startswith(("OK HIL", "ERR HIL")):
+            if hasattr(self, "hil_tab"):
+                self.hil_tab.on_master_hil_reply(line)
         elif line.startswith("OK RAW"):
             on = line.strip().endswith("1")
             self.raw_btn.blockSignals(True)
@@ -1600,8 +2190,24 @@ class DiagWindow(ag.MainWindow):
                                       "počkejte pár sekund; trvá-li to, restartujte desky. Bez shody NELZE zastrčit."))
             if self.param_edits:
                 problems.append((WARN, f"{len(self.param_edits)} upravených parametrů není odeslaných."))
+        hil_mode = int(M.get("hil", 0)) if M else 0
+        pol_on = bool(M.get("pol", 0)) if M else False
+        if hil_mode == 1:
+            self.chip_hil.setVisible(True)
+            set_chip(self.chip_hil, "HIL AKTIVNÍ (pyro blokováno)", "warn")
+        elif hil_mode == 2:
+            self.chip_hil.setVisible(True)
+            set_chip(self.chip_hil, "HIL AKTIVNÍ · PYRO ŽIVÉ!", "bad")
+        else:
+            self.chip_hil.setVisible(False)
+        if pol_on:
+            self.chip_pol.setVisible(True)
+            set_chip(self.chip_pol, "TEST SMĚRU (POLARITA · pyro OFF)", "warn")
+        else:
+            self.chip_pol.setVisible(False)
         self.test_btn.setChecked(bool(self.test_on and self.flight_fw))
-        self.test_btn.setEnabled(self.link.is_open and self.flight_fw)
+        self.test_btn.setEnabled(self.link.is_open and self.flight_fw and hil_mode == 0 and not pol_on)
+        self._refresh_polarity(M, N, G, hil_mode)
 
         # ---- boards
         kv = self.board_kv["M"]
@@ -1656,8 +2262,32 @@ class DiagWindow(ag.MainWindow):
             pc_ok = M and P.get("pcrc") == M.get("pcrc")
             kv.set("Parametry", f"{P.get('pseen', 0)} přijato, CRC {P.get('pcrc', 0):04X}", GOOD if pc_ok else WARN)
             kv.set("Senzory", " ".join(n for b, n in SENS_BITS if P.get("sens", 0) & (1 << b)) or "—")
-            kv.set("Orientace", "INSLIB " + INS_MODES.get(P.get("ins", 255), "?") if P.get("att") else
-                   "TriSense fúze")
+            sens = P.get("sens", 0)
+            li = P.get("lidar", [0.0, 0])
+            l_ans = bool(sens & (1 << 5))
+            l_gate = bool(sens & (1 << 7))
+            l_valid = bool(sens & (1 << 8))
+            l_sat = bool(sens & (1 << 9))
+            l_str = int(li[1]) * 256 if len(li) > 1 else 0
+            if not l_ans:
+                kv.set("Lidar kvalita", "neodpovídá", WARN)
+            elif l_sat:
+                kv.set("Lidar kvalita", "NEKVALITNÍ · přesyceno (nepoužívá se)", WARN)
+            elif l_valid:
+                kv.set("Lidar kvalita",
+                       f"OK · {li[0]:.2f} m · signál ~{l_str} ({'fúze' if l_gate else 'čeká na nohy'})",
+                       GOOD)
+            else:
+                kv.set("Lidar kvalita",
+                       f"NEKVALITNÍ · slabý signál (~{l_str}) / mimo rozsah (nepoužívá se)",
+                       WARN)
+            att_src = P.get("att", 0)
+            if att_src == 2:
+                kv.set("Orientace", "HIL simulace (USB vstup)", WARN)
+            elif att_src == 1:
+                kv.set("Orientace", "INSLIB " + INS_MODES.get(P.get("ins", 255), "?"))
+            else:
+                kv.set("Orientace", "TriSense fúze")
             kv.set("Fúze Hz", fmt(P.get("hz"), 0, "Hz"), GOOD if P.get("hz", 0) > 200 else WARN)
             kv.set("IMU přetečení", str(P.get("ovf", 0)), WARN if P.get("ovf") else GOOD)
             kv.set("Kalibrace", {0: "nekalibrováno", 1: "gyro", 2: "gyro + znovu", 3: "plná"}.get(P.get("cal", 0), "?"))
@@ -1732,8 +2362,15 @@ class DiagWindow(ag.MainWindow):
             self.att_kv.set("Pitch / heading", f"{a['pitch']:.1f}° / {a['heading']:.0f}°")
             w = N.get("w", [0, 0, 0])
             self.att_kv.set("Úhlové rychlosti", " ".join(f"{math.degrees(x):+.1f}" for x in w) + " °/s")
-            self.att_kv.set("Zdroj orientace", ("INSLIB · " + INS_MODES.get(P.get("ins", 255), "?"))
-                            if P and P.get("att") else ("TriSense fúze" if P else "—"))
+            att_src = P.get("att", 0) if P else None
+            if att_src == 2:
+                self.att_kv.set("Zdroj orientace", "HIL simulace (USB vstup)", WARN)
+            elif att_src == 1:
+                self.att_kv.set("Zdroj orientace", "INSLIB · " + INS_MODES.get(P.get("ins", 255), "?"))
+            elif P:
+                self.att_kv.set("Zdroj orientace", "TriSense fúze")
+            else:
+                self.att_kv.set("Zdroj orientace", "—")
         else:
             self.rocket.set_quaternion(1, 0, 0, 0, valid=False)
             self.bubble.set_tilt(0, 0, False)
@@ -1798,8 +2435,15 @@ class DiagWindow(ag.MainWindow):
             self.sens_kv.set("Baro trim", fmt(P.get("trim"), 2, "m"), WARN if abs(P.get("trim", 0)) > 1.4 else None)
             self.sens_kv.set("Pad tlak", fmt(P.get("pp"), 0, "Pa"))
             li = P.get("lidar", [0, 0])
-            self.sens_kv.set("Lidar", f"{li[0]:.2f} m, signál {li[1] * 256}" if li[0] else "neodpovídá / mimo rozsah",
-                             GOOD if li[0] else WARN)
+            sens_p = P.get("sens", 0)
+            if not (sens_p & (1 << 5)):
+                self.sens_kv.set("Lidar", "neodpovídá", WARN)
+            elif sens_p & (1 << 9):
+                self.sens_kv.set("Lidar", f"{li[0]:.2f} m · NEKVALITNÍ (přesyceno, nepoužívá se)", WARN)
+            elif sens_p & (1 << 8):
+                self.sens_kv.set("Lidar", f"{li[0]:.2f} m · OK (signál ~{li[1] * 256})", GOOD)
+            else:
+                self.sens_kv.set("Lidar", f"{li[0]:.2f} m · NEKVALITNÍ (signál ~{li[1] * 256}, nepoužívá se)", WARN)
             self.sens_kv.set("Teplota", fmt(P.get("temp"), 1, "°C"))
             self.sens_kv.set("INS (INSLIB)", INS_MODES.get(P.get("ins", 255), "?"))
             self.sens_flags.set(P.get("sens", 0), bad_when_off=(0, 1))
@@ -1823,13 +2467,18 @@ class DiagWindow(ag.MainWindow):
             self.problems.addItem(it)
         set_chip(self.chip_err, f"Chyby: {nbad} · varování: {nwarn}",
                  "bad" if nbad else ("warn" if nwarn else ("ok" if self.link.is_open else "")))
-        self.farm_btn.setEnabled(bool(M) and M.get("st") == 1)
+        self.farm_btn.setEnabled(bool(M) and M.get("st") == 1 and hil_mode == 0 and not pol_on)
 
     def closeEvent(self, e):
+        if hasattr(self, "hil_tab"):
+            self.hil_tab.shutdown()
         if self.rec_file:
             self.rec_file.close()
-        if self.test_on and self.link.is_open:
-            self.link.send("TEST 0")
+        if self.link.is_open:
+            if self.d.get("M", {}).get("pol"):
+                self.link.send("POLARITY 0")
+            if self.test_on:
+                self.link.send("TEST 0")
         super().closeEvent(e)
 
 
@@ -1842,13 +2491,19 @@ def main() -> int:
     ap.add_argument("--tab", type=int, default=0, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
+    ag.set_windows_app_id("VoltinoLabs.Daidalos.Diagnostika")
     QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    icon = ag.load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     ag.pick_font(app)
     app.setStyleSheet(ag.QSS)
     win = DiagWindow(args.config, args.demo, args.port)
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     win.show()
     if args.screenshot:
         win.tabs.setCurrentIndex(args.tab)

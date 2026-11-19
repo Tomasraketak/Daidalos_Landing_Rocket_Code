@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   331   // 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   332   // 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -143,7 +143,8 @@ typedef enum {
     ARIADNA_PKT_MASTER_STATE = 0x30,  // Master -> Position, Navigation
     ARIADNA_PKT_CMD          = 0x31,  // Master -> Position, Navigation
     ARIADNA_PKT_PARAM        = 0x32,  // Master -> Position, Navigation (ground only)
-    ARIADNA_PKT_TELEMETRY    = 0x40   // Master -> LoRa -> Ground Station
+    ARIADNA_PKT_TELEMETRY    = 0x40,  // Master -> LoRa -> Ground Station
+    ARIADNA_PKT_HIL_IN       = 0x50   // PC -> Position MCU (USB CDC HIL sensor frame)
 } ariadna_pkt_t;
 
 // ---------------------------------------------------------------------
@@ -395,8 +396,10 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_nav_status_t) == 92, "nav_status layout cha
 #define ARIADNA_SENS_GPS       (1u << 3)
 #define ARIADNA_SENS_UWB       (1u << 4)
 #define ARIADNA_SENS_LIDAR     (1u << 5)   // TF Luna answering on I2C
-#define ARIADNA_SENS_INS       (1u << 6)   // INSLIB filter running
+#define ARIADNA_SENS_INS        (1u << 6)  // INSLIB filter running
 #define ARIADNA_SENS_LIDAR_GATE (1u << 7)  // legs open long enough: the lidar may be fused
+#define ARIADNA_SENS_LIDAR_VALID (1u << 8) // TF-Luna isValid() + range plausible (quality OK)
+#define ARIADNA_SENS_LIDAR_SAT  (1u << 9)  // TF-Luna signal saturated (0xFFFF)
 
 /**
  * Position MCU housekeeping and telemetry, 20 Hz.
@@ -455,7 +458,7 @@ typedef struct {
     uint16_t fw_version;     // ARIADNA_FW_VERSION of this board
     uint16_t param_crc;      // CRC of the parameter table this board holds
     uint8_t  ins_mode;       // INSLIB: 0 none, 1 attitude, 2 coasting, 3 full; 255 = not built
-    uint8_t  att_src;        // 0 TriSense fusion, 1 INSLIB
+    uint8_t  att_src;        // 0 TriSense fusion, 1 INSLIB, 2 HIL synthetic
     uint8_t  lidar_strength; // signal strength / 256, saturating
     uint8_t  params_seen;    // how many distinct parameters have arrived
 } ariadna_pos_status_t;
@@ -493,13 +496,37 @@ typedef struct {
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_raw_imu_t) == 88, "raw_imu layout changed");
 
 // --- ariadna_master_state_t.flags ------------------------------------
-#define ARIADNA_MST_ARMED      (1u << 0)   // RBF removed and software armed
-#define ARIADNA_MST_RBF_OUT    (1u << 1)   // Remove-Before-Flight pin pulled
-#define ARIADNA_MST_BREAKWIRE  (1u << 2)   // breakwire broken -> launch detected
-#define ARIADNA_MST_TEST       (1u << 3)   // test mode, pyros inhibited
-#define ARIADNA_MST_LOGGING    (1u << 4)   // flash log is running
-#define ARIADNA_MST_ABORT      (1u << 5)
-#define ARIADNA_MST_RAW_IMU    (1u << 6)   // GUI asks the Position MCU for ariadna_raw_imu_t
+#define ARIADNA_MST_ARMED        (1u << 0)   // RBF removed and software armed
+#define ARIADNA_MST_RBF_OUT      (1u << 1)   // Remove-Before-Flight pin pulled
+#define ARIADNA_MST_BREAKWIRE    (1u << 2)   // breakwire broken -> launch detected
+#define ARIADNA_MST_TEST         (1u << 3)   // test mode, pyros inhibited
+#define ARIADNA_MST_LOGGING      (1u << 4)   // flash log is running
+#define ARIADNA_MST_ABORT        (1u << 5)
+#define ARIADNA_MST_RAW_IMU      (1u << 6)   // GUI asks the Position MCU for ariadna_raw_imu_t
+#define ARIADNA_MST_PYRO_INHIBIT (1u << 7)   // HIL safe mode: guidance/sequencer run, physical pyros inhibited
+
+// --- ariadna_master_state_t.flags2 -----------------------------------
+#define ARIADNA_MST2_POLARITY_TEST    (1u << 0) // bench TVC+fin polarity check on real IMU attitude (pyros OFF)
+#define ARIADNA_MST2_POL_THRUST_SHIFT 1u        // bits 1..7: 0 = default avg(mean, median); 1..121 -> 10..250 N (2 N step)
+#define ARIADNA_MST2_POL_THRUST_MASK  0xFEu
+
+static inline uint8_t ariadna_pol_thrust_encode(float thrust_n)
+{
+    if (thrust_n <= 0.0f) return 0u;
+    if (thrust_n < 10.0f) thrust_n = 10.0f;
+    if (thrust_n > 250.0f) thrust_n = 250.0f;
+    int code = (int)((thrust_n - 10.0f) * 0.5f + 0.5f) + 1;
+    if (code < 1) code = 1;
+    if (code > 121) code = 121;
+    return (uint8_t)((uint8_t)code << ARIADNA_MST2_POL_THRUST_SHIFT);
+}
+
+static inline float ariadna_pol_thrust_decode(uint8_t flags2)
+{
+    uint8_t code = (uint8_t)((flags2 & ARIADNA_MST2_POL_THRUST_MASK) >> ARIADNA_MST2_POL_THRUST_SHIFT);
+    if (code == 0u || code > 121u) return 0.0f;
+    return 10.0f + 2.0f * (float)(code - 1u);
+}
 
 /** Master flight state machine. Broadcast to both XIAOs at 10 Hz. */
 typedef struct {
@@ -510,7 +537,7 @@ typedef struct {
     uint8_t  state;        // ariadna_state_t
     uint8_t  flags;        // ARIADNA_MST_* bits
     uint8_t  nav_events;   // ARIADNA_EV_* from the Navigation MCU (legs open -> lidar)
-    uint8_t  _pad;
+    uint8_t  flags2;       // ARIADNA_MST2_* bits
 } ariadna_master_state_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_master_state_t) == 16, "master_state layout changed");
 

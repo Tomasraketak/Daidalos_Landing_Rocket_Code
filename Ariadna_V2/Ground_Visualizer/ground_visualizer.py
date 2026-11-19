@@ -1694,9 +1694,34 @@ class GroundStation(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+def _find_app_icon() -> str | None:
+    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    cands = [os.path.join(root, "tools", "windows", "daidalos.ico")]
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        cands.append(os.path.join(local, "Daidalos", "daidalos.ico"))
+    for path in cands:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "VoltinoLabs.Daidalos.GroundStation")
+        except Exception:
+            pass
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    _ico_path = _find_app_icon()
+    _icon = QtGui.QIcon(_ico_path) if _ico_path else QtGui.QIcon()
+    if not _icon.isNull():
+        app.setWindowIcon(_icon)
     window = GroundStation()
+    if not _icon.isNull():
+        window.setWindowIcon(_icon)
     window.show()
     sys.exit(app.exec())

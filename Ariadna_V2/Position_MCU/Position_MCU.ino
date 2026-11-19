@@ -91,6 +91,7 @@
 // =====================================================================
 
 #include "ariadna_link.h"
+#include "ariadna_hil.h"
 #include "ariadna_uart_dma.h"
 #include "ariadna_kf.h"
 #include "ariadna_uwb.h"
@@ -406,8 +407,11 @@ public:
         }
         _stale = 0;
 
-        // TF Luna: 0.2..8 m; isValid() = strength >= 100 and not saturated.
+        // TF Luna v1.1.0: 0.2..8 m; isValid() = strength >= TFLUNA_MIN_SIGNAL (100)
+        // and strength != TFLUNA_SIGNAL_SATURATED (0xFFFF). Low-quality or
+        // saturated readings set _fix.valid = false and are never fused.
         const uint16_t d = _luna.getDistance();
+        _last_strength = _luna.getSignalStrength();
         const bool good = d >= 20 && d <= 800 && _luna.isValid();
         _fix.range_m = (float)d * 0.01f;
         // 2 cm repeatability near, about 1 % of range far, and a floor that
@@ -419,11 +423,13 @@ public:
     }
 
     const RangeFix &fix(void) const { return _fix; }
-    bool     healthy(void)  const { return _ok && _fails < 10; }
-    uint16_t strength(void)       { return _luna.getSignalStrength(); }
-    float    range_m(void)        { return (float)_luna.getDistance() * 0.01f; }
-    float    temp_c(void)         { return _luna.getTemperature(); }
-    bool     fps_set(void)  const { return _fps_set; }
+    bool     healthy(void)    const { return _ok && _fails < 10; }
+    bool     quality_ok(void) const { return healthy() && _fix.valid; }
+    bool     saturated(void)  const { return healthy() && _last_strength == TFLUNA_SIGNAL_SATURATED; }
+    uint16_t strength(void)         { return _luna.getSignalStrength(); }
+    float    range_m(void)          { return (float)_luna.getDistance() * 0.01f; }
+    float    temp_c(void)           { return _luna.getTemperature(); }
+    bool     fps_set(void)    const { return _fps_set; }
 
 private:
     bool configure(void)
@@ -440,6 +446,7 @@ private:
         if (_fails < 255) _fails++;
         if (_fails >= 10) _ok = false;
         _fix.valid = false;
+        _last_strength = 0;
     }
 
     TFLuna   _luna;
@@ -448,6 +455,7 @@ private:
     bool     _have_tick = false;
     uint8_t  _fails = 0;
     uint8_t  _stale = 0;
+    uint16_t _last_strength = 0;
     uint32_t _last_try_ms = 0;
     RangeFix _fix  = { 0.0f, 0.0f, 0, false };
 };
@@ -2616,6 +2624,178 @@ static void link_poll(void)
 }
 
 // =====================================================================
+//  8b. HIL (HARDWARE-IN-THE-LOOP) USB SENSOR INJECTION
+//
+//  When the diagnostic GUI connects to this board's USB CDC port and
+//  streams ARIADNA_PKT_HIL_IN frames (ariadna_hil.h), the estimator runs
+//  its real Kalman filter, UWB solver, lidar leg gate and ZUPT on the
+//  synthetic measurements instead of physical I2C/SPI/UART sensors.
+//
+//  In a real flight no USB host is attached, so `if (!Serial)` returns in
+//  one branch with zero overhead. Cannot be entered during a real flight,
+//  and automatically exits back to physical sensors after
+//  ARIADNA_HIL_TIMEOUT_MS without frames or when USB closes.
+// =====================================================================
+static ariadna_hil_rx_t s_hil_rx;
+static ariadna_hil_in_t s_hil_pkt;
+static bool             s_hil_active          = false;
+static uint32_t         s_hil_last_ms         = 0;
+static uint32_t         s_hil_pkt_count       = 0;
+static uint32_t         s_hil_rate_ms         = 0;
+static uint32_t         s_hil_rate_n          = 0;
+static float            s_hil_hz              = 0.0f;
+static bool             s_hil_baro_pending    = false;
+static bool             s_hil_gps_pending     = false;
+static bool             s_hil_uwb_pending     = false;
+static bool             s_hil_pad_ref_pending = false;
+static bool             s_hil_reset_pending   = false;
+static GpsFix           s_hil_gps;
+static bool             s_hil_have_gps        = false;
+static RangeFix         s_hil_lidar_fix;
+static uint16_t         s_hil_lidar_strength  = 0;
+static bool             s_hil_lidar_fresh     = false;
+static uint8_t          s_hil_uwb_fresh_n     = 0;
+static uint32_t         s_hil_uwb_last_ms     = 0;
+static float            s_hil_temp_c          = 20.0f;
+
+static void hil_exit(void)
+{
+    if (!s_hil_active) return;
+    s_hil_active          = false;
+    s_hil_baro_pending    = false;
+    s_hil_gps_pending     = false;
+    s_hil_uwb_pending     = false;
+    s_hil_pad_ref_pending = false;
+    s_hil_reset_pending   = false;
+    s_hil_have_gps        = false;
+    s_hil_lidar_fresh     = false;
+    s_hil_lidar_fix.valid = false;
+    s_hil_uwb_fresh_n     = 0;
+    s_hil_uwb_last_ms     = 0;
+    s_hil_hz              = 0.0f;
+    // Reset estimator and restore any surveyed fixed pad origin from params.
+    s_est.begin();
+    memset(&s_uwb_fix, 0, sizeof(s_uwb_fix));
+    s_cal_dirty = true;
+}
+
+static void hil_usb_poll(bool in_flight_now)
+{
+    if (!Serial) {
+        if (s_hil_active) hil_exit();
+        return;
+    }
+
+    uint16_t budget = 256;
+    while (budget-- && Serial.available()) {
+        ariadna_hil_in_t pkt;
+        const ariadna_hil_rx_event_t ev =
+            ariadna_hil_rx_byte(&s_hil_rx, (uint8_t)Serial.read(), &pkt);
+        if (ev == ARIADNA_HIL_RX_NONE) continue;
+
+        if (ev == ARIADNA_HIL_RX_HELLO) {
+            if (Serial.availableForWrite() > 64)
+                Serial.printf("I DAIDALOS_POS %d HIL 1\n", ARIADNA_FW_VERSION);
+            continue;
+        }
+        if (ev == ARIADNA_HIL_RX_STOP) {
+            hil_exit();
+            if (Serial.availableForWrite() > 32) Serial.print("OK HIL 0\n");
+            continue;
+        }
+        if (ev == ARIADNA_HIL_RX_STATUS) {
+            if (Serial.availableForWrite() > 64)
+                Serial.printf("OK HIL STATUS %d %lu\n",
+                              s_hil_active ? 1 : 0, (unsigned long)s_hil_pkt_count);
+            continue;
+        }
+        if (ev == ARIADNA_HIL_RX_PKT) {
+            // Never allow HIL to hijack an actual in-progress real flight.
+            if (!s_hil_active && in_flight_now) continue;
+
+            ariadna_hil_imu_out_t imu;
+            if (!ariadna_hil_apply_imu(&pkt, &imu)) continue;
+
+            s_hil_pkt = pkt;
+            const uint32_t now_ms = millis();
+            s_hil_last_ms = now_ms ? now_ms : 1u;
+            if (!s_hil_active) {
+                s_hil_active      = true;
+                s_hil_pkt_count   = 0;
+                s_hil_rate_ms     = now_ms;
+                s_hil_rate_n      = 0;
+                s_hil_hz          = 100.0f;
+                s_hil_have_gps    = false;
+                s_hil_uwb_fresh_n = 0;
+                s_hil_uwb_last_ms = 0;
+            }
+            s_hil_pkt_count++;
+            s_hil_rate_n++;
+            if ((uint32_t)(now_ms - s_hil_rate_ms) >= 500u) {
+                const float dt_s = (float)(uint32_t)(now_ms - s_hil_rate_ms) * 1e-3f;
+                if (dt_s > 0.0f) s_hil_hz = (float)s_hil_rate_n / dt_s;
+                s_hil_rate_ms = now_ms;
+                s_hil_rate_n  = 0;
+            }
+
+            memcpy(s_att.R, imu.R, sizeof(s_att.R));
+            memcpy(s_att.q, imu.q, sizeof(s_att.q));
+            memcpy(s_att.w_pad, imu.w_pad, sizeof(s_att.w_pad));
+            memcpy(s_att.a_pad, imu.a_pad, sizeof(s_att.a_pad));
+            s_att.w_abs   = imu.w_abs;
+            s_att.a_valid = true;
+            s_att.roll    = imu.roll;
+            s_att.pitch   = imu.pitch;
+            s_att.heading = imu.heading;
+            s_att.hz      = s_hil_hz;
+            s_att.fresh   = true;
+            s_sensor_ok  |= ARIADNA_SENS_IMU | ARIADNA_SENS_MAG;
+
+            s_hil_temp_c = (float)pkt.temp_c_x10 * 0.1f;
+
+            if (pkt.flags & ARIADNA_HIL_RESET_EST)   s_hil_reset_pending   = true;
+            if (pkt.flags & ARIADNA_HIL_SET_PAD_REF) s_hil_pad_ref_pending = true;
+            if (pkt.flags & ARIADNA_HIL_BARO_FRESH)  s_hil_baro_pending    = true;
+            if (pkt.flags & ARIADNA_HIL_GPS_FRESH) {
+                s_hil_gps.lat_1e7  = pkt.gps_lat_1e7;
+                s_hil_gps.lon_1e7  = pkt.gps_lon_1e7;
+                s_hil_gps.alt_msl  = pkt.gps_alt_msl;
+                s_hil_gps.vel_e    = (float)pkt.gps_ve_cms * 0.01f;
+                s_hil_gps.vel_n    = (float)pkt.gps_vn_cms * 0.01f;
+                s_hil_gps.sats     = pkt.gps_sats;
+                s_hil_gps.fix      = pkt.gps_fix;
+                s_hil_gps.hdop_x10 = pkt.gps_hdop_x10;
+                s_hil_gps.t_ms     = now_ms;
+                s_hil_gps.valid    = (pkt.gps_fix >= 2);
+                s_hil_have_gps     = true;
+                s_hil_gps_pending  = true;
+            }
+            {
+                const float rm = (float)pkt.lidar_mm * 0.001f;
+                const bool qual_ok = pkt.lidar_strength >= TFLUNA_MIN_SIGNAL &&
+                                     pkt.lidar_strength != TFLUNA_SIGNAL_SATURATED;
+                const bool ok = (pkt.flags & ARIADNA_HIL_LIDAR_VALID) != 0 &&
+                                qual_ok &&
+                                pkt.lidar_mm >= 200u && pkt.lidar_mm <= 8000u;
+                s_hil_lidar_fix.range_m = rm;
+                s_hil_lidar_fix.sigma_m = 0.05f + 0.01f * rm;
+                s_hil_lidar_fix.t_ms    = now_ms;
+                s_hil_lidar_fix.valid   = ok;
+                s_hil_lidar_strength    = pkt.lidar_strength;
+                s_hil_lidar_fresh       = true;
+            }
+            if (pkt.flags & ARIADNA_HIL_UWB_FRESH) {
+                s_hil_uwb_pending = true;
+            }
+        }
+    }
+
+    if (s_hil_active && (uint32_t)(millis() - s_hil_last_ms) > ARIADNA_HIL_TIMEOUT_MS) {
+        hil_exit();
+    }
+}
+
+// =====================================================================
 //  9. ANNUNCIATOR
 //
 //  One WS2812 on the XIAO, saying what this board thinks of itself.
@@ -2668,7 +2848,7 @@ static void annunciate(uint16_t nav_flags, uint32_t now_ms)
 {
     (void)now_ms;
 
-    if (!s_post_pass || !(nav_flags & ARIADNA_NAV_IMU_OK)) {
+    if ((!s_post_pass && !s_hil_active) || !(nav_flags & ARIADNA_NAV_IMU_OK)) {
         ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_BLINK_N, 1);
         return;
     }
@@ -3290,6 +3470,7 @@ void setup()
     ariadna_uart_begin(MASTER_PORT, PIN_MASTER_TX, PIN_MASTER_RX);   // 2 kB RX buffer
     ariadna_uart_tx_begin(&s_tx, uart0);   // uart0 is Serial1 on this core
     ariadna_rx_init(&s_rx);
+    ariadna_hil_rx_init(&s_hil_rx);
     memset(&s_master, 0, sizeof(s_master));
 
     memset(&s_gps_shared, 0, sizeof(s_gps_shared));
@@ -3336,8 +3517,11 @@ void loop()
         const bool in_flight_now = s_have_master &&
                                    s_master.state >= ARIADNA_STATE_ASCENT &&
                                    s_master.state <= ARIADNA_STATE_GUIDANCE;
-        attitude_update(in_flight_now);
-        if (s_att.fresh) s_sensor_ok |= ARIADNA_SENS_IMU;
+        hil_usb_poll(in_flight_now);
+        if (!s_hil_active) {
+            attitude_update(in_flight_now);
+            if (s_att.fresh) s_sensor_ok |= ARIADNA_SENS_IMU;
+        }
     }
     // The DMA ring is serviced on every pass, not once per tick. Serviced
     // only per tick, a nav_state queued behind the 20 Hz status frame
@@ -3350,24 +3534,39 @@ void loop()
     next_us += period;
     if ((int32_t)(micros() - next_us) > 0) next_us = micros() + period;
 
-    // ---- deferred commands from core 1 ---------------------------------
+    // ---- deferred commands from core 1 (and HIL reset/pad-ref) ----------
     // Executed here because they touch the sensor buses, which belong to
     // this core exclusively.
-    if (s_req_pad_ref) {
-        s_req_pad_ref = false;
-        float p = sensor.readPressure();
-        // The horizontal origin is captured from the same command, so the
-        // pad is the origin of BOTH channels and px/py mean "metres from
-        // the pad" rather than "metres from wherever the first fix
-        // happened to land". Without a fix yet, the vertical reference is
-        // still taken and the origin is picked up on the first good one.
-        GpsFix g;
-        const bool have = gps_acquire(&g);
-        s_est.set_pad_reference(p, have ? &g : nullptr);
-        POS_PRINT("# pad reference %.1f Pa, origin %s\n",
-                  p, s_est.have_origin() ? "set" : "pending GPS");
+    if (s_hil_active && s_hil_reset_pending) {
+        s_hil_reset_pending = false;
+        s_est.begin();
+        s_est.set_fixed_origin(false, 0, 0);
+        memset(&s_uwb_fix, 0, sizeof(s_uwb_fix));
     }
-    if (s_cal_dirty) {
+    if (s_req_pad_ref || (s_hil_active && s_hil_pad_ref_pending)) {
+        s_req_pad_ref = false;
+        s_hil_pad_ref_pending = false;
+        if (s_hil_active) {
+            s_est.set_fixed_origin(false, 0, 0);
+            const float p = s_hil_pkt.pressure_pa;
+            s_est.set_pad_reference(p, (s_hil_have_gps && s_hil_gps.valid) ? &s_hil_gps : nullptr);
+            POS_PRINT("# HIL pad reference %.1f Pa, origin %s\n",
+                      p, s_est.have_origin() ? "set" : "pending GPS");
+        } else {
+            float p = sensor.readPressure();
+            // The horizontal origin is captured from the same command, so the
+            // pad is the origin of BOTH channels and px/py mean "metres from
+            // the pad" rather than "metres from wherever the first fix
+            // happened to land". Without a fix yet, the vertical reference is
+            // still taken and the origin is picked up on the first good one.
+            GpsFix g;
+            const bool have = gps_acquire(&g);
+            s_est.set_pad_reference(p, have ? &g : nullptr);
+            POS_PRINT("# pad reference %.1f Pa, origin %s\n",
+                      p, s_est.have_origin() ? "set" : "pending GPS");
+        }
+    }
+    if (s_cal_dirty && !s_hil_active) {
         s_cal_dirty = false;
         imu_cal_apply();
         const float plat = PRM(POS_PAD_LAT), plon = PRM(POS_PAD_LON);
@@ -3377,12 +3576,14 @@ void loop()
     }
     if (s_req_cal_gyro) {
         s_req_cal_gyro = false;
-        attitude_recalibrate();
-        s_cal_state = 2;
-        s_gyr_checked = true;          // fresh on purpose: no fallback to the saved one
+        if (!s_hil_active) {
+            attitude_recalibrate();
+            s_cal_state = 2;
+            s_gyr_checked = true;          // fresh on purpose: no fallback to the saved one
+        }
     }
     // Parameters only arrive on the ground (param_receive), so this never runs in flight.
-    if (!s_gyr_checked && gyro_saved_params_seen()) {
+    if (!s_hil_active && !s_gyr_checked && gyro_saved_params_seen()) {
         s_gyr_checked = true;
         (void)gyro_saved_check();
     }
@@ -3407,7 +3608,24 @@ void loop()
     // its altitude than the sensor justifies, and quietly reject the GPS
     // corrections that disagree.
     bool baro_fresh = false;
-    if ((int32_t)(micros() - next_baro_us) >= 0) {
+    if (s_hil_active) {
+        if (s_hil_baro_pending) {
+            s_hil_baro_pending = false;
+            const float p = s_hil_pkt.pressure_pa;
+            last_p_pa = p;
+            if (!s_est.have_pad_reference() && p > 30000.0f && p < 110000.0f) {
+                s_est.set_fixed_origin(false, 0, 0);
+                s_est.set_pad_reference(p, (s_hil_have_gps && s_hil_gps.valid) ? &s_hil_gps : nullptr);
+            }
+            if (p > 30000.0f && p < 110000.0f) {
+                h_baro      = s_est.baro_altitude(p);
+                baro_fresh  = s_est.have_pad_reference();
+                s_sensor_ok |= ARIADNA_SENS_BARO;
+            } else {
+                s_sensor_ok &= (uint16_t)~ARIADNA_SENS_BARO;
+            }
+        }
+    } else if ((int32_t)(micros() - next_baro_us) >= 0) {
         next_baro_us = micros() + 1000000UL / BARO_HZ;
         float p = sensor.readPressure();
         last_p_pa = p;
@@ -3474,10 +3692,24 @@ void loop()
     // old estimator fused velocity only, at a fixed gain; there was no
     // horizontal position state for the position to correct.
     GpsFix gps;
-    bool have_gps = gps_acquire(&gps);
+    bool have_gps = false;
+    if (s_hil_active) {
+        have_gps = s_hil_have_gps;
+        if (have_gps) gps = s_hil_gps;
+    } else {
+        have_gps = gps_acquire(&gps);
+    }
     const float amag_g = accel_magnitude_g();
 
-    if (have_gps && gps.valid && gps.t_ms != last_gps_ms) {
+    if (s_hil_active) {
+        if (s_hil_gps_pending) {
+            s_hil_gps_pending = false;
+            if (s_hil_gps.valid) {
+                s_est.fuse_gps(s_hil_gps, 0.0f, a_pad[0], a_pad[1], amag_g, now_ms);
+                s_sensor_ok |= ARIADNA_SENS_GPS;
+            }
+        }
+    } else if (have_gps && gps.valid && gps.t_ms != last_gps_ms) {
         last_gps_ms = gps.t_ms;
         const float age_s = (float)(uint32_t)(now_ms - gps.t_ms) * 1e-3f
                           + GPS_LATENCY_S;
@@ -3579,7 +3811,9 @@ void loop()
 
         if (PRM(POS_LIDAR_EN) > 0.5f && (int32_t)(now_ms - next_lidar_ms) >= 0) {
             next_lidar_ms = now_ms + (legs_ms ? 20 : 200);
-            if (s_lidar.poll(now_ms) && leg_out) {
+            const bool polled = s_hil_active ? s_hil_lidar_fresh : s_lidar.poll(now_ms);
+            if (s_hil_active) s_hil_lidar_fresh = false;
+            if (polled && leg_out) {
                 const float tx = PRM(POS_LIDAR_TILT_X) * (float)DEG_TO_RAD;
                 const float ty = PRM(POS_LIDAR_TILT_Y) * (float)DEG_TO_RAD;
                 // The nose axis (board -Y) tilted by tilt_x about board X,
@@ -3588,8 +3822,9 @@ void loop()
                 float d[3];
                 rotate(s_att.R, beam, d);
                 const float cos_beam = -d[2];              // component pointing DOWN
-                const RangeFix &f = s_lidar.fix();
-                const bool not_maxed = s_lidar.range_m() < LIDAR_CEILING_M;
+                const RangeFix &f = s_hil_active ? s_hil_lidar_fix : s_lidar.fix();
+                const float rm = s_hil_active ? s_hil_lidar_fix.range_m : s_lidar.range_m();
+                const bool not_maxed = rm < LIDAR_CEILING_M;
                 if (f.valid && not_maxed && cos_beam > 0.906f &&
                     f.range_m <= PRM(POS_LIDAR_MAX))
                     s_est.fuse_range(f, cos_beam, PRM(POS_LIDAR_OFFSET), now_ms);
@@ -3598,8 +3833,17 @@ void loop()
         s_lidar_leg_out = leg_out;
         if (leg_out) s_sensor_ok |= ARIADNA_SENS_LIDAR_GATE;
         else         s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR_GATE;
-        if (s_lidar.healthy()) s_sensor_ok |= ARIADNA_SENS_LIDAR;
-        else                   s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR;
+        const bool lidar_ok_now = s_hil_active ? s_hil_lidar_fix.valid : s_lidar.healthy();
+        const bool lidar_qual_now = s_hil_active ? s_hil_lidar_fix.valid : s_lidar.quality_ok();
+        const bool lidar_sat_now = s_hil_active
+            ? (s_hil_lidar_strength == TFLUNA_SIGNAL_SATURATED)
+            : s_lidar.saturated();
+        if (lidar_ok_now)   s_sensor_ok |= ARIADNA_SENS_LIDAR;
+        else                s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR;
+        if (lidar_qual_now) s_sensor_ok |= ARIADNA_SENS_LIDAR_VALID;
+        else                s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR_VALID;
+        if (lidar_sat_now)  s_sensor_ok |= ARIADNA_SENS_LIDAR_SAT;
+        else                s_sensor_ok &= (uint16_t)~ARIADNA_SENS_LIDAR_SAT;
     }
 
     // ---- UWB --------------------------------------------------------------
@@ -3616,75 +3860,121 @@ void loop()
     // Nothing here counts anchors or branches on how many answered — the
     // solver reports what the geometry supported and the estimator
     // weights it. A dead anchor costs accuracy and nothing else.
-    if (ARIADNA_UWB_ENABLED && PRM(POS_UWB_EN) > 0.5f &&
-        (uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
-        last_uwb_solve_ms = now_ms;
-        s_uwb.poll();                    // ~1.7 ms of I2C at 400 kHz
-        s_uwb.age(now_ms);
+    if (ARIADNA_UWB_ENABLED && PRM(POS_UWB_EN) > 0.5f) {
+        if (s_hil_active) {
+            if (s_hil_uwb_pending) {
+                s_hil_uwb_pending = false;
+                ariadna_uwb_obs_t obs[ARIADNA_UWB_MAX_ANCHORS];
+                memset(obs, 0, sizeof(obs));
+                uint8_t nf = 0;
+                for (uint8_t i = 0; i < UWB_ANCHOR_COUNT && i < 4u; i++) {
+                    if ((s_hil_pkt.uwb_mask & (uint8_t)(1u << i)) &&
+                        s_hil_pkt.uwb_range_cm[i] > 0u) {
+                        const float rm = (float)s_hil_pkt.uwb_range_cm[i] * 0.01f;
+                        obs[i].range_m = rm;
+                        obs[i].sigma_m = 0.25f + 0.004f * rm;
+                        obs[i].age_s   = 0.0f;
+                        obs[i].valid   = 1;
+                        nf++;
+                    }
+                }
+                s_hil_uwb_fresh_n = nf;
+                if (nf > 0u) {
+                    s_hil_uwb_last_ms = now_ms ? now_ms : 1u;
+                    const float prior[3] = { s_est.px(), s_est.py(), s_est.pz() };
+                    if (ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                                          prior, &s_uwb_cfg, &s_uwb_fix)) {
+                        s_est.fuse_uwb(s_uwb_fix, 0.0f, now_ms);
+                    }
+                } else {
+                    s_uwb_fix.mode   = ARIADNA_UWB_SOL_NONE;
+                    s_uwb_fix.use_x  = s_uwb_fix.use_y = s_uwb_fix.use_z = 0;
+                    s_uwb_fix.n_used = 0;
+                    s_uwb_fix.mask   = 0;
+                    s_uwb_fix.residual_rms = 0.0f;
+                }
+            } else if (s_hil_uwb_last_ms != 0u &&
+                       (uint32_t)(now_ms - s_hil_uwb_last_ms) > UWB_RANGE_MAX_AGE_MS) {
+                s_hil_uwb_fresh_n = 0;
+                s_uwb_fix.mode   = ARIADNA_UWB_SOL_NONE;
+                s_uwb_fix.use_x  = s_uwb_fix.use_y = s_uwb_fix.use_z = 0;
+                s_uwb_fix.n_used = 0;
+                s_uwb_fix.mask   = 0;
+                s_uwb_fix.residual_rms = 0.0f;
+            }
+        } else if ((uint32_t)(now_ms - last_uwb_solve_ms) >= (1000u / UWB_SOLVE_HZ)) {
+            last_uwb_solve_ms = now_ms;
+            s_uwb.poll();                    // ~1.7 ms of I2C at 400 kHz
+            s_uwb.age(now_ms);
 
-        if (s_uwb.fresh() == 0) {
-            // The constellation has gone quiet. Clear the published fix
-            // rather than leave the last good one sitting in the status
-            // packet, where it would read as a working constellation for
-            // as long as nobody thought to power-cycle something.
-            s_uwb_fix.mode   = ARIADNA_UWB_SOL_NONE;
-            s_uwb_fix.use_x  = s_uwb_fix.use_y = s_uwb_fix.use_z = 0;
-            s_uwb_fix.n_used = 0;
-            s_uwb_fix.mask   = 0;
-            s_uwb_fix.residual_rms = 0.0f;
-        } else if (s_uwb.generation() != last_uwb_gen) {
-            last_uwb_gen = s_uwb.generation();
+            if (s_uwb.fresh() == 0) {
+                // The constellation has gone quiet. Clear the published fix
+                // rather than leave the last good one sitting in the status
+                // packet, where it would read as a working constellation for
+                // as long as nobody thought to power-cycle something.
+                s_uwb_fix.mode   = ARIADNA_UWB_SOL_NONE;
+                s_uwb_fix.use_x  = s_uwb_fix.use_y = s_uwb_fix.use_z = 0;
+                s_uwb_fix.n_used = 0;
+                s_uwb_fix.mask   = 0;
+                s_uwb_fix.residual_rms = 0.0f;
+            } else if (s_uwb.generation() != last_uwb_gen) {
+                last_uwb_gen = s_uwb.generation();
 
-            ariadna_uwb_obs_t obs[ARIADNA_UWB_MAX_ANCHORS];
-            (void)s_uwb.snapshot(obs, now_ms);
+                ariadna_uwb_obs_t obs[ARIADNA_UWB_MAX_ANCHORS];
+                (void)s_uwb.snapshot(obs, now_ms);
 
-            // The prior is the filter's own position. It is the
-            // linearisation point, the held height in the degraded 2-D
-            // modes, and the tie-breaker for the two-anchor ambiguity —
-            // which is exactly why the vertical channel being
-            // barometer-anchored matters to the HORIZONTAL accuracy of a
-            // partial constellation.
-            const float prior[3] = { s_est.px(), s_est.py(), s_est.pz() };
-            const float vel[3]   = { s_est.vx(), s_est.vy(), s_est.vz() };
+                // The prior is the filter's own position. It is the
+                // linearisation point, the held height in the degraded 2-D
+                // modes, and the tie-breaker for the two-anchor ambiguity —
+                // which is exactly why the vertical channel being
+                // barometer-anchored matters to the HORIZONTAL accuracy of a
+                // partial constellation.
+                const float prior[3] = { s_est.px(), s_est.py(), s_est.pz() };
+                const float vel[3]   = { s_est.vx(), s_est.vy(), s_est.vz() };
 
-            // BRING THE RANGES TO ONE EPOCH BEFORE SOLVING THEM.
-            //
-            // The anchors answer one at a time, so this set was taken
-            // from several different places. Standing still that is
-            // free; descending it is not, and the failure is not a
-            // graceful one. Measured on the host, on a 40 m square with
-            // a 200 ms spread, an UNCOMPENSATED solve is out by 2.1 m at
-            // 20 m/s and 11.6 m at 50 m/s — and the 20 m/s case sails
-            // through the residual gate, because the error is a
-            // consistent translation along the direction of travel
-            // rather than a disagreement between the ranges.
-            //
-            // That is the worst kind of sensor error: confident, wrong,
-            // and biased in the direction the vehicle is moving, at the
-            // altitude where the guidance law has the least time to
-            // recover. With the de-rotation the same cases come out at
-            // 0.22 m and 0.13 m. See ../../test/uwb_test.cpp, which
-            // walks the whole descent profile.
-            ariadna_uwb_derotate(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
-                                 prior, vel, &s_uwb_cfg);
+                // BRING THE RANGES TO ONE EPOCH BEFORE SOLVING THEM.
+                //
+                // The anchors answer one at a time, so this set was taken
+                // from several different places. Standing still that is
+                // free; descending it is not, and the failure is not a
+                // graceful one. Measured on the host, on a 40 m square with
+                // a 200 ms spread, an UNCOMPENSATED solve is out by 2.1 m at
+                // 20 m/s and 11.6 m at 50 m/s — and the 20 m/s case sails
+                // through the residual gate, because the error is a
+                // consistent translation along the direction of travel
+                // rather than a disagreement between the ranges.
+                //
+                // That is the worst kind of sensor error: confident, wrong,
+                // and biased in the direction the vehicle is moving, at the
+                // altitude where the guidance law has the least time to
+                // recover. With the de-rotation the same cases come out at
+                // 0.22 m and 0.13 m. See ../../test/uwb_test.cpp, which
+                // walks the whole descent profile.
+                ariadna_uwb_derotate(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                                     prior, vel, &s_uwb_cfg);
 
-            // The jump test in the driver has to know how fast the
-            // vehicle is, for the same reason: at 50 m/s a range to one
-            // anchor legitimately changes by metres between exchanges.
-            s_uwb.set_speed_hint(sqrtf(vel[0] * vel[0] + vel[1] * vel[1] +
-                                       vel[2] * vel[2]));
+                // The jump test in the driver has to know how fast the
+                // vehicle is, for the same reason: at 50 m/s a range to one
+                // anchor legitimately changes by metres between exchanges.
+                s_uwb.set_speed_hint(sqrtf(vel[0] * vel[0] + vel[1] * vel[1] +
+                                           vel[2] * vel[2]));
 
-            if (ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
-                                  prior, &s_uwb_cfg, &s_uwb_fix)) {
-                // The ranges have been brought to now_ms, so what is left
-                // is only the gap between this solve and the estimator
-                // step that consumes it — sub-millisecond, since they are
-                // the same tick.
-                s_est.fuse_uwb(s_uwb_fix, 0.0f, now_ms);
+                if (ariadna_uwb_solve(s_uwb_anchors, obs, UWB_ANCHOR_COUNT,
+                                      prior, &s_uwb_cfg, &s_uwb_fix)) {
+                    // The ranges have been brought to now_ms, so what is left
+                    // is only the gap between this solve and the estimator
+                    // step that consumes it — sub-millisecond, since they are
+                    // the same tick.
+                    s_est.fuse_uwb(s_uwb_fix, 0.0f, now_ms);
+                }
             }
         }
     }
-    if (s_uwb.healthy()) s_sensor_ok |= ARIADNA_SENS_UWB;
+    const bool uwb_healthy_now = s_hil_active
+        ? (s_hil_uwb_fresh_n > 0u && s_hil_uwb_last_ms != 0u &&
+           (uint32_t)(now_ms - s_hil_uwb_last_ms) <= UWB_RANGE_MAX_AGE_MS)
+        : s_uwb.healthy();
+    if (uwb_healthy_now) s_sensor_ok |= ARIADNA_SENS_UWB;
     else                 s_sensor_ok &= (uint16_t)~ARIADNA_SENS_UWB;
 
     // ---- publish -----------------------------------------------------------
@@ -3730,7 +4020,7 @@ void loop()
     // Two separate facts, and the difference between them is diagnostic
     // gold on the pad: UWB_OK means the radio is ranging, UWB_AIDED means
     // the filter accepted what it produced.
-    if (s_uwb.healthy())                 st.flags |= ARIADNA_NAV_UWB_OK;
+    if (uwb_healthy_now)                 st.flags |= ARIADNA_NAV_UWB_OK;
     if (s_est.uwb_aided(now_ms))         st.flags |= ARIADNA_NAV_UWB_AIDED;
     if (s_est.lidar_aided(now_ms))       st.flags |= ARIADNA_NAV_LIDAR_OK;
 
@@ -3742,7 +4032,7 @@ void loop()
     const bool core_ok = (s_sensor_ok & ARIADNA_SENS_IMU) &&
                          (s_sensor_ok & ARIADNA_SENS_BARO) &&
                          s_est.have_pad_reference() &&
-                         s_post_pass;
+                         (s_post_pass || s_hil_active);
     if (core_ok) st.flags |= ARIADNA_NAV_VALID;
 
     link_send(ARIADNA_PKT_NAV_STATE, &st, sizeof(st));
@@ -3764,31 +4054,43 @@ void loop()
         ps.roll         = roll;
         ps.pitch        = pitch;
         ps.yaw          = heading;
-        ps.temp_c       = sensor.readTemperature();
+        ps.temp_c       = s_hil_active ? s_hil_temp_c : sensor.readTemperature();
         ps.sigma_pos_h  = s_est.sigma_pos_h();
         ps.sigma_vel_h  = s_est.sigma_vel_h();
         ps.sensor_ok    = s_sensor_ok;
-        ps.imu_overflow = (uint16_t)sensor.imu.getFIFOOverflowCount();
+        ps.imu_overflow = s_hil_active ? 0u : (uint16_t)sensor.imu.getFIFOOverflowCount();
         ps.cal_state    = s_cal_state;
         ps.uwb_sigma_h  = s_est.uwb_sigma_h();
         ps.uwb_resid    = s_uwb_fix.residual_rms;
-        ps.uwb_anchors  = s_uwb.fresh();
+        ps.uwb_anchors  = s_hil_active ? s_hil_uwb_fresh_n : s_uwb.fresh();
         ps.uwb_mask     = s_uwb_fix.mask;
         ps.uwb_mode     = s_uwb_fix.mode;
         ps.uwb_rejects  = s_est.uwb_rejects();
         ps.baro_trim    = s_est.baro_trim();
-        ps.lidar_m      = s_lidar.healthy() ? s_lidar.range_m() : 0.0f;
-        ps.lidar_strength = (uint8_t)(s_lidar.strength() > 65279 ? 255 : s_lidar.strength() >> 8);
+        ps.lidar_m      = s_hil_active
+                            ? (s_hil_lidar_fix.valid ? s_hil_lidar_fix.range_m : 0.0f)
+                            : (s_lidar.healthy() ? s_lidar.range_m() : 0.0f);
+        {
+            const uint16_t lstr = s_hil_active ? s_hil_lidar_strength : s_lidar.strength();
+            uint8_t s8 = (uint8_t)(lstr > 65279u ? 255u : (lstr >> 8));
+            if (s8 == 0 && lstr >= TFLUNA_MIN_SIGNAL) s8 = 1;
+            ps.lidar_strength = s8;
+        }
         ps.fw_version   = ARIADNA_FW_VERSION;
         ps.param_crc    = ariadna_params_crc(&s_params);
         ps.params_seen  = s_params_seen_n;
+        if (s_hil_active) {
+            ps.ins_mode = 254;
+            ps.att_src  = 2;
+        } else {
 #if ARIADNA_USE_INSLIB
-        ps.ins_mode     = (uint8_t)ins.getMode();
-        ps.att_src      = 1;
+            ps.ins_mode = (uint8_t)ins.getMode();
+            ps.att_src  = 1;
 #else
-        ps.ins_mode     = 255;
-        ps.att_src      = 0;
+            ps.ins_mode = 255;
+            ps.att_src  = 0;
 #endif
+        }
 
         if (have_gps && gps.valid) {
             ps.lat      = gps.lat_1e7;
@@ -3811,7 +4113,8 @@ void loop()
         static uint32_t next_raw_ms = 0;
         static float    mag_cal[3] = { 0.0f, 0.0f, 0.0f };
         static float    mag_last[3] = { 0.0f, 0.0f, 0.0f };
-        const bool want = s_have_master && (s_master.flags & ARIADNA_MST_RAW_IMU) && !in_flight;
+        const bool want = !s_hil_active && s_have_master &&
+                          (s_master.flags & ARIADNA_MST_RAW_IMU) && !in_flight;
         if (want && (int32_t)(now_ms - next_raw_ms) >= 0) {
             next_raw_ms = now_ms + 1000u / ARIADNA_RAW_IMU_HZ;
             ariadna_raw_imu_t r;

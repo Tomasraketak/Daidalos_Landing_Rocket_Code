@@ -270,4 +270,17 @@ void dg_fin_mix(const float b[3], const float u1[3], const float u2[3],
                 float brake, float kappa, const float trim[3],
                 bool control, float out_deg[4]);
 
+/**
+ * Bench polarity-check step on real IMU attitude (pyros strictly OFF).
+ *
+ * Drives TVC as in landing burn (0 deg vertical hold) and fins as in ascent
+ * (0 deg vertical hold + roll damping) using the exact same coordinate frame,
+ * gimbal basis, dynamic inversion, and fin mixer as dg_step_control(), without
+ * touching flight state S.
+ *
+ * ref_thrust_n: reference thrust for TVC [N]; <= 0 uses the default
+ *               avg(mean, median) of the reference thrust curve.
+ */
+void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out, float ref_thrust_n = 0.0f);
+
 #endif // DAIDALOS_GUIDANCE_H

@@ -390,12 +390,20 @@ static inline bool master_fresh(void)
     return s_have_master && (micros() - s_master_us) <= 500000u;
 }
 
-/** Flight firing: the Master is present, fresh, ARMED, not TEST, not ABORT. */
+/** Flight logic armed: guidance, fins, TVC, aerocover and sequencer events. */
+static inline bool flight_armed(void)
+{
+    if (!master_fresh())                                         return false;
+    if (!(s_master.flags & ARIADNA_MST_ARMED))                   return false;
+    if (s_master.flags & (ARIADNA_MST_TEST | ARIADNA_MST_ABORT)) return false;
+    return true;
+}
+
+/** Physical pyro firing: flight armed AND not inhibited (HIL safe mode). */
 static inline bool pyro_permitted(void)
 {
-    if (!master_fresh())                                  return false;
-    if (!(s_master.flags & ARIADNA_MST_ARMED))            return false;
-    if (s_master.flags & (ARIADNA_MST_TEST | ARIADNA_MST_ABORT)) return false;
+    if (!flight_armed())                                         return false;
+    if (s_master.flags & ARIADNA_MST_PYRO_INHIBIT)               return false;
     return true;
 }
 
@@ -407,6 +415,16 @@ static inline bool test_permitted(void)
     if (s_master.flags & ARIADNA_MST_ABORT)               return false;
     if (!(s_master.flags & ARIADNA_MST_RBF_OUT))          return false;
     return s_dg_out.phase == DG_PHASE_IDLE;
+}
+
+/** Bench TVC+fin polarity check on real IMU attitude (ground IDLE, pyros OFF). */
+static inline bool polarity_test_active(void)
+{
+    if (!master_fresh())                                         return false;
+    if (flight_armed() || test_permitted())                      return false;
+    if (s_master.state != ARIADNA_STATE_IDLE)                    return false;
+    if (s_master.flags & (ARIADNA_MST_TEST | ARIADNA_MST_ABORT)) return false;
+    return (s_master.flags2 & ARIADNA_MST2_POLARITY_TEST) != 0;
 }
 
 static void pyro_write(uint8_t mask)
@@ -508,7 +526,7 @@ static void phase_logic(void)
     if (!s_have_state || !s_dg_nav.valid) return;
     const dg_phase_t ph = s_dg_out.phase;
     if (ph != DG_PHASE_IDLE && ph != DG_PHASE_ASCENT) return;
-    if (!pyro_permitted()) {
+    if (!flight_armed()) {
         // Not armed: nothing here may leave IDLE. (TEST and ABORT included.)
         return;
     }
@@ -561,6 +579,7 @@ static void handle_command(const ariadna_cmd_t *c)
             dg_init();
             ariadna_seq_init(&s_seq);
             s_h_max = 0.0f;
+            s_fired_mask = 0;
         }
         break;
     default:
@@ -588,7 +607,7 @@ static const uint8_t NAV_RGB_BRIGHTNESS = 60;
 
 static void annunciate(bool fresh, bool stale_parked)
 {
-    const bool armed = pyro_permitted();
+    const bool armed = flight_armed();
     if (!s_post_pass)      { ariadna_rgb_set(&s_rgb, ARIADNA_C_RED, ARIADNA_PAT_SOLID, 0); return; }
     if (s_out_mask)        { ariadna_rgb_set(&s_rgb, ARIADNA_C_WHITE, ARIADNA_PAT_SOLID, 0); return; }
     if (s_test_sm.armed)   { ariadna_rgb_set(&s_rgb, ARIADNA_C_AMBER, ARIADNA_PAT_FAST, 0); return; }
@@ -798,24 +817,35 @@ void loop()
     }
 
     // ---- flight phase, guidance, sequencer ----------------------------
-    phase_logic();
+    const bool pol_mode = polarity_test_active();
+    if (pol_mode) {
+        const float pol_thr = ariadna_pol_thrust_decode(s_master.flags2);
+        if (s_have_state && state_fresh && (s_state.flags & ARIADNA_NAV_IMU_OK)) {
+            dg_step_polarity(&s_dg_nav, &s_dg_out, pol_thr);
+        } else {
+            dg_step_polarity(nullptr, &s_dg_out, pol_thr);
+        }
+    } else {
+        phase_logic();
 
-    if (s_have_state) {
-        nav_publish(&s_dg_nav);
-        dg_step_control(&s_dg_nav, &s_dg_out);
+        if (s_have_state) {
+            nav_publish(&s_dg_nav);
+            dg_step_control(&s_dg_nav, &s_dg_out);
 #if !NAV_USE_CORE1
-        dg_step_planner(&s_dg_nav);
-        s_plan_calls++;
+            dg_step_planner(&s_dg_nav);
+            s_plan_calls++;
 #endif
+        }
     }
 
-    const bool permit = pyro_permitted();
+    const bool armed   = flight_armed();
+    const bool pyro_ok = pyro_permitted();
     {
         ariadna_seq_in_t in;
         in.phase          = (uint8_t)s_dg_out.phase;
         in.ignite         = s_dg_out.ignite ? 1 : 0;
         in.thrust_on      = s_dg_out.thrust_on ? 1 : 0;
-        in.permit         = permit ? 1 : 0;
+        in.permit         = armed ? 1 : 0;
         in.t_to_ignition  = s_dg_out.t_to_ignition;
         in.t_to_touchdown = s_dg_out.t_to_touchdown;
         in.h              = s_dg_nav.h;
@@ -828,9 +858,11 @@ void loop()
     // Flight and bench firing are mutually exclusive by construction: one
     // needs ARMED and not TEST, the other needs TEST. The permit is checked
     // again here, at the output stage, so withdrawing it CUTS current.
+    // In HIL safe mode (ARIADNA_MST_PYRO_INHIBIT) `armed` is true so the
+    // sequencer runs, while `pyro_ok` is false so physical pins stay LOW.
     {
         uint8_t mask = 0;
-        if (permit) {
+        if (pyro_ok) {
             for (uint8_t i = 0; i < 3; i++) if (s_seq.pyro[i]) mask |= (uint8_t)(1u << i);
         } else if (test_permitted()) {
             mask = actcon_pyro_tick(&s_test_sm, now_ms);
@@ -855,7 +887,10 @@ void loop()
         act.clamp = s_dg_out.clamp;
         act.phase = (uint8_t)s_dg_out.phase;
 
-        if (s_have_state && s_dg_nav.valid) {
+        const bool act_ok = pol_mode
+            ? (s_have_state && state_fresh && (s_state.flags & ARIADNA_NAV_IMU_OK))
+            : (s_have_state && s_dg_nav.valid);
+        if (act_ok) {
             act.tvc_x_deg = s_dg_out.servo1_deg;
             act.tvc_y_deg = s_dg_out.servo2_deg;
             act.flags |= ARIADNA_ACT_VALID;
@@ -869,7 +904,8 @@ void loop()
         }
         if (s_seq.cover_open) act.flags |= ARIADNA_ACT_COVER_OPEN;
         act.events = s_seq.events;
-        if (s_fired_mask & 0x03) act.flags |= ARIADNA_ACT_IGNITE;
+        if ((s_fired_mask & 0x03) || (s_seq.events & (ARIADNA_EV_IGN1 | ARIADNA_EV_IGN2)))
+            act.flags |= ARIADNA_ACT_IGNITE;
 
         link_send(ARIADNA_PKT_ACTUATOR, &act, sizeof(act));
     }
@@ -909,7 +945,7 @@ void loop()
         st.drag_scale  = s_dg_out.drag_scale;
         st.band_lo     = s_dg_out.h_band_lo;
         st.band_hi     = s_dg_out.h_band_hi;
-        st.flags       = (uint8_t)((permit       ? ARIADNA_NST_ARMED      : 0) |
+        st.flags       = (uint8_t)((armed        ? ARIADNA_NST_ARMED      : 0) |
                                    (s_post_pass  ? ARIADNA_NST_POST_PASS  : 0) |
                                    (state_fresh  ? ARIADNA_NST_LINK_OK    : 0) |
                                    (s_plan_calls ? ARIADNA_NST_PLANNER_OK : 0) |

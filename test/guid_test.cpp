@@ -719,12 +719,105 @@ static void test_state_machine()
     dg_set_params(&prm);
 }
 
+// ---------------------------------------------------------------------
+//  bench polarity test (TVC landing 0 deg + fins ascent 0 deg)
+// ---------------------------------------------------------------------
+static void test_polarity()
+{
+    dg_init();
+    dg_params_t prm;
+    dg_params_default(&prm);
+    dg_set_params(&prm);
+
+    dg_nav_t n;
+    dg_out_t o;
+
+    // 1) Vertical nose-up (b = 0,0,-1): everything neutral, pyros OFF
+    std::memset(&n, 0, sizeof(n));
+    n.bz = -1.0f; n.gx = 1.0f; n.valid = true;
+    dg_step_polarity(&n, &o);
+    CHECK(!o.ignite && !o.thrust_on && o.phase == DG_PHASE_IDLE, "polarity: must stay IDLE/no ignite");
+    CHECK(near(o.clamp, DG_CLAMP_MAX, 1e-4), "polarity: clamp open");
+    CHECK(near(o.servo1_deg, 0.0, 1e-4) && near(o.servo2_deg, 0.0, 1e-4), "polarity: vertical TVC zero");
+    for (int i = 0; i < 4; i++)
+        CHECK(near(o.fin_deg[i], 0.0, 1e-4), "polarity: vertical fin %d zero", i);
+
+    // 2) Vertical nose-down (b = 0,0,+1): everything neutral
+    n.bz = 1.0f;
+    dg_step_polarity(&n, &o);
+    CHECK(near(o.servo1_deg, 0.0, 1e-4) && near(o.servo2_deg, 0.0, 1e-4), "polarity: nose-down TVC zero");
+    for (int i = 0; i < 4; i++)
+        CHECK(near(o.fin_deg[i], 0.0, 1e-4), "polarity: nose-down fin %d zero", i);
+
+    // 3) Landing orientation (nose-down, bz > 0), tilted +10 deg toward +X:
+    //    b = (+sin 10, 0, +cos 10), u1 = (+cos 10, 0, -sin 10), u2 = (0, +1, 0)
+    //    e = b x (0,0,+1) = (0, -sin 10, 0) -> tr along -Y -> sq = b x tr along +u1 -> servo1 > 0
+    const float th = 10.0f * (float)M_PI / 180.0f;
+    std::memset(&n, 0, sizeof(n));
+    n.bx = std::sin(th); n.bz = std::cos(th);
+    n.gx = std::cos(th); n.gz = -std::sin(th);
+    n.valid = true;
+    dg_step_polarity(&n, &o);
+    CHECK(o.servo1_deg > 4.0f && o.servo1_deg <= DG_SERVO_MAX_DEG + 1e-3f,
+          "polarity landing +X tilt: servo1=%g", o.servo1_deg);
+    CHECK(near(o.servo2_deg, 0.0, 0.2), "polarity landing +X tilt: servo2=%g", o.servo2_deg);
+    // Opposite tilt must invert TVC sign symmetrically
+    dg_out_t o_opp;
+    n.bx = -std::sin(th); n.gz = std::sin(th);
+    dg_step_polarity(&n, &o_opp);
+    CHECK(near(o_opp.servo1_deg, -o.servo1_deg, 0.2),
+          "polarity landing opposite tilt: %g vs %g", o_opp.servo1_deg, -o.servo1_deg);
+
+    // 4) Ascent orientation (nose-up, bz < 0), tilted 10 deg:
+    //    b = (+sin 10, 0, -cos 10), u1 = (+cos 10, 0, +sin 10), u2 = b x u1 = (0, -1, 0)
+    //    e = b x (0,0,-1) = (0, +sin 10, 0) -> tr along +Y -> dot(tr, u2) < 0 -> b_cmd > 0 -> fin[1] > 0, fin[3] < 0
+    std::memset(&n, 0, sizeof(n));
+    n.bx = std::sin(th); n.bz = -std::cos(th);
+    n.gx = std::cos(th); n.gz = std::sin(th);
+    n.valid = true;
+    dg_step_polarity(&n, &o);
+    CHECK(o.fins_live, "polarity ascent: fins must be live");
+    CHECK(o.fin_deg[1] > 5.0f && near(o.fin_deg[3], -o.fin_deg[1], 1e-3),
+          "polarity ascent fin pair 1/3: %g, %g", o.fin_deg[1], o.fin_deg[3]);
+    CHECK(near(o.fin_deg[0], 0.0, 1e-3) && near(o.fin_deg[2], 0.0, 1e-3),
+          "polarity ascent fin pair 0/2: %g, %g", o.fin_deg[0], o.fin_deg[2]);
+    // Opposite tilt must invert fin sign symmetrically
+    n.bx = -std::sin(th); n.gz = -std::sin(th);
+    dg_step_polarity(&n, &o_opp);
+    CHECK(near(o_opp.fin_deg[1], -o.fin_deg[1], 1e-3),
+          "polarity ascent opposite tilt: %g vs %g", o_opp.fin_deg[1], -o.fin_deg[1]);
+
+    // 5) Pure roll rate damping (w_roll = dot(w, b) = +1 rad/s -> all 4 fins negative equally)
+    std::memset(&n, 0, sizeof(n));
+    n.bz = -1.0f; n.gx = 1.0f; n.wz = -1.0f; n.valid = true;
+    dg_step_polarity(&n, &o);
+    for (int i = 0; i < 4; i++)
+        CHECK(o.fin_deg[i] < -0.05f && near(o.fin_deg[i], o.fin_deg[0], 1e-4),
+              "polarity roll damper fin %d: %g", i, o.fin_deg[i]);
+
+    // 6) Custom reference thrust override (10..250 N): lower thrust -> larger TVC deflection
+    std::memset(&n, 0, sizeof(n));
+    n.by = -std::sin(0.08f); n.bz = -std::cos(0.08f); n.gx = 1.0f; n.valid = true;
+    dg_out_t o_def, o_lo, o_hi;
+    dg_step_polarity(&n, &o_def, 0.0f);
+    dg_step_polarity(&n, &o_lo,  50.0f);
+    dg_step_polarity(&n, &o_hi,  200.0f);
+    CHECK(o_def.thrust_est > 85.0f && o_def.thrust_est < 100.0f,
+          "polarity default thrust_est=%g", o_def.thrust_est);
+    CHECK(near(o_lo.thrust_est, 50.0, 1e-3) && near(o_hi.thrust_est, 200.0, 1e-3),
+          "polarity custom thrust_est lo=%g hi=%g", o_lo.thrust_est, o_hi.thrust_est);
+    CHECK(o_lo.servo2_deg > 0.5f && o_hi.servo2_deg > 0.5f
+          && !near(o_lo.servo2_deg, o_hi.servo2_deg, 0.2),
+          "polarity custom thrust changes TVC gain: lo=%g hi=%g", o_lo.servo2_deg, o_hi.servo2_deg);
+}
+
 int main()
 {
     std::printf("guidance v2 (LandSim_Light port)\n");
     test_golden();
     test_properties();
     test_state_machine();
+    test_polarity();
     test_closed_loop();
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

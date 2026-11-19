@@ -1877,6 +1877,35 @@ def pick_font(app: QtWidgets.QApplication) -> None:
             return
 
 
+def find_app_icon() -> str | None:
+    """Locate tools/windows/daidalos.ico in the repo or Windows install dir."""
+    root = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+    cands = [os.path.join(root, "tools", "windows", "daidalos.ico")]
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        cands.append(os.path.join(local, "Daidalos", "daidalos.ico"))
+    for path in cands:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def set_windows_app_id(app_id: str) -> None:
+    """Give the process its own Windows taskbar identity instead of pythonw.exe."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
+def load_app_icon() -> QtGui.QIcon:
+    path = find_app_icon()
+    return QtGui.QIcon(path) if path else QtGui.QIcon()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--port", help="sériový port Masteru, např. COM5 nebo /dev/ttyACM0")
@@ -1885,14 +1914,20 @@ def main() -> int:
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
+    set_windows_app_id("VoltinoLabs.Daidalos.Aktuatory")
     QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    icon = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     QtCore.QLocale.setDefault(QtCore.QLocale(QtCore.QLocale.Language.Czech, QtCore.QLocale.Country.CzechRepublic))
     pick_font(app)
     app.setStyleSheet(QSS)
     win = MainWindow(args.config, args.demo, args.port)
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     win.show()
     if args.screenshot:
         def shot():

@@ -169,6 +169,7 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_batt.h:$(V2)/Master_MCU/ariadna_batt.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Master_MCU/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Position_MCU/ariadna_link.h \
+  $(V2)/common/ariadna_hil.h:$(V2)/Position_MCU/ariadna_hil.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
   $(V2)/common/ariadna_kf.h:$(V2)/Position_MCU/ariadna_kf.h \
   $(V2)/common/ariadna_uwb.h:$(V2)/Position_MCU/ariadna_uwb.h \
@@ -206,6 +207,20 @@ sync-fix:
 # ---------------------------------------------------------------------
 pyfmt:
 	python3 check_py_format.py
+
+# ---------------------------------------------------------------------
+# Hardware-in-the-Loop (HIL) USB injection protocol & 6-DOF simulator.
+# ---------------------------------------------------------------------
+HIL_H   = $(V2)/common/ariadna_hil.h
+
+hil: hil_test
+	./hil_test
+
+hil_test: hil_test.cpp $(HIL_H) $(LINK_H)
+	$(CXX) $(CXXFLAGS) -o hil_test hil_test.cpp -lm
+
+hilfmt:
+	python3 check_hil_format.py
 
 # ---------------------------------------------------------------------
 # Type- and format-check the sketches without a board. Compile only:
@@ -281,7 +296,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink link batt sync pyfmt calib syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -289,5 +304,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test guid_test seq_test link_test est_test uwb_test uwb_link_test actcon_test
-.PHONY: all guid seq tables est uwb uwblink link batt sync sync-fix pyfmt syntax check golden clean actcon
+	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test actcon_test batt_test bench_test
+.PHONY: all guid seq tables est uwb uwblink link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix

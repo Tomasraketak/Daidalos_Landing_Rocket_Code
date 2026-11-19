@@ -1311,3 +1311,138 @@ void dg_step_planner(const dg_nav_t *nav)
                                                 DG_CLAMP_MAX, true);
     }
 }
+
+// =====================================================================
+//  BENCH POLARITY TEST — real IMU attitude, pyros OFF
+//
+//  Uses the exact same gimbal basis, TVC dynamic inversion (landing burn)
+//  and fin mixer (ascent vertical hold + roll damping) as dg_step_control()
+//  so tilting the rocket by hand immediately verifies every sign in the
+//  chain (IMU -> attitude -> Navigation MCU -> Master MCU -> PCA9685).
+// =====================================================================
+// Average of time-weighted mean and median thrust of the reference thrust curve.
+static float pol_ref_thrust(void)
+{
+    const float mean_t = (DG_BURN_T > 1e-6f)
+        ? (DG_I_TOTAL / DG_BURN_T) * P.thrust_scale
+        : DG_T_SCHED_REF;
+    const int N = 64;
+    float s[N];
+    for (int i = 0; i < N; i++) {
+        float t = ((float)i + 0.5f) * (DG_BURN_T / (float)N);
+        s[i] = dg_thrust_ref(t);
+    }
+    for (int i = 1; i < N; i++) {
+        float key = s[i];
+        int j = i - 1;
+        while (j >= 0 && s[j] > key) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = key;
+    }
+    const float med_t = 0.5f * (s[N / 2 - 1] + s[N / 2]);
+    const float t_ref = 0.5f * (mean_t + med_t);
+    return t_ref > 8.0f ? t_ref : 8.0f;
+}
+
+void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out, float ref_thrust_n)
+{
+    memset(out, 0, sizeof(*out));
+    out->clamp          = DG_CLAMP_MAX;
+    out->phase          = DG_PHASE_IDLE;
+    out->t_to_ignition  = -1.0f;
+    out->t_to_touchdown = -1.0f;
+    out->t_burn         = -1.0f;
+    out->t_scale        = 1.0f;
+    out->k_plan         = DG_CLAMP_MAX;
+    out->fin_gain       = 1.0f;
+    out->drag_scale     = 1.0f;
+    if (!nav) return;
+
+    float b[3] = { nav->bx, nav->by, nav->bz };
+    {
+        float n = sqrtf(dot3(b, b));
+        if (n < 0.5f) return;
+        b[0] /= n;  b[1] /= n;  b[2] /= n;
+    }
+
+    // Nearest vertical: u = (0,0,+1) when held nose-down (landing orientation),
+    // u = (0,0,-1) when held nose-up (launch orientation), with hysteresis so
+    // flipping the airframe through horizontal does not chatter.
+    static float s_pol_uz = -1.0f;
+    if (b[2] > 0.25f)       s_pol_uz =  1.0f;
+    else if (b[2] < -0.25f) s_pol_uz = -1.0f;
+    const float u[3] = { 0.0f, 0.0f, s_pol_uz };
+
+    float u1[3], u2[3];
+    dg_gimbal_basis(b[0], b[1], b[2], nav->gx, nav->gy, nav->gz,
+                    &u1[0], &u1[1], &u1[2], &u2[0], &u2[1], &u2[2]);
+
+    // Attitude error rotation vector b -> u (same as dg_step_control S5 step 1)
+    float e[3];
+    cross3(b, u, e);
+    float cn = sqrtf(dot3(e, e));
+    float bu = dot3(b, u);
+    float ang = 0.0f;
+    if (cn > 1e-9f) {
+        ang = asinf(clampf(cn, -1.0f, 1.0f));
+        if (bu < 0.0f) ang = 3.14159265f - ang;
+        float sc = ang / cn;
+        e[0] *= sc;  e[1] *= sc;  e[2] *= sc;
+    } else {
+        e[0] = e[1] = e[2] = 0.0f;
+        if (bu < 0.0f) ang = 3.14159265f;
+    }
+    out->tilt_err = ang;
+
+    const float w[3] = { nav->wx, nav->wy, nav->wz };
+    const float w_roll = dot3(w, b);
+    const float wt[3]  = { w[0] - w_roll * b[0], w[1] - w_roll * b[1], w[2] - w_roll * b[2] };
+    out->roll_rate = w_roll;
+
+    const float mass = P.mass_gross;
+    const float I_t  = mass * DG_IT_PER_KG;
+    const float I_a  = mass * DG_IA_PER_KG;
+
+    // 1) TVC: landing-burn 0 deg attitude-hold at reference thrust (default: avg of mean & median)
+    {
+        const float t_est  = (ref_thrust_n > 0.0f)
+            ? clampf(ref_thrust_n, 10.0f, 250.0f)
+            : pol_ref_thrust();
+        out->thrust_est    = t_est;
+        const float fac    = (P.sched_tvc != 0.0f) ? powf(t_est / DG_T_SCHED_REF, P.sched_tvc) : 1.0f;
+        const float wn_a   = P.wn_tvc * clampf(fac, DG_SCHED_LO, DG_SCHED_HI);
+        const float k_rate = 2.0f * P.zeta_tvc * wn_a;
+        const float k_th   = wn_a / (2.0f * P.zeta_tvc);
+        float tr[3];
+        for (int i = 0; i < 3; i++) tr[i] = I_t * k_rate * (k_th * e[i] - wt[i]);
+
+        float sq[3];
+        cross3(b, tr, sq);
+        const float inv = 1.0f / (t_est * DG_L_GIMBAL);
+        const float sd1 = clampf(dot3(sq, u1) * inv, -0.999f, 0.999f);
+        const float sd2 = clampf(dot3(sq, u2) * inv, -0.999f, 0.999f);
+        float cmd1 = clampf(asinf(sd1) * RAD * DG_TVC_RATIO, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG);
+        float cmd2 = clampf(asinf(sd2) * RAD * DG_TVC_RATIO, -DG_SERVO_MAX_DEG, DG_SERVO_MAX_DEG);
+        out->servo1_deg = floorf(cmd1 / DG_SERVO_QUANT + 0.5f) * DG_SERVO_QUANT;
+        out->servo2_deg = floorf(cmd2 / DG_SERVO_QUANT + 0.5f) * DG_SERVO_QUANT;
+    }
+
+    // 2) Fins: ascent 0 deg attitude-hold + roll damping at nominal axial airspeed
+    if (P.fin_enable > 0.5f) {
+        const float v_ref = 22.0f;           // m/s axial airflow, nose (-b) to tail (+b)
+        const float v[3]  = { -v_ref * b[0], -v_ref * b[1], -v_ref * b[2] };
+        const float q     = 0.5f * DG_RHO * v_ref * v_ref;
+        const float fac   = (P.sched_fin != 0.0f) ? powf(q / DG_Q_SCHED_REF, P.sched_fin) : 1.0f;
+        const float wn_a  = P.wn_fin * clampf(fac, DG_SCHED_LO, DG_SCHED_HI);
+        const float k_rate = 2.0f * P.zeta_fin * wn_a;
+        const float k_th   = wn_a / (2.0f * P.zeta_fin);
+        float tr[3];
+        for (int i = 0; i < 3; i++) tr[i] = I_t * k_rate * (k_th * e[i] - wt[i]);
+        const float tau_roll = I_a * P.roll_gain * (0.0f - w_roll);
+        const float trim0[3] = { 0.0f, 0.0f, 0.0f };
+        dg_fin_mix(b, u1, u2, v, tr, tau_roll, 0.0f, 1.0f, trim0, true, out->fin_deg);
+        out->fins_live = true;
+    }
+}
