@@ -1346,7 +1346,8 @@ static float pol_ref_thrust(void)
     return t_ref > 8.0f ? t_ref : 8.0f;
 }
 
-void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out, float ref_thrust_n)
+void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out,
+                      float ref_thrust_n, float ref_speed_ms)
 {
     memset(out, 0, sizeof(*out));
     out->clamp          = DG_CLAMP_MAX;
@@ -1429,9 +1430,11 @@ void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out, float ref_thrust_n)
         out->servo2_deg = floorf(cmd2 / DG_SERVO_QUANT + 0.5f) * DG_SERVO_QUANT;
     }
 
-    // 2) Fins: ascent 0 deg attitude-hold + roll damping at nominal axial airspeed
+    // 2) Fins: ascent 0 deg attitude-hold + roll damping at axial airspeed (default 40 m/s, 5..70 m/s)
     if (P.fin_enable > 0.5f) {
-        const float v_ref = 22.0f;           // m/s axial airflow, nose (-b) to tail (+b)
+        const float v_ref = (ref_speed_ms > 0.0f)
+            ? clampf(ref_speed_ms, 5.0f, 70.0f)
+            : 40.0f;                         // m/s axial airflow, nose (-b) to tail (+b)
         const float v[3]  = { -v_ref * b[0], -v_ref * b[1], -v_ref * b[2] };
         const float q     = 0.5f * DG_RHO * v_ref * v_ref;
         const float fac   = (P.sched_fin != 0.0f) ? powf(q / DG_Q_SCHED_REF, P.sched_fin) : 1.0f;

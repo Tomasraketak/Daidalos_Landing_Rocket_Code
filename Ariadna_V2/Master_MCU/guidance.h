@@ -280,7 +280,10 @@ void dg_fin_mix(const float b[3], const float u1[3], const float u2[3],
  *
  * ref_thrust_n: reference thrust for TVC [N]; <= 0 uses the default
  *               avg(mean, median) of the reference thrust curve.
+ * ref_speed_ms: axial airspeed for fins [m/s]; <= 0 uses the default 40 m/s
+ *               (clamped to 5..70 m/s when > 0).
  */
-void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out, float ref_thrust_n = 0.0f);
+void dg_step_polarity(const dg_nav_t *nav, dg_out_t *out,
+                      float ref_thrust_n = 0.0f, float ref_speed_ms = 0.0f);
 
 #endif // DAIDALOS_GUIDANCE_H

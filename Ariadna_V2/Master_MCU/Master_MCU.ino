@@ -396,6 +396,7 @@ static bool     s_hil_pyro    = false;
 // Bench TVC+fin polarity check on real IMU attitude (ground IDLE, pyros OFF)
 static bool     s_polarity    = false;
 static float    s_pol_thrust_n = 0.0f;  // 0 = default avg(mean, median); 10..250 N override
+static float    s_pol_speed_ms = 0.0f;  // 0 = default 40 m/s; 5..70 m/s override
 static float    s_pwm_hz      = 339.0f;          // PCA_PWM_HZ outside TEST
 static uint16_t s_test_us[16];                   // commanded pulse, 0 = off
 static bool     s_test_awake[16];
@@ -2629,7 +2630,8 @@ static void console_line(char *line)
             for (char *q = a1; *q; q++) *q = (char)toupper((unsigned char)*q);
         }
         if (!a1 || !strcmp(a1, "STATUS")) {
-            usb_printf("OK POLARITY STATUS %d %.0f\n", s_polarity ? 1 : 0, (double)s_pol_thrust_n);
+            usb_printf("OK POLARITY STATUS %d %.0f %.0f\n",
+                       s_polarity ? 1 : 0, (double)s_pol_thrust_n, (double)s_pol_speed_ms);
             return;
         }
         if (!strcmp(a1, "THRUST")) {
@@ -2647,6 +2649,23 @@ static void console_line(char *line)
             }
             if (s_polarity) send_master_state();
             usb_printf("OK POLARITY THRUST %.0f\n", (double)s_pol_thrust_n);
+            return;
+        }
+        if (!strcmp(a1, "SPEED")) {
+            if (!a2) {
+                usb_printf("ERR POLARITY SPEED <0|5..70>\n");
+                return;
+            }
+            float v = (float)atof(a2);
+            if (v <= 0.0f) {
+                s_pol_speed_ms = 0.0f;
+            } else {
+                if (v < 5.0f) v = 5.0f;
+                if (v > 70.0f) v = 70.0f;
+                s_pol_speed_ms = v;
+            }
+            if (s_polarity) send_master_state();
+            usb_printf("OK POLARITY SPEED %.0f\n", (double)s_pol_speed_ms);
             return;
         }
         if (a1[0] == '0') {
@@ -2684,12 +2703,17 @@ static void console_line(char *line)
                 if (v <= 0.0f) s_pol_thrust_n = 0.0f;
                 else           s_pol_thrust_n = (v < 10.0f) ? 10.0f : (v > 250.0f ? 250.0f : v);
             }
+            if (a3) {
+                float v = (float)atof(a3);
+                if (v <= 0.0f) s_pol_speed_ms = 0.0f;
+                else           s_pol_speed_ms = (v < 5.0f) ? 5.0f : (v > 70.0f ? 70.0f : v);
+            }
             s_polarity = true;
             send_master_state();
             usb_printf("OK POLARITY 1\n");
             return;
         }
-        usb_printf("ERR POLARITY 1 [N] | 0 | THRUST <0|10..250> | STATUS\n");
+        usb_printf("ERR POLARITY 1 [N] [m/s] | 0 | THRUST <0|10..250> | SPEED <0|5..70> | STATUS\n");
         return;
     }
     if (!strcmp(cmd, "SERVOCHECK")) {
@@ -3097,6 +3121,7 @@ static void send_master_state(void)
     if (s_polarity && s_state == ARIADNA_STATE_IDLE) {
         ms.flags2 |= ARIADNA_MST2_POLARITY_TEST;
         ms.flags2 |= ariadna_pol_thrust_encode(s_pol_thrust_n);
+        ms.t_launch_ms = ariadna_pol_speed_encode(s_pol_speed_ms);
     }
     send_to(&s_tx_pos, POS_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));
     send_to(&s_tx_nav, NAV_PORT, ARIADNA_PKT_MASTER_STATE, &ms, sizeof(ms));

@@ -777,7 +777,7 @@ static void test_polarity()
     n.valid = true;
     dg_step_polarity(&n, &o);
     CHECK(o.fins_live, "polarity ascent: fins must be live");
-    CHECK(o.fin_deg[1] > 5.0f && near(o.fin_deg[3], -o.fin_deg[1], 1e-3),
+    CHECK(o.fin_deg[1] > 0.3f && near(o.fin_deg[3], -o.fin_deg[1], 1e-3),
           "polarity ascent fin pair 1/3: %g, %g", o.fin_deg[1], o.fin_deg[3]);
     CHECK(near(o.fin_deg[0], 0.0, 1e-3) && near(o.fin_deg[2], 0.0, 1e-3),
           "polarity ascent fin pair 0/2: %g, %g", o.fin_deg[0], o.fin_deg[2]);
@@ -792,7 +792,7 @@ static void test_polarity()
     n.bz = -1.0f; n.gx = 1.0f; n.wz = -1.0f; n.valid = true;
     dg_step_polarity(&n, &o);
     for (int i = 0; i < 4; i++)
-        CHECK(o.fin_deg[i] < -0.05f && near(o.fin_deg[i], o.fin_deg[0], 1e-4),
+        CHECK(o.fin_deg[i] < -0.01f && near(o.fin_deg[i], o.fin_deg[0], 1e-4),
               "polarity roll damper fin %d: %g", i, o.fin_deg[i]);
 
     // 6) Custom reference thrust override (10..250 N): lower thrust -> larger TVC deflection
@@ -809,6 +809,17 @@ static void test_polarity()
     CHECK(o_lo.servo2_deg > 0.5f && o_hi.servo2_deg > 0.5f
           && !near(o_lo.servo2_deg, o_hi.servo2_deg, 0.2),
           "polarity custom thrust changes TVC gain: lo=%g hi=%g", o_lo.servo2_deg, o_hi.servo2_deg);
+
+    // 7) Custom airspeed override (5..70 m/s, default 40 m/s): lower speed -> larger fin deflection
+    dg_out_t o_vdef, o_v40, o_vlo, o_vhi;
+    dg_step_polarity(&n, &o_vdef, 0.0f, 0.0f);
+    dg_step_polarity(&n, &o_v40,  0.0f, 40.0f);
+    dg_step_polarity(&n, &o_vlo,  0.0f, 15.0f);
+    dg_step_polarity(&n, &o_vhi,  0.0f, 60.0f);
+    CHECK(near(o_vdef.fin_deg[0], o_v40.fin_deg[0], 1e-4),
+          "polarity default speed is 40 m/s: def=%g v40=%g", o_vdef.fin_deg[0], o_v40.fin_deg[0]);
+    CHECK(std::fabs(o_vlo.fin_deg[0]) > std::fabs(o_vhi.fin_deg[0]) && std::fabs(o_vhi.fin_deg[0]) > 0.01f,
+          "polarity lower airspeed demands larger fin deflection: v15=%g v60=%g", o_vlo.fin_deg[0], o_vhi.fin_deg[0]);
 }
 
 int main()

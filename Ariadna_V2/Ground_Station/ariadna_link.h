@@ -528,6 +528,25 @@ static inline float ariadna_pol_thrust_decode(uint8_t flags2)
     return 10.0f + 2.0f * (float)(code - 1u);
 }
 
+// Polarity-test airspeed override carried in ariadna_master_state_t.t_launch_ms
+// ONLY while (flags2 & ARIADNA_MST2_POLARITY_TEST) && state == ARIADNA_STATE_IDLE
+// (t_launch_ms is unused in IDLE). 0 = default (40 m/s); otherwise 5..70 m/s.
+static inline uint32_t ariadna_pol_speed_encode(float speed_ms)
+{
+    if (speed_ms <= 0.0f) return 0u;
+    if (speed_ms < 5.0f)  speed_ms = 5.0f;
+    if (speed_ms > 70.0f) speed_ms = 70.0f;
+    return (uint32_t)(int)(speed_ms + 0.5f);
+}
+
+static inline float ariadna_pol_speed_decode(uint32_t raw)
+{
+    if (raw == 0u)  return 0.0f;
+    if (raw < 5u)   return 5.0f;
+    if (raw > 70u)  return 70.0f;
+    return (float)raw;
+}
+
 /** Master flight state machine. Broadcast to both XIAOs at 10 Hz. */
 typedef struct {
     uint32_t t_ms;         // master mission clock

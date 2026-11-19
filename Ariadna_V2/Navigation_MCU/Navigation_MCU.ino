@@ -820,10 +820,11 @@ void loop()
     const bool pol_mode = polarity_test_active();
     if (pol_mode) {
         const float pol_thr = ariadna_pol_thrust_decode(s_master.flags2);
+        const float pol_spd = ariadna_pol_speed_decode(s_master.t_launch_ms);
         if (s_have_state && state_fresh && (s_state.flags & ARIADNA_NAV_IMU_OK)) {
-            dg_step_polarity(&s_dg_nav, &s_dg_out, pol_thr);
+            dg_step_polarity(&s_dg_nav, &s_dg_out, pol_thr, pol_spd);
         } else {
-            dg_step_polarity(nullptr, &s_dg_out, pol_thr);
+            dg_step_polarity(nullptr, &s_dg_out, pol_thr, pol_spd);
         }
     } else {
         phase_logic();

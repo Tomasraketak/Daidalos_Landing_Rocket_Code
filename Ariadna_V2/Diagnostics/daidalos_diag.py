@@ -334,6 +334,7 @@ class FlightSimBoard(ag.SimBoard):
         self.polarity = False
         self._pol_uz = -1.0
         self._pol_thrust_n = 0.0
+        self._pol_speed_ms = 0.0
         self._pol_demo_tilt: tuple[float, float, bool] | None = None
         self.next_h = 0.0
         self._hil_pos_t = 0.0
@@ -541,7 +542,8 @@ class FlightSimBoard(ag.SimBoard):
         if c == "POLARITY":
             sub = p[1].upper() if len(p) > 1 else "STATUS"
             if sub == "STATUS":
-                self.q.put(f"OK POLARITY STATUS {1 if self.polarity else 0} {self._pol_thrust_n:.0f}")
+                self.q.put(f"OK POLARITY STATUS {1 if self.polarity else 0} "
+                           f"{self._pol_thrust_n:.0f} {self._pol_speed_ms:.0f}")
                 return
             if sub == "THRUST":
                 if len(p) < 3:
@@ -554,6 +556,18 @@ class FlightSimBoard(ag.SimBoard):
                     return
                 self._pol_thrust_n = 0.0 if v <= 0.0 else max(10.0, min(250.0, v))
                 self.q.put(f"OK POLARITY THRUST {self._pol_thrust_n:.0f}")
+                return
+            if sub == "SPEED":
+                if len(p) < 3:
+                    self.q.put("ERR POLARITY SPEED <0|5..70>")
+                    return
+                try:
+                    v = float(p[2])
+                except ValueError:
+                    self.q.put("ERR POLARITY SPEED <0|5..70>")
+                    return
+                self._pol_speed_ms = 0.0 if v <= 0.0 else max(5.0, min(70.0, v))
+                self.q.put(f"OK POLARITY SPEED {self._pol_speed_ms:.0f}")
                 return
             if sub == "0":
                 self.polarity = False
@@ -576,10 +590,16 @@ class FlightSimBoard(ag.SimBoard):
                         self._pol_thrust_n = 0.0 if v <= 0.0 else max(10.0, min(250.0, v))
                     except ValueError:
                         pass
+                if len(p) >= 4:
+                    try:
+                        v = float(p[3])
+                        self._pol_speed_ms = 0.0 if v <= 0.0 else max(5.0, min(70.0, v))
+                    except ValueError:
+                        pass
                 self.polarity = True
                 self.q.put("OK POLARITY 1")
                 return
-            self.q.put("ERR POLARITY 1 [N] | 0 | THRUST <0|10..250> | STATUS")
+            self.q.put("ERR POLARITY 1 [N] [m/s] | 0 | THRUST <0|10..250> | SPEED <0|5..70> | STATUS")
             return
         if c == "POLSIM" and len(p) >= 4:
             try:
@@ -899,7 +919,9 @@ class FlightSimBoard(ag.SimBoard):
             b_vec = (R[0][1], R[1][1], R[2][1])
             g_vec = (R[0][0], R[1][0], R[2][0])
             pol = hs.polarity_step(b_vec, g_vec, (0.0, 0.0, 0.0),
-                                   uz_hint=self._pol_uz, ref_thrust_n=self._pol_thrust_n)
+                                   uz_hint=self._pol_uz,
+                                   ref_thrust_n=self._pol_thrust_n,
+                                   ref_speed_ms=self._pol_speed_ms)
             self._pol_uz = pol["uz"]
             tvc = pol["tvc_deg"]
             fin = pol["fin_deg"]
@@ -1212,6 +1234,42 @@ class DiagWindow(ag.MainWindow):
         thr_row.addStretch(1)
         cl.addLayout(thr_row)
 
+        self._pol_default_speed = 40
+        self._pol_speed_custom = False
+        self._pol_spd_timer = QtCore.QTimer(self)
+        self._pol_spd_timer.setSingleShot(True)
+        self._pol_spd_timer.setInterval(60)
+        self._pol_spd_timer.timeout.connect(self._send_pol_speed)
+
+        spd_row = QtWidgets.QHBoxLayout()
+        spd_row.setSpacing(10)
+        spd_lbl_title = QtWidgets.QLabel("Rychlost (křidélka):")
+        spd_lbl_title.setMinimumWidth(thr_lbl_title.sizeHint().width())
+        spd_lbl_title.setToolTip(
+            "Rychlost proudění pro výpočet výchylky křidélek při testu polarity (5–70 m/s). "
+            "Vyšší rychlost = vyšší dynamický tlak a menší potřebná výchylka. Výchozí: 40 m/s."
+        )
+        self.pol_spd_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.pol_spd_slider.setRange(5, 70)
+        self.pol_spd_slider.setSingleStep(1)
+        self.pol_spd_slider.setPageStep(5)
+        self.pol_spd_slider.setValue(self._pol_default_speed)
+        self.pol_spd_slider.setFixedWidth(220)
+        self.pol_spd_lbl = QtWidgets.QLabel(f"{self._pol_default_speed} m/s (výchozí)")
+        self.pol_spd_lbl.setMinimumWidth(130)
+        self.pol_spd_reset = button(
+            "Výchozí", "",
+            f"Vrátí rychlost rakety pro křidélka na výchozí hodnotu ({self._pol_default_speed} m/s).",
+        )
+        self.pol_spd_reset.clicked.connect(self._reset_pol_speed)
+        self.pol_spd_slider.valueChanged.connect(self._on_pol_speed_changed)
+        spd_row.addWidget(spd_lbl_title)
+        spd_row.addWidget(self.pol_spd_slider)
+        spd_row.addWidget(self.pol_spd_lbl)
+        spd_row.addWidget(self.pol_spd_reset)
+        spd_row.addStretch(1)
+        cl.addLayout(spd_row)
+
         self.pol_kv = KV([
             "Reálný náklon",
             "Úhlová rychlost roll",
@@ -1279,11 +1337,30 @@ class DiagWindow(ag.MainWindow):
             arg = self.pol_thr_slider.value() if self._pol_thrust_custom else 0
             self.link.send(f"POLARITY THRUST {arg}")
 
+    def _on_pol_speed_changed(self, val: int) -> None:
+        self._pol_speed_custom = True
+        self.pol_spd_lbl.setText(f"{val} m/s")
+        self._pol_spd_timer.start()
+
+    def _reset_pol_speed(self) -> None:
+        self._pol_speed_custom = False
+        self.pol_spd_slider.blockSignals(True)
+        self.pol_spd_slider.setValue(self._pol_default_speed)
+        self.pol_spd_slider.blockSignals(False)
+        self.pol_spd_lbl.setText(f"{self._pol_default_speed} m/s (výchozí)")
+        self._send_pol_speed()
+
+    def _send_pol_speed(self) -> None:
+        if self.link.is_open and self.flight_fw:
+            arg = self.pol_spd_slider.value() if self._pol_speed_custom else 0
+            self.link.send(f"POLARITY SPEED {arg}")
+
     def _toggle_polarity(self) -> None:
         on = self.pol_btn.isChecked()
         if on:
-            arg = self.pol_thr_slider.value() if self._pol_thrust_custom else 0
-            self._cmd(f"POLARITY 1 {arg}")
+            thr = self.pol_thr_slider.value() if self._pol_thrust_custom else 0
+            spd = self.pol_spd_slider.value() if self._pol_speed_custom else 0
+            self._cmd(f"POLARITY 1 {thr} {spd}")
             if self.port_box.currentData() == "DEMO":
                 self._send_pol_demo()
         else:

@@ -1069,19 +1069,22 @@ def pol_ref_thrust(motor: MotorCurve | None = None, thrust_scale: float = 1.0) -
 
 
 def polarity_step(b, g, w, cfg: HilConfig | None = None, uz_hint: float = -1.0,
-                  ref_thrust_n: float = 0.0) -> dict:
+                  ref_thrust_n: float = 0.0, ref_speed_ms: float = 0.0) -> dict:
     """Exact Python mirror of C++ dg_step_polarity() (guidance.cpp).
 
     Drives TVC as in landing burn (0 deg vertical hold) and fins as in ascent
     (0 deg vertical hold + roll damping) from real attitude (b, g, w).
     ref_thrust_n <= 0 uses pol_ref_thrust() (avg of mean & median).
+    ref_speed_ms <= 0 uses default 40 m/s (clamped to 5..70 m/s when > 0).
     """
     c = cfg or HilConfig()
+    v_ref = _clamp(ref_speed_ms, 5.0, 70.0) if ref_speed_ms > 0.0 else 40.0
     bn = _norm(b)
     if bn < 0.5:
         return {"tvc_deg": (0.0, 0.0), "fin_deg": (0.0, 0.0, 0.0, 0.0),
                 "tilt_err": 0.0, "roll_rate": 0.0, "uz": uz_hint, "fins_live": False,
-                "ref_thrust_n": _clamp(ref_thrust_n, 10.0, 250.0) if ref_thrust_n > 0.0 else pol_ref_thrust(thrust_scale=c.thrust_scale)}
+                "ref_thrust_n": _clamp(ref_thrust_n, 10.0, 250.0) if ref_thrust_n > 0.0 else pol_ref_thrust(thrust_scale=c.thrust_scale),
+                "ref_speed_ms": v_ref}
     b = (b[0] / bn, b[1] / bn, b[2] / bn)
     uz = 1.0 if b[2] > 0.25 else (-1.0 if b[2] < -0.25 else uz_hint)
     u = (0.0, 0.0, uz)
@@ -1123,8 +1126,7 @@ def polarity_step(b, g, w, cfg: HilConfig | None = None, uz_hint: float = -1.0,
     cmd1 = math.floor(cmd1 / servo_quant + 0.5) * servo_quant
     cmd2 = math.floor(cmd2 / servo_quant + 0.5) * servo_quant
 
-    # 2) Fins: ascent 0 deg attitude-hold + roll damping at nominal axial airspeed
-    v_ref = 22.0
+    # 2) Fins: ascent 0 deg attitude-hold + roll damping at axial airspeed (default 40 m/s, 5..70 m/s)
     v = (-v_ref * b[0], -v_ref * b[1], -v_ref * b[2])
     q = 0.5 * RHO_AIR * v_ref * v_ref
     fac = (q / 700.0) ** DG_SCHED_FIN if DG_SCHED_FIN != 0.0 else 1.0
@@ -1143,6 +1145,7 @@ def polarity_step(b, g, w, cfg: HilConfig | None = None, uz_hint: float = -1.0,
         "uz": uz,
         "fins_live": True,
         "ref_thrust_n": t_est,
+        "ref_speed_ms": v_ref,
     }
 
 
