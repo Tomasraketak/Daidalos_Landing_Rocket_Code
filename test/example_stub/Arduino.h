@@ -17,6 +17,8 @@
 #define INPUT         0
 #define OUTPUT        1
 #define INPUT_PULLUP  2
+#define MSBFIRST      1
+#define SPI_MODE0     0
 
 #define D0   26
 #define D1   27

@@ -132,6 +132,10 @@ Pin numbers are raw `GPnn` GPIO numbers (`Master_MCU/Master_MCU.ino`).
 | GP28 / ADC2 | digital/analog in | RBF pin (`Q4` IRF9540NS gate + `R5`/`R6`/`R7` 10k network; removed = LOW) | `PIN_RBF` |
 | USB | USB CDC | Diagnostic console (`Diagnostics/daidalos_diag.py`) | `Serial` |
 
+> **Bench example, not flight:** `Examples/Static_Fire_Link` puts the Static Fire Stand on this same bus
+> as an I²C slave at `0x2C` (stand GP4/GP5 + GND to `I2C1`/`I2C2`; never the 3V3 pins). The flight
+> firmware does not use it, and the Rampa umbilical stays on the Navigation `I2CN` as above.
+
 ### PCA9685 Servo Channels (`U33`, addr `0x40`, 339 Hz digital servos only)
 
 Default channel map (editable via `srv.ch_*` parameters in flash):
