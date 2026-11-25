@@ -12,6 +12,8 @@ public:
     void    setClock(uint32_t) {}
     void    beginTransmission(uint8_t) {}
     size_t  write(uint8_t) { return 1; }
+    size_t  write(const uint8_t *, size_t n) { return n; }
+    int     available(void) { return 0; }
     uint8_t endTransmission(bool = true) { return 0; }
     uint8_t requestFrom(int, int) { return 0; }
     int     read(void) { return -1; }

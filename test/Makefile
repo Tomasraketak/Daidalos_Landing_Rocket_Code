@@ -14,6 +14,9 @@
 #   make bench    Ariadna V2 bench-test link (ping / pong / routing)
 #   make bench-sync  verify the bench sketches' copies of bench_common.h
 #   make actcon   Actuator Console pyro bridge: arming / firing safety rules
+#   make sflink   Static Fire Link: when to fire, the clamp profile, the stored record
+#   make sflink-sync  verify the stand's protocol header against the Static_Fire_Stand checkout
+#   make sflink-loop  both ends of the Static Fire Link against each other (needs that checkout)
 #   make calib    calibration fits of the diagnostic console (accel, magnetometer)
 #   make check    all of the above
 #
@@ -33,6 +36,7 @@ UWB_H   = $(V2)/common/ariadna_uwb.h
 UWBL_H  = $(V2)/common/ariadna_uwb_link.h
 EX_DIR  = $(V2)/Examples
 ACT_H   = $(V2)/common/actcon_pyro.h
+SFL_DIR = $(EX_DIR)/Static_Fire_Link
 
 all: host_test
 	./host_test
@@ -198,7 +202,9 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_link.h:$(EX_DIR)/Actuator_Console/ariadna_link.h \
   $(V2)/common/actcon_pyro.h:$(EX_DIR)/Actuator_Console/actcon_pyro.h \
   $(V2)/common/ariadna_link.h:$(EX_DIR)/Pyro_Companion/ariadna_link.h \
-  $(V2)/common/actcon_pyro.h:$(EX_DIR)/Pyro_Companion/actcon_pyro.h
+  $(V2)/common/actcon_pyro.h:$(EX_DIR)/Pyro_Companion/actcon_pyro.h \
+  $(V2)/common/ariadna_link.h:$(SFL_DIR)/ariadna_link.h \
+  $(V2)/common/actcon_pyro.h:$(SFL_DIR)/actcon_pyro.h
 
 sync:
 	@fail=0; for p in $(SYNC_PAIRS); do \
@@ -265,6 +271,8 @@ syntax: $(INO) stub/Arduino.h
 	    -x c++ -fsyntax-only $(EX_DIR)/Actuator_Console/Actuator_Console.ino
 	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(EX_DIR)/Pyro_Companion \
 	    -x c++ -fsyntax-only $(EX_DIR)/Pyro_Companion/Pyro_Companion.ino
+	$(CXX) $(CXXFLAGS) -Iexample_stub -I$(SFL_DIR) \
+	    -x c++ -fsyntax-only $(SFL_DIR)/Static_Fire_Link.ino
 	@echo "sketches compile clean"
 
 # ---------------------------------------------------------------------
@@ -281,6 +289,45 @@ actcon: actcon_test
 
 actcon_test: actcon_test.cpp $(ACT_H) $(LINK_H)
 	$(CXX) $(CXXFLAGS) -o actcon_test actcon_test.cpp
+
+# ---------------------------------------------------------------------
+# Static Fire Link (Examples/Static_Fire_Link). It fires an igniter on a
+# signal from another board and moves a clamp on a thrust threshold, so the
+# rules for that are tested like flight code. The three headers under test
+# are the sketch's own files, compiled unchanged.
+#
+# sflink_golden.h holds a real record in the stand's on-flash format, built
+# and decoded by the stand's own Python tools:
+#   make sflink-golden STAND=../../Static_Fire_Stand
+# ---------------------------------------------------------------------
+STAND ?= ../../Static_Fire_Stand
+SFL_HDRS = $(SFL_DIR)/sf_flaps.h $(SFL_DIR)/sf_run.h $(SFL_DIR)/sf_record.h $(SFL_DIR)/sf_link_proto.h
+
+sflink: sflink_test
+	./sflink_test
+
+sflink_test: sflink_test.cpp $(SFL_HDRS) sflink_golden.h
+	$(CXX) $(CXXFLAGS) -o sflink_test sflink_test.cpp -lm
+
+sflink-golden:
+	python3 gen_sflink_golden.py --stand $(STAND) > sflink_golden.h
+
+# Both ends of the link against each other (needs the stand checkout, since the
+# stand's side of the logic lives there). Skipped, loudly, without it.
+sflink-loop:
+	@if [ -f $(STAND)/firmware/StaticFire_Stand/sf_stand_link.h ]; then \
+	  $(CXX) $(CXXFLAGS) -DSTAND_LINK_H='"$(STAND)/firmware/StaticFire_Stand/sf_stand_link.h"' \
+	    -o sflink_loop_test sflink_loop_test.cpp -lm && ./sflink_loop_test; \
+	else echo "sflink-loop: skipped (no Static_Fire_Stand checkout at $(STAND))"; fi
+
+# The protocol header exists twice (the Arduino builder only sees a sketch's own
+# folder): the canonical one in the stand's repository, a copy here.
+sflink-sync:
+	@if [ -f $(STAND)/firmware/StaticFire_Stand/sf_link_proto.h ]; then \
+	  cmp -s $(STAND)/firmware/StaticFire_Stand/sf_link_proto.h $(SFL_DIR)/sf_link_proto.h \
+	    || { echo "sf_link_proto.h has drifted from $(STAND) - copy it over (the stand's is canonical)"; exit 1; }; \
+	  echo "sf_link_proto.h matches the Static_Fire_Stand checkout"; \
+	else echo "sflink-sync: skipped (no Static_Fire_Stand checkout at $(STAND))"; fi
 
 # ---------------------------------------------------------------------
 # Ariadna V2 bench tests. The sketches in Bench_Tests/ exist to tell a
@@ -310,7 +357,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink rampa link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon
+check: all guid seq est uwb uwblink rampa link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon sflink sflink-sync sflink-loop
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -318,5 +365,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test rampa_link_test actcon_test batt_test bench_test
-.PHONY: all guid seq tables est uwb uwblink rampa link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix
+	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test rampa_link_test actcon_test batt_test bench_test sflink_test sflink_loop_test
+.PHONY: all guid seq tables est uwb uwblink rampa link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix sflink sflink-golden sflink-sync sflink-loop
