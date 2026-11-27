@@ -98,6 +98,7 @@
 #include "ariadna_uwb_link.h"
 #include "ariadna_params.h"
 #include "ariadna_seq.h"          // ARIADNA_EV_LEGS: the lidar is on a leg
+#include "ariadna_vib.h"          // fw 3.35: in-flight vibration spectrum (core 1)
 // Named here, not only inside ariadna_rgb.h: the Arduino builder adds a
 // library's include path only when it sees a real #include of it, so the
 // header's __has_include probe on its own always reads "absent" and the
@@ -148,6 +149,29 @@
 //  supplies the rotation, the body rates and the world-frame acceleration
 //  that estimator integrates.
 // ---------------------------------------------------------------------
+// fw 3.35: IMU output rate 2 kHz instead of INSLIB's default 1 kHz.
+//
+//  * The vibration spectrum (section 7c) is asked for up to 500 Hz, and
+//    500 Hz is the Nyquist frequency of a 1 kHz stream - unusable.
+//  * The attitude filter gains as well: the gyro's power-on anti-alias
+//    filter (585 Hz) sat ABOVE the 500 Hz Nyquist at 1 kHz, so airframe
+//    vibration could fold down into the band INSLIB integrates. At 2 kHz
+//    it is well below Nyquist. INSLIB now averages ~8 samples per 240 Hz
+//    epoch instead of ~4; its dt comes from the sample count, so nothing
+//    else changes.
+//  * Cost: the FIFO read doubles to 32 kB/s, ~26 ms/s of 10 MHz SPI on
+//    core 0 (~2.6 %, was ~1.3 %). The 128-packet FIFO holds 64 ms (was
+//    128 ms), against a worst blocking I2C transaction of 10 ms.
+//
+// Check on the bench after flashing: the raw IMU line in the console must
+// show imu_hz ~240 and imu_overflow must not grow. 0 = back to 1 kHz; the
+// vibration spectrum then stops at 450 Hz and says so (LOWRATE). Only the
+// INSLIB path sets the rate; with ARIADNA_USE_INSLIB 0 the IMU stays at the
+// driver's 1 kHz.
+#ifndef ARIADNA_IMU_ODR_2K
+#  define ARIADNA_IMU_ODR_2K 1
+#endif
+
 #ifndef ARIADNA_USE_INSLIB
 #  define ARIADNA_USE_INSLIB 1
 #endif
@@ -2487,6 +2511,9 @@ static void attitude_begin(void)
     cfg.navRateHz     = (uint16_t)ESTIMATOR_HZ;
     cfg.gnssLatencyMs = 50;            // refined per fix from pos.gps_latency_ms
     cfg.autoZupt      = true;          // switched off at launch, see the loop
+#if ARIADNA_IMU_ODR_2K
+    cfg.imuOdr        = ODR_2KHZ;      // fw 3.35, see ARIADNA_IMU_ODR_2K
+#endif
     ins.setMounting(TriSenseINSMount::ComponentsUp);
     sensor.imu.setAccelOffset(ACC_OFFSET[0], ACC_OFFSET[1], ACC_OFFSET[2]);
     sensor.imu.setAccelScale(ACC_SCALE[0], ACC_SCALE[1], ACC_SCALE[2]);
@@ -2502,6 +2529,66 @@ static void attitude_begin(void)
     sensor.autoCalibrateGyro(1000);
     fusion.initOrientation(200);
 #endif
+}
+
+// =====================================================================
+//  7c. VIBRATION SPECTRUM (fw 3.35)
+//
+//  Which frequencies the vehicle shakes at, 0.5-500 Hz, logged by the
+//  Master for the whole flight. The method and its cost are described in
+//  ariadna_vib.h; the split of the work is what matters here:
+//
+//    core 0   vib_tap(): called by the Voltino driver for every IMU sample
+//             INSLIB reads (2 kHz), copies 12 bytes into a ring. Nothing
+//             else - no FFT, no bus, no wait.
+//    core 1   vib_service() in loop1(): decimation, FFTs, the frame.
+//             At most one set of six FFTs per call (~0.6 ms), so the GPS
+//             parser beside it never waits long.
+//    core 0   sends the frame (2 x 88 B, one per tick) when core 1 has one.
+//
+//  The tap needs Voltino_TriSense with ICM42688P::setSampleTap()
+//  (Ariadna_V2/patches/voltino_trisense_sample_tap.patch). Without it the
+//  firmware still builds and flies; the analyser just stays off and says
+//  so on the console at boot.
+// =====================================================================
+static vib_t           s_vib;                  // ~33 kB
+static volatile bool   s_vib_on    = false;    // set once, after vib_init()
+static ariadna_vib_t   s_vib_frame[2];         // core 1 -> core 0
+static volatile bool   s_vib_ready = false;
+static volatile uint32_t s_vib_dropped = 0;    // frames core 0 had no time to send
+
+static void vib_tap(const float acc_g[3], const float gyr_dps[3], void *ctx)
+{
+    (void)ctx;
+    vib_push(&s_vib, acc_g, gyr_dps);
+}
+
+static void vib_begin(void)
+{
+    const int odr = sensor.imu.getODRHz();
+    if (odr < 1000 || odr % 250 != 0) {
+        POS_PRINT("# vibration: IMU at %d Hz, analyser off\n", odr);
+        return;
+    }
+    vib_init(&s_vib, (uint16_t)odr);
+    if (!vib_install_tap(sensor.imu, &vib_tap, 0)) {
+        POS_PRINT("# vibration: Voltino_TriSense has no setSampleTap() - apply "
+                  "Ariadna_V2/patches/voltino_trisense_sample_tap.patch; analyser off\n");
+        return;
+    }
+    __atomic_store_n(&s_vib_on, true, __ATOMIC_RELEASE);
+    POS_PRINT("# vibration: IMU %d Hz, spectrum 0.5-500 Hz every 0.51 s (core 1)\n", odr);
+}
+
+/** Core 1, every pass of loop1(). */
+static void vib_core1(void)
+{
+    if (!__atomic_load_n(&s_vib_on, __ATOMIC_ACQUIRE)) return;
+    ariadna_vib_t f[2];
+    if (!vib_service(&s_vib, micros(), f)) return;
+    if (__atomic_load_n(&s_vib_ready, __ATOMIC_ACQUIRE)) { s_vib_dropped = s_vib_dropped + 1u; return; }
+    memcpy(s_vib_frame, f, sizeof(f));
+    __atomic_store_n(&s_vib_ready, true, __ATOMIC_RELEASE);
 }
 
 /**
@@ -3584,6 +3671,7 @@ void setup()
     if (sensors) {
         attitude_begin();
         s_cal_state = 1;
+        vib_begin();               // after INSLIB set the IMU rate
     }
 
     s_post_pass = self_test() && sensors;
@@ -4249,6 +4337,23 @@ void loop()
         link_send(ARIADNA_PKT_POS_STATUS, &ps, sizeof(ps));
     }
 
+    // ---- vibration spectrum, when core 1 has finished a frame (~2 Hz) -------
+    // One part per tick, so a tick never queues more than one extra frame.
+    {
+        static uint8_t vib_part = 0;
+        if (__atomic_load_n(&s_vib_ready, __ATOMIC_ACQUIRE)) {
+            ariadna_vib_t &vf = s_vib_frame[vib_part];
+            if (s_have_master && s_master.state >= ARIADNA_STATE_ASCENT &&
+                s_master.state <= ARIADNA_STATE_LANDED)
+                vf.stat |= ARIADNA_VIB_ST_FLIGHT;
+            link_send(ARIADNA_PKT_VIB, &vf, sizeof(vf));
+            if (++vib_part >= 2) {
+                vib_part = 0;
+                __atomic_store_n(&s_vib_ready, false, __ATOMIC_RELEASE);
+            }
+        }
+    }
+
     // ---- UWB per-anchor diagnostics, 2 Hz ----------------------------------
     // Built from values already in memory (no I2C traffic) so the GUI can
     // display each anchor's status, distance, RSSI and age.
@@ -4539,4 +4644,7 @@ void loop1()
 
     // ---- inbound from the Master -------------------------------------------
     link_poll();
+
+    // ---- vibration spectrum (section 7c) -------------------------------------
+    vib_core1();
 }

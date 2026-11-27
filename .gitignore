@@ -18,3 +18,4 @@ seq_test
 test/batt_test
 test/sflink_test
 test/sflink_loop_test
+test/vib_test

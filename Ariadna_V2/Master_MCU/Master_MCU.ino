@@ -349,6 +349,11 @@ static bool                  s_raw_on  = false;
 static volatile bool         s_raw_new = false;
 static ariadna_uwb_diag_t    s_uwb_diag;
 static volatile bool         s_uwb_diag_new = false;
+// Vibration spectrum from the Position MCU (fw 3.35), two parts per frame.
+// Bit p of each mask: part p arrived and is still to be logged / printed.
+static ariadna_vib_t         s_vib_rx[2];
+static uint8_t               s_vib_log_mask = 0;
+static uint8_t               s_vib_usb_mask = 0;
 static uint32_t              s_utc_base_ms  = 0;
 static uint32_t              s_utc_ref_ms   = 0;
 static bool                  s_utc_valid    = false;
@@ -947,6 +952,25 @@ struct LogRecord {
 #pragma pack(pop)
 ARIADNA_STATIC_ASSERT(sizeof(LogRecord) == 96, "LogRecord layout changed");
 
+/**
+ * Vibration spectrum record (fw 3.35): one part of an ariadna_vib_t frame
+ * from the Position MCU, in the same 96-byte slot as a LogRecord so the
+ * log stays a plain array of records. Told apart by bit 7 of the last
+ * byte (`flags`), which a LogRecord never sets; bit 0 is the same
+ * flight-rate bit. tools/daidalos_log.py decodes both.
+ */
+#define LOG_FLAG_VIB 0x80u
+#pragma pack(push, 1)
+struct VibLogRecord {
+    uint32_t      t_ms;        // Master clock when the part arrived
+    ariadna_vib_t v;           // 88 B, ariadna_link.h
+    uint8_t       _pad[3];
+    uint8_t       flags;       // LOG_FLAG_VIB | flight-rate bit
+};
+#pragma pack(pop)
+ARIADNA_STATIC_ASSERT(sizeof(VibLogRecord) == sizeof(LogRecord), "VibLogRecord must fill a log slot");
+ARIADNA_STATIC_ASSERT(offsetof(VibLogRecord, flags) == offsetof(LogRecord, flags), "flags at the same offset");
+
 // RAM ring, drained to flash by core 1.
 //
 // Sized for the worst case that actually happens: a 400 ms sector erase
@@ -1231,6 +1255,14 @@ static void poll_position(void)
         } else if (type == ARIADNA_PKT_UWB_DIAG) {
             // Stored only; printed by diag_emit() as a "U" JSON line at 2 Hz.
             if (ariadna_unpack(pl, len, &s_uwb_diag, sizeof(s_uwb_diag))) s_uwb_diag_new = true;
+        } else if (type == ARIADNA_PKT_VIB) {
+            // Stored only; logged by the 200 Hz tick, printed by diag_emit().
+            ariadna_vib_t v;
+            if (ariadna_unpack(pl, len, &v, sizeof(v)) && v.part < 2) {
+                s_vib_rx[v.part] = v;
+                s_vib_log_mask |= (uint8_t)(1u << v.part);
+                s_vib_usb_mask |= (uint8_t)(1u << v.part);
+            }
         } else if (type == ARIADNA_PKT_GPS_TIME) {
             ariadna_gps_time_t gt;
             if (ariadna_unpack(pl, len, &gt, sizeof(gt)) && gt.valid) {
@@ -2036,6 +2068,14 @@ static void flash_log_scan(void)
         for (uint32_t o = 0; o + LOG_REC_SZ <= len; o += LOG_REC_SZ) {
             const LogRecord *r = (const LogRecord *)(buf + o);
             const uint32_t idx = (a + o - LOG_BASE) / LOG_REC_SZ;
+            if (r->t_ms != 0xFFFFFFFFu && (r->flags & LOG_FLAG_VIB)) {
+                // A vibration record: part of the run it sits in (so that
+                // dumping the run's record range takes all of it), but no
+                // altitude and no say in where a run starts or ends.
+                if (in) s_seg[n - 1].count++;
+                s_scan_rec = idx;
+                continue;
+            }
             const bool fl = (r->flags & 1) && r->t_ms != 0xFFFFFFFFu;
             const bool brk = in && (r->t_ms < last_t || r->t_ms - last_t > 2000);
             if (in && (!fl || brk)) in = false;
@@ -2974,6 +3014,23 @@ static void diag_emit(void)
         if (n > 0 && n < (int)sizeof(b)) usb_puts_n(b, (uint16_t)n);
         n = 0;
     }
+    if (s_vib_usb_mask) {
+        // V <t_ms> <hex>: one part of a vibration frame, the 88-byte
+        // ariadna_vib_t as hex - the same bytes as in the log, so the GUI
+        // and tools/daidalos_log.py share one decoder.
+        const uint8_t p = (s_vib_usb_mask & 1u) ? 0u : 1u;
+        s_vib_usb_mask &= (uint8_t)~(1u << p);
+        static const char hx[] = "0123456789abcdef";
+        const uint8_t *vb = (const uint8_t *)&s_vib_rx[p];
+        n = snprintf(b, sizeof(b), "V %lu ", (unsigned long)millis());
+        for (uint16_t i = 0; i < sizeof(ariadna_vib_t) && n + 3 < (int)sizeof(b); i++) {
+            b[n++] = hx[vb[i] >> 4];
+            b[n++] = hx[vb[i] & 15];
+        }
+        b[n++] = '\n';
+        usb_puts_n(b, (uint16_t)n);
+        n = 0;
+    }
     if (s_uwb_diag_new) {
         s_uwb_diag_new = false;
         const ariadna_uwb_diag_t &u = s_uwb_diag;
@@ -3810,6 +3867,24 @@ void loop()
         r.health     = health_bits();
 
         log_push(&r);
+    }
+
+    // ---- vibration spectrum records (fw 3.35) -----------------------------
+    // ~4 parts a second from the Position MCU. In flight every one (375 B/s,
+    // 2 % of the log); on the ground one frame in four, so a bench knock
+    // test still lands in the log without filling it.
+    while (s_vib_log_mask) {
+        const uint8_t p = (s_vib_log_mask & 1u) ? 0u : 1u;
+        s_vib_log_mask &= (uint8_t)~(1u << p);
+        const ariadna_vib_t &v = s_vib_rx[p];
+        if (!s_flash_ok || s_hil) continue;
+        if (!in_flight && !(ground_ok && (v.seq & 3u) == 0)) continue;
+        VibLogRecord vr;
+        memset(&vr, 0, sizeof(vr));
+        vr.t_ms  = millis();
+        vr.v     = v;
+        vr.flags = (uint8_t)(LOG_FLAG_VIB | (in_flight ? 1u : 0u));
+        log_push((const LogRecord *)&vr);
     }
 
     // ---- USB diagnostics ----------------------------------------------------
