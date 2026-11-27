@@ -301,6 +301,11 @@ static void usb_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)
 // LogRecord *) have a prototype at all.
 struct LogRecord;
 
+// Same reason for the LoRa sync snapshot (section 10b): sync_acquire()
+// takes a LoRaSyncSnap *, and without this its generated prototype fails
+// with "'LoRaSyncSnap' was not declared in this scope".
+struct LoRaSyncSnap;
+
 // Parameter image stored in flash. Defined here (not next to its users) so the
 // Arduino-generated function prototypes can see the type.
 struct ParamImage {
