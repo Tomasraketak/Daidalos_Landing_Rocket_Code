@@ -2546,9 +2546,8 @@ static void attitude_begin(void)
 //             parser beside it never waits long.
 //    core 0   sends the frame (2 x 88 B, one per tick) when core 1 has one.
 //
-//  The tap needs Voltino_TriSense with ICM42688P::setSampleTap()
-//  (Ariadna_V2/patches/voltino_trisense_sample_tap.patch). Without it the
-//  firmware still builds and flies; the analyser just stays off and says
+//  The tap needs Voltino_TriSense >= 1.7.0 (ICM42688P::setSampleTap()).
+//  With an older library the firmware still builds and flies; the analyser just stays off and says
 //  so on the console at boot.
 // =====================================================================
 static vib_t           s_vib;                  // ~33 kB
@@ -2572,8 +2571,8 @@ static void vib_begin(void)
     }
     vib_init(&s_vib, (uint16_t)odr);
     if (!vib_install_tap(sensor.imu, &vib_tap, 0)) {
-        POS_PRINT("# vibration: Voltino_TriSense has no setSampleTap() - apply "
-                  "Ariadna_V2/patches/voltino_trisense_sample_tap.patch; analyser off\n");
+        POS_PRINT("# vibration: Voltino_TriSense has no setSampleTap() - "
+                  "update the library to >= 1.7.0; analyser off\n");
         return;
     }
     __atomic_store_n(&s_vib_on, true, __ATOMIC_RELEASE);
