@@ -19,3 +19,5 @@ test/batt_test
 test/sflink_test
 test/sflink_loop_test
 test/vib_test
+test/hil_test
+test/rampa_link_test
