@@ -1,0 +1,61 @@
+diff --git a/src/ICM42688P_voltino.cpp b/src/ICM42688P_voltino.cpp
+index 883a2b1..da15279 100644
+--- a/src/ICM42688P_voltino.cpp
++++ b/src/ICM42688P_voltino.cpp
+@@ -1296,14 +1296,21 @@ void ICM42688P::noteFIFOTimestamp(const uint8_t *packet, uint8_t tsOffset) {
+ }
+ 
+ bool ICM42688P::readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
++  bool ok;
+   switch (_fifoMode) {
+-    case FIFO_NONE: return readSensorData(ax, ay, az, gx, gy, gz);
+-    case FIFO_16BIT: return readHardwareFIFO(ax, ay, az, gx, gy, gz);
++    case FIFO_NONE: ok = readSensorData(ax, ay, az, gx, gy, gz); break;
++    case FIFO_16BIT: ok = readHardwareFIFO(ax, ay, az, gx, gy, gz); break;
+ #if !TRISENSE_LITE
+-    case FIFO_20BIT_HIRES: return readHardwareFIFOHires(ax, ay, az, gx, gy, gz);
++    case FIFO_20BIT_HIRES: ok = readHardwareFIFOHires(ax, ay, az, gx, gy, gz); break;
+ #endif
+-    default: return false;
++    default: ok = false; break;
+   }
++  if (ok && _sampleTap) {
++    const float a[3] = { ax, ay, az };
++    const float g[3] = { gx, gy, gz };
++    _sampleTap(a, g, _sampleTapCtx);
++  }
++  return ok;
+ }
+ 
+ bool ICM42688P::readFIFO(float& ax, float& ay, float& az, float& gx, float& gy, float& gz) {
+diff --git a/src/ICM42688P_voltino.h b/src/ICM42688P_voltino.h
+index e4e8324..0c5f7be 100644
+--- a/src/ICM42688P_voltino.h
++++ b/src/ICM42688P_voltino.h
+@@ -435,6 +435,17 @@ public:
+ #endif
+   bool readFIFO(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
+ 
++  // --- Per-sample tap (optional) ---
++  // Called with every sample readIMU()/readFIFO() hands out, in the same
++  // calibrated units (g, deg/s), after the caller's read succeeded. Lets a
++  // sketch see the full-rate stream while another consumer (a fusion
++  // library) owns the FIFO: reading the FIFO a second time would steal
++  // samples from it. Runs in the reader's context - keep it short and
++  // non-blocking (copy into a ring buffer and return). nullptr disables it.
++  // Cost when unused: one pointer test per sample.
++  typedef void (*SampleTap)(const float acc_g[3], const float gyr_dps[3], void *ctx);
++  void setSampleTap(SampleTap fn, void *ctx = nullptr) { _sampleTap = fn; _sampleTapCtx = ctx; }
++
+   // --- Calibration ---
+   // Selects register bank 0, the bank every other call in this driver expects.
+   // Kept as a recovery hook: if a sketch talks to the chip directly and leaves
+@@ -576,6 +587,8 @@ private:
+   uint8_t _uiAccelOrd = UI_FILT_2ND_ORDER;
+   float _uiGyroReqHz = 0;    // 0 = never requested: the ODR path leaves the UI filter alone
+   float _uiAccelReqHz = 0;
++  SampleTap _sampleTap = nullptr;
++  void *_sampleTapCtx = nullptr;
+   uint16_t _fifoTs = 0;
+   bool _fifoTsValid = false;
+ 

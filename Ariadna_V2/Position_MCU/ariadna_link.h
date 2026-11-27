@@ -115,7 +115,7 @@
 // showing three different numbers is a mixed flash, and a mixed flash is
 // the first thing to rule out when something makes no sense.
 //   major * 100 + minor
-#define ARIADNA_FW_VERSION   334   // 3.34: Bidirectional time-synced LoRa uplink (10 s + T-1 s final abort RX windows, <= 5 ms sync), Rampa umbilical I2C protocol + pre-liftoff detach, GPS UTC sync, Anchor D3 RGB & GS active-HIGH buttons. 3.33: UWB 34 B fast I2C frame (0.79 ms), Position MCU I2C sensor staggering (Core 0 WCET ~30 %), 2 Hz per-anchor UWB health diagnostics (ARIADNA_PKT_UWB_DIAG / USB "U" line). 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
+#define ARIADNA_FW_VERSION   335   // 3.35: in-flight vibration spectrum 0.5-500 Hz (Position MCU core 1, IMU 2 kHz via a Voltino driver sample tap, ARIADNA_PKT_VIB, 96 B log records + USB "V" line, tools/daidalos_log.py --vib-plot). 3.34: Bidirectional time-synced LoRa uplink (10 s + T-1 s final abort RX windows, <= 5 ms sync), Rampa umbilical I2C protocol + pre-liftoff detach, GPS UTC sync, Anchor D3 RGB & GS active-HIGH buttons. 3.33: UWB 34 B fast I2C frame (0.79 ms), Position MCU I2C sensor staggering (Core 0 WCET ~30 %), 2 Hz per-anchor UWB health diagnostics (ARIADNA_PKT_UWB_DIAG / USB "U" line). 3.32: Hardware-in-the-Loop (HIL) simulation mode (USB synthetic sensor injection into Position MCU, Master HIL command + 50 Hz H telemetry, Navigation ARIADNA_MST_PYRO_INHIBIT). 3.31: buzzer start-up tune and OK / FAIL verdict after the vehicle has finished its own start-up ("su" in the Master M line). 3.30: battery: current/voltage averaged from the 200 Hz ADC, air temperature every 30 s, the health corrects itself (batt.learn, layout 7). 3.29: battery state of charge and run time to 20 % (common/ariadna_batt.h, parameters batt.*, layout 6, "bat" in the Master M line). 3.28: servo channel map and per-servo pulse limits are parameters (srv.ch_*, srv.*_min_us/_max_us, layout 5, 232 ids), default map TVC 5/6, clamp 7, cover 8, fins 9-12. 3.27: gyro zero offset saved as parameters (imu.gyr_off_*), fallback when the boot calibration was disturbed; raw IMU packet carries the offset. 3.26: attitude filter polled every loop pass (was aliasing to 120 Hz), 240 Hz epochs. 3.25: IMU calibration + pad position as parameters, servo connection check. 3.24: TriSense mounted -Y = nose (thrust +Y), raw IMU stream for the GUI. 3.23: TF-Luna via TFLuna_I2C 1.1.0. 3.22: RBF polarity as wired. 3.21: UART RX buffer + link polled every pass, IMU FIFO no longer stolen, provisional pad ref, baro in burn, TF-Luna fresh frames
 
 // ---------------------------------------------------------------------
 //  Framing constants
@@ -140,6 +140,7 @@ typedef enum {
     ARIADNA_PKT_RAW_IMU      = 0x12,  // Position -> Master, only on request (diagnostics)
     ARIADNA_PKT_UWB_DIAG     = 0x13,  // Position -> Master, 2 Hz per-anchor UWB health
     ARIADNA_PKT_GPS_TIME     = 0x14,  // Position -> Master, 1 Hz GPS UTC time sync
+    ARIADNA_PKT_VIB          = 0x15,  // Position -> Master, ~2 Hz vibration spectrum (2 parts)
     ARIADNA_PKT_ACTUATOR     = 0x20,  // Navigation -> Master
     ARIADNA_PKT_NAV_STATUS   = 0x21,  // Navigation -> Master
     ARIADNA_PKT_RAMPA_STATUS = 0x22,  // Navigation -> Master (forwarded from Rampa I2CN)
@@ -547,6 +548,61 @@ typedef struct {
 } ariadna_gps_time_t;
 ARIADNA_STATIC_ASSERT(sizeof(ariadna_gps_time_t) == 12, "gps_time layout changed");
 
+// ---------------------------------------------------------------------
+//  Vibration spectrum (fw 3.35, common/ariadna_vib.h)
+//
+//  The Position MCU taps every IMU sample (2 kHz) and computes, on its
+//  otherwise idle core 1, a 1/3-octave spectrum 0.5-500 Hz (31 bands,
+//  ISO 266 centres) of four channels plus the three strongest tones of
+//  each. One frame every ~0.51 s, sent as two parts of two channels each;
+//  the Master stores each part as one 96 B record in the flight log and
+//  prints it on USB as a "V" line.
+//
+//  Levels are 8-bit dB codes, 0.5 dB per step, 0 = nothing / below range:
+//    acceleration  dB re 1 g    code = 2 * (dB + 100)   10 ug .. 23.7 g
+//    angular rate  dB re 1 dps  code = 2 * (dB + 70)    0.3 mdps .. 750 dps
+//  Band values are the RMS in the band, peak values the RMS of the tone.
+// ---------------------------------------------------------------------
+#define ARIADNA_VIB_BANDS      31     // 0.5 Hz .. 500 Hz, 1/3 octave
+#define ARIADNA_VIB_PEAKS       3     // strongest tones per channel
+#define ARIADNA_VIB_CHANNELS    4
+
+// Channels. Part 0 carries channels 0-1, part 1 channels 2-3.
+// "Axial" is the TriSense Y axis (the thrust axis), "lateral" the power sum
+// of X and Z, so the lateral spectra do not depend on roll.
+#define ARIADNA_VIB_CH_ACC_AX   0     // acceleration along the thrust axis [g]
+#define ARIADNA_VIB_CH_ACC_LAT  1     // lateral acceleration [g]
+#define ARIADNA_VIB_CH_GYR_LAT  2     // pitch + yaw rate [deg/s]
+#define ARIADNA_VIB_CH_GYR_ROLL 3     // roll rate about the thrust axis [deg/s]
+
+// ariadna_vib_t.stat
+#define ARIADNA_VIB_ST_FRESH0   (1u << 0)  // 63-500 Hz bands new in this frame
+#define ARIADNA_VIB_ST_FRESH1   (1u << 1)  // 5-50 Hz bands new in this frame
+#define ARIADNA_VIB_ST_FRESH2   (1u << 2)  // 0.5-4 Hz bands new (every 4th frame)
+#define ARIADNA_VIB_ST_OVERRUN  (1u << 3)  // samples lost core 0 -> core 1 since the last frame
+#define ARIADNA_VIB_ST_LOWRATE  (1u << 4)  // IMU below 1.8 kHz: bands above 315 Hz are void
+#define ARIADNA_VIB_ST_FLIGHT   (1u << 5)  // Master state ASCENT..LANDED when computed
+
+typedef struct {
+    uint8_t  part;                              // 0: channels 0-1, 1: channels 2-3
+    uint8_t  seq;                               // frame counter, both parts share it
+    uint8_t  stat;                              // ARIADNA_VIB_ST_*
+    uint8_t  n_avg;                             // 63-500 Hz spectra averaged in this frame
+    uint16_t fs_dhz;                            // measured IMU sample rate, 0.1 Hz
+    uint16_t peak_f[2][ARIADNA_VIB_PEAKS];      // tone frequency, 0.01 Hz, strongest first (0 = none)
+    uint8_t  band[2][ARIADNA_VIB_BANDS];        // band RMS, dB codes
+    uint8_t  peak_amp[2][ARIADNA_VIB_PEAKS];    // tone RMS, dB codes
+    uint8_t  rms[2];                            // whole range 0.45-561 Hz RMS, dB code
+} ariadna_vib_t;
+ARIADNA_STATIC_ASSERT(sizeof(ariadna_vib_t) == 88, "vib layout changed");
+
+// ISO 266 1/3-octave centre frequencies [Hz]; band k spans
+// fc * 2^(-1/6) .. fc * 2^(+1/6) around the exact centre 1000 * 10^((k-33)/10).
+#define ARIADNA_VIB_BAND_HZ_INIT { 0.5f, 0.63f, 0.8f, 1.0f, 1.25f, 1.6f, 2.0f, 2.5f, 3.15f, \
+    4.0f, 5.0f, 6.3f, 8.0f, 10.0f, 12.5f, 16.0f, 20.0f, 25.0f, 31.5f, 40.0f, 50.0f,         \
+    63.0f, 80.0f, 100.0f, 125.0f, 160.0f, 200.0f, 250.0f, 315.0f, 400.0f, 500.0f }
+
+
 // --- ariadna_master_state_t.flags ------------------------------------
 #define ARIADNA_MST_ARMED        (1u << 0)   // RBF removed and software armed
 #define ARIADNA_MST_RBF_OUT      (1u << 1)   // Remove-Before-Flight pin pulled
@@ -802,6 +858,8 @@ ARIADNA_STATIC_ASSERT(sizeof(ariadna_gs_serial_t) == 52, "gs serial layout chang
 #define ARIADNA_MASTER_HZ       10   // Master state broadcast
 #define ARIADNA_RAW_IMU_HZ      25   // ariadna_raw_imu_t, only on request
 #define ARIADNA_UWB_DIAG_HZ      2   // ariadna_uwb_diag_t, per-anchor UWB health
+// ariadna_vib_t: one frame per 128 samples of the 250 Hz stage (0.512 s at
+// 2 kHz), two packets each - not a timer, the analyser's own clock.
 
 // ---------------------------------------------------------------------
 //  LoRa radio

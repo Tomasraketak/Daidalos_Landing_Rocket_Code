@@ -38,6 +38,7 @@ přeprogramování.
 14. [Co je a co není ověřeno](#14-co-je-ověřeno)
 15. [Řešení problémů](#15-řešení-problémů)
 16. [Audit výpočetní vytíženosti a časování (všechny 3 MCU)](#16-audit-výpočetní-vytíženosti)
+17. [Vibrační analýza za letu (0,5–500 Hz)](#17-vibrační-analýza-za-letu)
 
 ---
 
@@ -920,7 +921,7 @@ Arduino IDE 2, deska **arduino-pico** (earlephilhower).
 | sketch | deska | knihovny |
 |---|---|---|
 | `Master_MCU` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.6, [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
+| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.6 **+ patch `Ariadna_V2/patches/voltino_trisense_sample_tap.patch`** (vibrační analýza, kap. 17; bez něj se vše přeloží a poletí, jen analýza je vypnutá), [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
 | `Navigation_MCU` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Ground_Station` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
 
@@ -943,6 +944,7 @@ make seq          # sekvencer událostí a tabulka parametrů
 make est / uwb    # Kalmanův filtr, UWB
 make link / pyfmt # protokol, Python dekodér
 make batt         # nabití a výdrž baterie: tabulka, pokles napětí, teplota, okno 5 min
+make vib          # vibrační spektrum: tóny, Parseval, ztráty vzorků, 1 kHz, chyba hodin, dekódování logu
 make syntax       # překlad sketchů proti náhradním hlavičkám
 make tables SIM=../../LandSim_Light   # přegenerovat tabulky ze simulace
 ```
@@ -1006,7 +1008,7 @@ Veškerá matematika v řídicí a odhadové cestě používá nativní `float` 
 | MCU (deska) | Jádro | Perioda / frekvence | Průměrné vytížení | Špička (WCET) v jednom slotu | Stíhá včas? | Hlavní odběratel času |
 |---|---|---|---:|---:|---|---|
 | **Position MCU** (XIAO RP2350) | **Core 0** | `4 167 µs` (240 Hz) | **13–19 %** *(čisté CPU ~8–12 %)* | **~32 %** (`~1,33 ms`) | **Ano** (rezerva > 65 %) | `s_uwb.poll()` (`~0,79 ms` I2C @ 25 Hz, 34 B fast rámec), INSLIB/TriSense |
-| **Position MCU** (XIAO RP2350) | **Core 1** | průběžně (UART) | **< 2 %** | **< 5 %** | **Ano** (obrovská rezerva) | GPS NMEA 115 200 baud (5 Hz) + RX z Masteru |
+| **Position MCU** (XIAO RP2350) | **Core 1** | průběžně (UART) | **~2–4 %** *(fw 3.35: + vibrační analýza ~1–1,5 %)* | **< 5 %** (1 sada 6 FFT ≈ 0,6 ms na průchod) | **Ano** (obrovská rezerva) | GPS NMEA 115 200 baud (5 Hz) + RX z Masteru + vibrační spektrum (kap. 17) |
 | **Navigation MCU** (XIAO RP2350) | **Core 0** | `5 000 µs` (200 Hz) | **2–4 %** (`~100–200 µs`) | **5–7 %** (`~250–350 µs`) | **Ano** (rezerva > 93 %) | `dg_step_control()`, sekvencer, 3× ADC kontinuity |
 | **Navigation MCU** (XIAO RP2350) | **Core 1** | `100 000 µs` (10 Hz) | **5–10 %** (pád) / **30–55 %** (začátek zážehu) | **~55 %** (`~55 ms`, nominální zážeh) | **Ano** *(Core 0 nikdy neblokuje)* | `dg_solve_plan()` + vnořené replany v `touchdown_time()` |
 | **Master MCU** (Pico 2 W) | **Core 0** | `5 000 µs` (200 Hz) | **18–32 %** *(čisté CPU ~2–3 %)* | **25–40 %** (`~1,2–2,0 ms`, s USB) | **Ano** (rezerva > 60 %) | I2C zápis PCA9685 @ 400 kHz (`~0,8–1,5 ms`) |
@@ -1036,8 +1038,10 @@ Veškerá matematika v řídicí a odhadové cestě používá nativní `float` 
     - GPS fúze (`5 Hz`): `fuse_gps()` + `ins.feedGnss()` `~60–120 µs`.
     - Odeslání `ariadna_nav_state_t` (94 B @ 240 Hz), `pos_status` (102 B @ 20 Hz) a per-anchor UWB diagnostiky `ariadna_uwb_diag_t` (50 B @ 2 Hz, bez I2C přenosu — čte data z RAM) do DMA: `~15–25 µs`.
   - **Souběh v nejhorším ticku (WCET):** IMU + UWB fast (34 B) + solve + GPS v jednom slotu ≈ **`1,33 ms` z `4,17 ms` (~32 %)** (sníženo z `2,86 ms` / 69 %).
-- **Core 1 (GPS + RX z Masteru):**
+- **Core 1 (GPS + RX z Masteru + vibrace):**
   - Čtení GPS UART (115 200 baud, 5 Hz, omezeno na max 64 B/průchod) + `link_poll()` z Masteru (10 Hz). Vytížení **< 2 %**.
+  - **fw 3.35 — vibrační spektrum** (`vib_service()`, kap. 17): 2× 6. řád Butterworth na vzorek + ~106 reálných FFT/s (256/128 bodů) ≈ **1–1,5 %**, nejvýš jedna sada šesti FFT (~0,6 ms) na průchod `loop1()`, takže GPS parser nikdy nečeká déle. RAM ~33 kB.
+- **fw 3.35 — IMU na 2 kHz** (bylo 1 kHz): čtení FIFO na Core 0 se zdvojnásobí na ~32 kB/s SPI @ 10 MHz ≈ **+1,3 %** Core 0; vibrační *tap* (kopie 12 B do kruhového bufferu) ≈ 0,03 %. FIFO (128 paketů) vydrží 64 ms proti nejdelší blokující I2C transakci 10 ms.
 - **Diagnostika UWB kotev v GUI (fw 3.33):**
   - Position MCU odesílá 2× za sekundu paket `ARIADNA_PKT_UWB_DIAG` (`0x13`, 44 B payload), který Master MCU přeposílá po USB jako JSON řádek `U {...}`. Na záložce **Poloha a senzory** v `daidalos_diag.py` jsou přímo vidět stav UWB tagu (rádio, I2C chyby, odmítnuté rozsahy) a jednotlivé řádky **Kotva 1–4** se stavem (`OK` / `SLABÝ` / `VELMI SLABÝ` / `OFFLINE`), vzdáleností (m), RSSI (dBm), stářím (ms) a účastí v multilateračním řešení.
 
@@ -1097,7 +1101,7 @@ Změřené vytížení mezičipových UART linek (`921 600 baud`, DMA TX, ověř
 
 | Linka | Provoz | Vytížení linky | Rezerva |
 |---|---|---:|---:|
-| Position → Master | `nav_state` (94 B @ 240 Hz) + `pos_status` (102 B @ 20 Hz) + `uwb_diag` (50 B @ 2 Hz) | **29,3 %** | 70,7 % |
+| Position → Master | `nav_state` (94 B @ 240 Hz) + `pos_status` (102 B @ 20 Hz) + `uwb_diag` (50 B @ 2 Hz) + `vib` (2× 94 B @ 1,95 Hz, fw 3.35) | **29,7 %** | 70,3 % |
 | Master → Navigation | `nav_state` (94 B @ 240 Hz) + `master_state` (22 B @ 10 Hz) | **24,5 %** | 75,5 % |
 | Navigation → Master | `actuator` (42 B @ 200 Hz) + `nav_status` (98 B @ 20 Hz) | **11,2 %** | 88,8 % |
 
@@ -1112,4 +1116,118 @@ Změřené vytížení mezičipových UART linek (`921 600 baud`, DMA TX, ověř
 
 - **Výsledná latence end-to-end:** **~9–11 ms typicky** (nejhorší souběh **~15 ms**).
 - Při šířce pásma řídicí smyčky TVC `~9 rad/s` (~1,4 Hz) odpovídá 10 ms zpoždění fázovému zpoždění jen **~5°**, což je pro stabilizaci přistání s velkou rezervou vyhovující.
+
+---
+
+## 17. Vibrační analýza za letu
+
+**fw 3.35.** Position MCU za letu průběžně počítá, **na jakých frekvencích raketa vibruje
+a kmitá** (0,5–500 Hz), Master to ukládá do flash logu a po letu z toho
+`tools/daidalos_log.py` vypíše dominantní frekvence pro každou fázi letu a nakreslí
+spektrogram.
+
+### 17.1 Co se měří
+
+Čtyři kanály ze stejného IMU (ICM-42688), které používá odhad orientace:
+
+| kanál | co je to | jednotka | typicky ukáže |
+|---|---|---|---|
+| **osa** | zrychlení podél osy tahu (TriSense +Y) | g | podélné kmity konstrukce, „chuffing“ motoru, nárazy |
+| **bočně** | boční zrychlení (výkonový součet X + Z, nezávisí na rotaci) | g | ohybové módy trupu, nohy, flutter |
+| **náklon** | úhlová rychlost klopení + zatáčení (výkonový součet) | °/s | kmitání řízení TVC (limitní cyklus), aerodynamické kmity |
+| **rotace** | úhlová rychlost kolem osy tahu | °/s | rotace, kmity křidélek kolem podélné osy |
+
+Výstup každých **0,512 s**: 31 třetinooktávových pásem (ISO 266: 0,5 · 0,63 · 0,8 · 1 …
+400 · 500 Hz) jako RMS v pásmu, **3 nejsilnější tóny** s frekvencí (interpolovanou mezi
+biny) a RMS a celkové RMS 0,45–561 Hz.
+
+### 17.2 Jak to funguje (a proč to MCU nezatíží)
+
+- **IMU běží na 2 kHz** (dřív 1 kHz). Pro 500 Hz je to nutnost — 500 Hz je Nyquistova
+  frekvence 1 kHz streamu. Pomůže to i orientaci: antialiasingový filtr gyra (585 Hz) byl
+  při 1 kHz *nad* Nyquistem a vibrace se mohly „sklápět“ do pásma, které INSLIB integruje.
+  Přepínač `ARIADNA_IMU_ODR_2K` v `Position_MCU.ino` (0 = zpět 1 kHz, spektrum pak končí
+  na 450 Hz a hlásí `LOWRATE`).
+- **Vzorky se neberou z FIFO podruhé** (to byla chyba fw 3.21 — kradlo to vzorky INSLIBu).
+  Driver Voltino_TriSense zavolá pro každý vzorek, který INSLIB přečte, malý *tap*, a ten
+  jen zkopíruje 12 bajtů do kruhového bufferu (Core 0, ~0,03 %). Tap přidává
+  **patch `Ariadna_V2/patches/voltino_trisense_sample_tap.patch`** (do knihovny:
+  `cd Voltino_TriSense_Library && git apply …/voltino_trisense_sample_tap.patch`).
+  Bez patche se firmware přeloží i poletí normálně — jen při startu vypíše
+  `# vibration: Voltino_TriSense has no setSampleTap()` a konzole ukáže „žádná spektra“.
+- **Všechno počítání běží na Core 1** Position MCU (jinak jen GPS, < 2 %), metodou
+  víceúrovňového Welchova průměrování — jinak se 0,5 Hz a 500 Hz do jednoho rozpočtu
+  nevejdou:
+
+  | stupeň | vzorkování | FFT | rozlišení | okno | pásma |
+  |---|---|---|---|---|---|
+  | 0 | 2000 Hz | 256 b., Hann, 50 % překryv | 7,8 Hz | 0,128 s | 63–500 Hz |
+  | 1 | 250 Hz (6. řád Butterworth 80 Hz, ÷8) | 256 b. | 0,98 Hz | 1,02 s | 5–50 Hz |
+  | 2 | 31,25 Hz (6. řád Butterworth 10 Hz, ÷8) | 128 b. | 0,24 Hz | 4,1 s | 0,5–4 Hz |
+
+  Každé okno se zbaví průměru a lineárního trendu (gravitace a náběh tahu nejsou vibrace).
+  Výkony binů jsou normované tak, že dávají rozptyl signálu (Parseval): hodnota pásma je
+  skutečné RMS v pásmu, tón je součet tří binů hlavního laloku Hannova okna. Skutečná
+  vzorkovací frekvence IMU (vnitřní oscilátor ±2 %) se měří proti krystalu MCU a frekvence
+  tónů se podle ní opraví.
+- **Rozpočet:** Core 1 ~1–1,5 %, Core 0 +1,3 % (2 kHz SPI) a ~0,03 % (tap), RAM ~33 kB,
+  UART Position → Master +0,4 %, **flash +375 B/s (2 % logu)** — za letu každý snímek,
+  na zemi každý čtvrtý (0,5 Hz), takže i klepací test na stole skončí v logu.
+
+### 17.3 Fyzikální omezení (nejsou to chyby)
+
+- **Rozlišení pod 1 Hz:** rozlišit 0,5 Hz od 0,63 Hz chce ~8 s signálu. Nejnižší stupeň má
+  okno 4,1 s (biny 0,24 Hz): pod 1 Hz jsou pásma užší než bin a jejich úroveň je
+  interpolace; frekvence tónu je přesto dobrá na ~0,05 Hz.
+- **Zpoždění:** spektrum 63–500 Hz popisuje posledních ~0,6 s, 5–50 Hz poslední ~1 s
+  a 0,5–4 Hz poslední ~4 s (obnova každé ~2 s). Nástroj to při rozdělení na fáze letu
+  zohledňuje: snímek se do fáze započítá pro danou frekvenci až tehdy, když jeho okno leží
+  ve fázi. Fáze kratší než ~4 s proto nemusí mít nic pod 4,5 Hz.
+- **500 Hz pásmo** je na hraně výstupního filtru IMU (při 2 kHz ~500 Hz, −3 dB): úrovně
+  nad ~400 Hz jsou mírně podhodnocené.
+
+### 17.4 Kde to uvidíte
+
+- **Diagnostická konzole**, záložka *Poloha a senzory*, karta **Vibrace**: živě RMS
+  a 3 nejsilnější tóny každého kanálu a vzorkovací frekvence IMU. Hodí se k **poklepovému
+  testu**: raketu postavte na rampu, poklepejte na trup / nohu / motorovou sekci a čtěte
+  vlastní frekvence konstrukce dřív, než je najde řízení.
+- **Záložka Letový záznam**: pod grafy shrnutí dominantních tónů po fázích letu.
+- **Po letu**:
+
+  ```
+  python tools/daidalos_log.py --port COM5 --flights-only --out let.csv --vib-plot vib.png
+  ```
+
+  zapíše `let_vib.csv` (jeden řádek = jeden snímek a kanál: 31 pásem, 3 tóny, RMS),
+  vypíše pro každou fázi (rampa, výstup, vrchol + pád, přistávací zážeh, po dosednutí)
+  dominantní tóny (průměrná a maximální úroveň) a nejhlasitější pásma a nakreslí
+  spektrogram všech čtyř kanálů se značkami změn stavu (`--vib-plot`, potřebuje matplotlib).
+
+### 17.5 Jak výsledek číst
+
+- **Úzký silný tón v ose během zážehu** → nestabilita hoření / rezonance motorové sekce.
+- **Tón v kanálu *náklon* 0,5–5 Hz, který roste s časem zážehu** → kmitání smyčky TVC
+  (příliš velké zesílení nebo zpoždění; srv. kap. 5.4 a audit latence 16.5).
+- **Stejná frekvence v *bočně* na rampě (poklepový test) i za letu** → ohybový mód trupu;
+  pokud leží blízko šířky pásma řízení nebo jejích násobků, je čas na notch filtr nebo
+  tužší konstrukci.
+- **`LOWRATE`** v souhrnu → IMU neběželo na 2 kHz (pásma nad 450 Hz chybí);
+  **`ztracené vzorky` / overrun** → Core 1 nestíhal (nemělo by se stát; zkontrolujte
+  `imu_hz` a `imu_overflow` v surových datech).
+
+### 17.6 Formát (pro vlastní skripty)
+
+- Paket `ARIADNA_PKT_VIB` (0x15), struktura `ariadna_vib_t` (88 B, `common/ariadna_link.h`),
+  dvě části na snímek (kanály 0–1 a 2–3). Úrovně jsou 8bitové dB kódy po 0,5 dB:
+  zrychlení `kód = 2·(dB re 1 g + 100)`, úhlová rychlost `kód = 2·(dB re 1 °/s + 70)`,
+  0 = nic. Frekvence tónů v 0,01 Hz.
+- Ve flash logu je každá část jedním 96B záznamem (`VibLogRecord`: `t_ms`, 88 B
+  `ariadna_vib_t`, 3 B výplň, `flags` s bitem 7 = vibrační záznam). `LOG FLIGHTS` je
+  počítá do letu, ale nemění podle nich začátek/konec ani výšku.
+- USB řádek `V <t_ms> <hex 88 B>` — stejné bajty jako v logu.
+- Implementace: `common/ariadna_vib.h` (bez závislosti na Arduinu), test `make -C test vib`
+  (113 kontrol: tóny ve všech třech stupních na ±¼ binu a ±1 dB, bílý šum ±0,8 dB na pásmo,
+  celkové RMS ±0,6 dB, ztráta vzorků, IMU 1 kHz, hodiny IMU o 1,5 % pomalejší, detekce
+  patche driveru) + `check_vib_log.py` (snímky → 96B záznamy → dekodér).
 

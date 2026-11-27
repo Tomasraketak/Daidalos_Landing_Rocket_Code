@@ -77,6 +77,44 @@ SENS_BITS = [(0, "IMU"), (1, "BARO"), (2, "MAG"), (3, "GPS"), (4, "UWB"), (5, "L
 INS_MODES = {0: "žádný", 1: "jen orientace", 2: "bez GPS (coasting)", 3: "plný (GPS)",
              254: "HIL simulace", 255: "nezkompilováno"}
 UWB_MODES = {0: "—", 1: "1 kotva (LOS)", 2: "2-D", 3: "3-D"}
+
+# ---- vibration spectrum (fw 3.35): "V <t_ms> <hex>", the 88-byte ariadna_vib_t
+VIB_FMT = "<4BH6H62B6B2B"
+VIB_CH_NAMES = ["Vibrace osa (zrychlení)", "Vibrace bočně (zrychlení)",
+                "Kmitání náklon (úhl. rychl.)", "Kmitání rotace (úhl. rychl.)"]
+VIB_UNIT = ["g", "g", "°/s", "°/s"]
+
+
+def vib_level(code: int, ch: int) -> float:
+    """RMS of an 8-bit dB code (ariadna_link.h): g for channels 0-1, deg/s for 2-3."""
+    if code == 0:
+        return 0.0
+    return 10.0 ** ((code * 0.5 - (100.0 if ch <= 1 else 70.0)) / 20.0)
+
+
+def parse_vib(line: str) -> list[dict] | None:
+    """A V line -> two channel dicts (rms, tones [(Hz, rms)], stat, fs), or None."""
+    import struct
+    p = line.split()
+    if len(p) != 3:
+        return None
+    try:
+        raw = bytes.fromhex(p[2])
+        v = struct.unpack(VIB_FMT, raw)
+    except (ValueError, struct.error):
+        return None
+    part, seq, stat, _n, fs = v[0:5]
+    peak_f, peak_a, rms = v[5:11], v[73:79], v[79:81]
+    out = []
+    for j in range(2):
+        ch = 2 * part + j
+        if ch > 3:
+            return None
+        tones = [(peak_f[3 * j + i] / 100.0, vib_level(peak_a[3 * j + i], ch))
+                 for i in range(3) if peak_f[3 * j + i]]
+        out.append({"ch": ch, "seq": seq, "stat": stat, "fs": fs / 10.0,
+                    "rms": vib_level(rms[j], ch), "tones": tones})
+    return out
 HEALTH_ERR = {1: "POST selhal", 2: "spoj s Position MCU", 3: "spoj s Navigation MCU",
               4: "flash log", 5: "sběrnice serv", 6: "nízká baterie", 7: "parametry nesouhlasí"}
 
@@ -774,7 +812,11 @@ class FlightSimBoard(ag.SimBoard):
             return self._raw(now - self.t0)
         if now >= self.next_uwb:
             self.next_uwb = now + 0.5
+            self.vib_part = 0
             return self._uwb_diag(now - self.t0)
+        if getattr(self, "vib_part", 2) < 2:
+            self.vib_part += 1
+            return self._vib_demo(self.vib_part - 1, now - self.t0)
         if now >= self.next_diag:
             self.next_diag = now + 0.02
             self.which = (self.which + 1) % 5
@@ -793,6 +835,27 @@ class FlightSimBoard(ag.SimBoard):
         ]
         d = {"t": int(t * 1000), "ok": 1, "fl": 3, "err": 0, "rej": 0, "na": 4, "a": anchors}
         return "U " + json.dumps(d, separators=(",", ":"))
+
+    @staticmethod
+    def _vib_demo(part: int, t: float) -> str:
+        """Demo V line: a 2 kHz IMU on the pad with a fan at 87 Hz and a slow sway."""
+        import struct
+
+        def code(rms, ch):
+            off = 100.0 if ch <= 1 else 70.0
+            return max(1, min(255, int(round(2 * (20 * math.log10(rms) + off)))))
+        chs = (2 * part, 2 * part + 1)
+        tones = {0: [(87.0, 0.012), (174.1, 0.004), (311.5, 0.002)],
+                 1: [(87.0, 0.006), (23.4, 0.003), (1.3, 0.001)],
+                 2: [(1.31, 0.4 + 0.1 * math.sin(t)), (87.0, 0.05), (23.4, 0.03)],
+                 3: [(4.2, 0.08), (87.0, 0.02), (140.0, 0.01)]}
+        floor = [0.0005, 0.0006, 0.02, 0.015]
+        peak_f = [int(f * 100) for ch in chs for f, _ in tones[ch]]
+        bands = [code(floor[ch] * (1.5 if b > 20 else 1.0), ch) for ch in chs for b in range(31)]
+        peak_a = [code(a, ch) for ch in chs for _, a in tones[ch]]
+        rms = [code(math.sqrt(sum(a * a for _, a in tones[ch]) + (3 * floor[ch]) ** 2), ch) for ch in chs]
+        raw = struct.pack(VIB_FMT, part, int(t / 0.512) & 255, 3, 8, 20000, *peak_f, *bands, *peak_a, *rms)
+        return f"V {int(t * 1000)} {raw.hex()}"
 
     def _sim_tilt(self, t: float):
         # standing on the pad, nose up, swaying a little
@@ -1058,6 +1121,8 @@ def fmt(v, nd=1, unit="", sign=False):
 class DiagWindow(ag.MainWindow):
     def __init__(self, cfg_path: str, demo: bool, port: str | None):
         self.d: dict[str, dict] = {"M": {}, "N": {}, "P": {}, "G": {}, "R": {}, "U": {}}
+        self.vib: dict[int, dict] = {}            # channel -> newest V-line decode
+        self.vib_time = 0.0
         self.d_time: dict[str, float] = {"M": 0.0, "N": 0.0, "P": 0.0, "G": 0.0, "R": 0.0, "U": 0.0}
         self.flight_fw = False
         self.fw_info = ""
@@ -1580,6 +1645,11 @@ class DiagWindow(ag.MainWindow):
         self.sens_flags = Flags(SENS_BITS)
         se.lay.addWidget(self.sens_flags)
         g.addWidget(se, 1, 1)
+
+        vc = Card("Vibrace", "0,5–500 Hz z IMU (2 kHz) · RMS celkem a 3 nejsilnější tóny · zapisuje se do logu")
+        self.vib_kv = KV(VIB_CH_NAMES + ["Analyzátor"])
+        vc.lay.addWidget(self.vib_kv)
+        g.addWidget(vc, 2, 0, 1, 2)
         g.setColumnStretch(0, 1)
         g.setColumnStretch(1, 1)
         return w
@@ -2096,6 +2166,11 @@ class DiagWindow(ag.MainWindow):
         if line.startswith("PRM "):
             self._prm(line)
             return
+        if line.startswith("V "):
+            for c in parse_vib(line) or []:
+                self.vib[c["ch"]] = c
+                self.vib_time = time.monotonic()
+            return
         if line.startswith("SRVCHK "):
             d = parse_srvchk(line)
             if d is not None:
@@ -2202,6 +2277,34 @@ class DiagWindow(ag.MainWindow):
     def fmt_minutes(m: float) -> str:
         m = int(round(m))
         return f"{m} min" if m < 120 else f"{m // 60} h {m % 60:02d} min"
+
+    def _refresh_vib(self, pos_alive: bool) -> None:
+        fresh = self.link.is_open and time.monotonic() - self.vib_time < 2.0
+        if not fresh:
+            for n in VIB_CH_NAMES:
+                self.vib_kv.set(n, "—", DIM)
+            self.vib_kv.set("Analyzátor",
+                            "žádná spektra – Position MCU bez sample tapu? (Ariadna_V2/patches/, výpis při startu)"
+                            if pos_alive and self.flight_fw else "čeká na spektrum (2 Hz)", DIM)
+            return
+        stat, fs = 0, 0.0
+        for ch, n in enumerate(VIB_CH_NAMES):
+            c = self.vib.get(ch)
+            if not c:
+                self.vib_kv.set(n, "—", DIM)
+                continue
+            stat |= c["stat"]
+            fs = c["fs"]
+            u = VIB_UNIT[ch]
+            tones = " · ".join(f"{f:.1f} Hz {a:.3g}" for f, a in c["tones"]) or "žádný výrazný tón"
+            self.vib_kv.set(n, f"RMS {c['rms']:.3g} {u}   |   {tones}")
+        notes = []
+        if stat & 16:
+            notes.append("IMU pod 1,8 kHz – nad 450 Hz nic")
+        if stat & 8:
+            notes.append("ztracené vzorky")
+        self.vib_kv.set("Analyzátor", f"IMU {fs:.0f} Hz" + (" · " + ", ".join(notes) if notes else ""),
+                        WARN if notes else GOOD)
 
     def _refresh_battery(self, kv, M: dict) -> None:
         """Charge and run time to the limit, from the Master's "bat" field
@@ -2594,6 +2697,7 @@ class DiagWindow(ag.MainWindow):
             self.sens_kv.set("Teplota", fmt(P.get("temp"), 1, "°C"))
             self.sens_kv.set("INS (INSLIB)", INS_MODES.get(P.get("ins", 255), "?"))
             self.sens_flags.set(P.get("sens", 0), bad_when_off=(0, 1))
+        self._refresh_vib(bool(P))
 
         # ---- problems list
         self.problems.clear()

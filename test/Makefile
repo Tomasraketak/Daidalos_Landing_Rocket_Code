@@ -8,6 +8,7 @@
 #   make uwblink  Ariadna V2 UWB tag I2C frame codec
 #   make link     Ariadna V2 inter-processor link codec
 #   make batt     Ariadna V2 battery state of charge and run-time estimate
+#   make vib      Ariadna V2 vibration spectrum (tones, Parseval, overrun, 1 kHz, clock error)
 #   make syntax   compile the sketches against a stub Arduino header
 #   make sync     verify the sketches' copies of guidance and common/ headers
 #   make pyfmt    verify ground_visualizer.py decodes the current packet
@@ -187,6 +188,7 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_hil.h:$(V2)/Position_MCU/ariadna_hil.h \
   $(V2)/common/ariadna_uart_dma.h:$(V2)/Position_MCU/ariadna_uart_dma.h \
   $(V2)/common/ariadna_kf.h:$(V2)/Position_MCU/ariadna_kf.h \
+  $(V2)/common/ariadna_vib.h:$(V2)/Position_MCU/ariadna_vib.h \
   $(V2)/common/ariadna_uwb.h:$(V2)/Position_MCU/ariadna_uwb.h \
   $(V2)/common/ariadna_uwb_link.h:$(V2)/Position_MCU/ariadna_uwb_link.h \
   $(V2)/common/ariadna_uwb_link.h:$(V2)/Uwb_Tag/ariadna_uwb_link.h \
@@ -230,6 +232,20 @@ pyfmt:
 # Hardware-in-the-Loop (HIL) USB injection protocol & 6-DOF simulator.
 # ---------------------------------------------------------------------
 HIL_H   = $(V2)/common/ariadna_hil.h
+
+# ---------------------------------------------------------------------
+# Vibration spectrum analyser (fw 3.35). Synthetic IMU streams with known
+# tones and noise through the same tap the Position MCU uses.
+# ---------------------------------------------------------------------
+VIB_H = $(V2)/common/ariadna_vib.h
+
+vib: vib_test
+	./vib_test
+	python3 -I check_vib_log.py
+
+vib_test: vib_test.cpp $(VIB_H) $(LINK_H)
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -o vib_test vib_test.cpp -lm
+	$(CXX) $(CXXFLAGS) -fsyntax-only -x c++ $(VIB_H)
 
 hil: hil_test
 	./hil_test
@@ -357,7 +373,7 @@ bench-sync-fix:
 	@for s in $(BENCH_SKETCHES); do cp $(BENCH_H) $(BENCH_DIR)/$$s/bench_common.h; done
 	@echo "bench_common.h re-synced into $(BENCH_SKETCHES)"
 
-check: all guid seq est uwb uwblink rampa link hil batt sync pyfmt hilfmt calib syntax bench bench-sync actcon sflink sflink-sync sflink-loop
+check: all guid seq est uwb uwblink rampa link hil batt vib sync pyfmt hilfmt calib syntax bench bench-sync actcon sflink sflink-sync sflink-loop
 
 # Regenerate the golden vectors from the simulation. Needs the model repo.
 MODEL ?= ../../Landing-Rocket-Sim/lander_v2.py
@@ -365,5 +381,5 @@ golden:
 	python3 gen_golden.py --model $(MODEL) > golden_vectors.h
 
 clean:
-	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test rampa_link_test actcon_test batt_test bench_test sflink_test sflink_loop_test
-.PHONY: all guid seq tables est uwb uwblink rampa link hil batt sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix sflink sflink-golden sflink-sync sflink-loop
+	rm -f host_test guid_test seq_test link_test hil_test est_test uwb_test uwb_link_test rampa_link_test actcon_test batt_test vib_test bench_test sflink_test sflink_loop_test
+.PHONY: all guid seq tables est uwb uwblink rampa link hil batt vib sync sync-fix pyfmt hilfmt syntax check golden clean actcon bench bench-sync bench-sync-fix sflink sflink-golden sflink-sync sflink-loop

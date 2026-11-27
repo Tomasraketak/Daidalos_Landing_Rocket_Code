@@ -47,6 +47,10 @@ class LogTab(QtWidgets.QWidget):
         self.expect = 0
         self.got_in_job = 0
         self._pending: list[dict] = []
+        # fw 3.35 vibration records: kept apart from the flight rows (they have
+        # none of their columns), numbered by the flight row before them.
+        self.vib_rows: list[dict] = []
+        self._pending_vib: list[dict] = []
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(20, 16, 20, 20)
         lay.setSpacing(14)
@@ -195,6 +199,12 @@ class LogTab(QtWidgets.QWidget):
             d = dlog.decode_line(line)
             if d:
                 n, row = d
+                if isinstance(row, list):           # a vibration record (two channels)
+                    for c in row:
+                        c["rec"] = n
+                    self._pending_vib += row
+                    self.got_in_job += 1
+                    return
                 row["rec"] = n
                 self._pending.append(row)
                 self.got_in_job += 1
@@ -236,12 +246,16 @@ class LogTab(QtWidgets.QWidget):
             self.queue = []
 
     def _decoded_done(self) -> None:
-        if not self._pending:
+        if not self._pending and not self._pending_vib:
             return
         seen = {r["rec"] for r in self.rows}
         self.rows += [r for r in self._pending if r["rec"] not in seen]
         self._pending = []
+        seen_v = {(r["rec"], r["ch"]) for r in self.vib_rows}
+        self.vib_rows += [r for r in self._pending_vib if (r["rec"], r["ch"]) not in seen_v]
+        self._pending_vib = []
         self.rows.sort(key=lambda r: r["rec"])
+        self.vib_rows.sort(key=lambda r: r["rec"])
         self._number_flights()
         self.prog.setValue(self.prog.maximum())
         self.win.log(f"# záznam: staženo {len(self.rows)} záznamů")
@@ -264,6 +278,22 @@ class LogTab(QtWidgets.QWidget):
                 if 0 <= nxt["t_ms"] - r["t_ms"] <= CONTEXT_S * 1000:
                     f = k + 1
             r["flight"] = f
+        # vibration rows: state and analysis windows from the flight rows
+        # around them (tools/daidalos_log.py does the bookkeeping), flight
+        # number from the flight row just before them, as numbered above.
+        by_rec: dict[int, list[dict]] = {}
+        for r in self.vib_rows:
+            by_rec.setdefault(r["rec"], []).append(r)
+        entries = sorted([(r["rec"], r) for r in self.rows] + list(by_rec.items()),
+                         key=lambda e: e[0])
+        dlog.split_vib(entries)
+        last_f = 0
+        for _, d in entries:
+            if isinstance(d, list):
+                for r in d:
+                    r["flight"] = last_f
+            else:
+                last_f = d["flight"]
         self.f_flight.blockSignals(True)
         cur = self.f_flight.currentText()
         self.f_flight.clear()
@@ -337,7 +367,34 @@ class LogTab(QtWidgets.QWidget):
                     + (f"  ·  tah/tabulka {burn[len(burn) // 2]:.2f}" if burn else "")
                     + (f"  ·  křidélka {last['fin_gain']:.2f}" if last["fin_gain"] > 0 else "")
                     + "   (co s tím: CALIBRATION_MANUAL.md, kap. 10)")
+        txt += self._vib_summary(rows)
         self.summary.setText(txt)
+
+    def _vib_summary(self, rows: list[dict]) -> str:
+        """Dominant tones per flight phase of the shown flight (fw 3.35)."""
+        if not rows or not self.vib_rows:
+            return ""
+        flights = {r["flight"] for r in rows}
+        a, b = rows[0]["t_ms"], rows[-1]["t_ms"]
+        vib = [r for r in self.vib_rows if r["flight"] in flights and a <= r["t_ms"] <= b]
+        if not vib:
+            return ""
+        unit = ["g", "g", "°/s", "°/s"]
+        name = ["osa", "bočně", "náklon", "rotace"]
+        out = [f"\nVibrace ({len(vib) // 4} spekter, podrobně: tools/daidalos_log.py --vib-plot):"]
+        for ph, states in dlog.VIB_PHASES:
+            sel = [r for r in vib if r["state_name"] in states]
+            if not sel:
+                continue
+            t0 = min(r["state_t0"] for r in sel)
+            parts = []
+            for ch in range(4):
+                tones = dlog.vib_dominant(sel, ch, t0)[:2]
+                if tones:
+                    parts.append(f"{name[ch]} " + ", ".join(f"{t[0]:.1f} Hz {t[1]:.2g} {unit[ch]}" for t in tones))
+            if parts:
+                out.append(f"  {ph}: " + "  ·  ".join(parts))
+        return "\n".join(out)
 
     def export(self) -> None:
         rows = self.selected()
@@ -378,5 +435,7 @@ class LogTab(QtWidgets.QWidget):
     def clear(self) -> None:
         self.rows = []
         self._pending = []
+        self.vib_rows = []
+        self._pending_vib = []
         self.f_flight.clear()
         self.replot()

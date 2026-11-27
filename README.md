@@ -10,9 +10,13 @@
 >   netlist-verified pinouts for Ariadna V2, UWB Anchor/Tag, Ground Station, and **Rampa PCB1**,
 >   plus the bidirectional LoRa TDMA & umbilical I²C protocol.
 > * **Flight software:** [`Ariadna_V2/`](Ariadna_V2/README.md) — Master, Position,
->   Navigation, Ground Station, UWB Tag/Anchors, and **Rampa MCU** (`Rampa_MCU/`), firmware 3.34,
+>   Navigation, Ground Station, UWB Tag/Anchors, and **Rampa MCU** (`Rampa_MCU/`), firmware 3.35,
 >   flying the [LandSim_Light](https://github.com/Tomasraketak/LandSim_Light) algorithm
 >   (`Ariadna_V2/common/guidance.cpp`).
+> * **Vibration analysis in flight (fw 3.35):** 0.5–500 Hz spectrum of the vehicle every 0.5 s,
+>   logged to flash; `python tools/daidalos_log.py … --vib-plot vib.png` — see
+>   [USER_MANUAL.md, chapter 17](USER_MANUAL.md#17-vibrační-analýza-za-letu). Needs
+>   [`Ariadna_V2/patches/voltino_trisense_sample_tap.patch`](Ariadna_V2/patches/README.md).
 > * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`
 > * **Flight display** (LoRa ground station + uplink & Rampa control): `python Ariadna_V2/Ground_Visualizer/ground_visualizer.py`
 > * **Tests:** `cd test && make check`

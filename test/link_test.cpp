@@ -252,6 +252,7 @@ static void test_all_types(void)
     roundtrip_one<ariadna_raw_imu_t>(ARIADNA_PKT_RAW_IMU, "RAW_IMU round trip");
     roundtrip_one<ariadna_uwb_diag_t>(ARIADNA_PKT_UWB_DIAG, "UWB_DIAG round trip");
     roundtrip_one<ariadna_gps_time_t>(ARIADNA_PKT_GPS_TIME, "GPS_TIME round trip");
+    roundtrip_one<ariadna_vib_t>(ARIADNA_PKT_VIB, "VIB round trip");
     roundtrip_one<ariadna_actuator_t>(ARIADNA_PKT_ACTUATOR,     "ACTUATOR round trip");
     roundtrip_one<ariadna_nav_status_t>(ARIADNA_PKT_NAV_STATUS, "NAV_STATUS round trip");
     roundtrip_one<ariadna_master_state_t>(ARIADNA_PKT_MASTER_STATE, "MASTER_STATE round trip");
