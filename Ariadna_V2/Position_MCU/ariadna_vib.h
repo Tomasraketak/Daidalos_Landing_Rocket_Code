@@ -14,8 +14,8 @@
 //  WHERE THE SAMPLES COME FROM
 //    The IMU runs at 2 kHz and TriSenseINSLIB owns its FIFO; reading the
 //    FIFO a second time would steal samples from the attitude filter (the
-//    fw 3.21 bug). The Voltino driver instead calls a per-sample tap
-//    (patches/voltino_trisense_sample_tap.patch) on core 0, which only
+//    fw 3.21 bug). The Voltino driver (>= 1.7.0) instead calls a per-sample
+//    tap, ICM42688P::setSampleTap(), on core 0, which only
 //    copies the sample into a lock-free ring - ~0.1 us per sample, ~0.03 %
 //    of core 0. Everything else happens here, on core 1, which on the
 //    Position MCU otherwise only parses GPS NMEA (< 2 % busy).
@@ -558,9 +558,9 @@ static inline bool vib_service(vib_t *v, uint32_t now_us, ariadna_vib_t out[2])
 //  Installing the tap - only if the driver has one.
 //
 //  vib_install_tap(sensor.imu, &fn, 0) calls imu.setSampleTap(fn, nullptr)
-//  and returns true when the Voltino_TriSense driver offers it (patched,
-//  see Ariadna_V2/patches/), and compiles to `return false` when it does
-//  not, so the firmware builds against either library.
+//  and returns true when the Voltino_TriSense driver offers it (>= 1.7.0),
+//  and compiles to `return false` when it does not (an older library), so
+//  the firmware still builds and flies - without the spectrum.
 // ---------------------------------------------------------------------
 #ifdef __cplusplus
 template <typename IMU, typename Fn>

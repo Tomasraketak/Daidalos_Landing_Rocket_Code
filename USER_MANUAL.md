@@ -921,7 +921,7 @@ Arduino IDE 2, deska **arduino-pico** (earlephilhower).
 | sketch | deska | knihovny |
 |---|---|---|
 | `Master_MCU` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.6 **+ patch `Ariadna_V2/patches/voltino_trisense_sample_tap.patch`** (vibrační analýza, kap. 17; bez něj se vše přeloží a poletí, jen analýza je vypnutá), [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
+| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) **≥ 1.7.0** (`setSampleTap()` pro vibrační analýzu, kap. 17; se starší se vše přeloží a poletí, jen analýza je vypnutá), [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
 | `Navigation_MCU` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Ground_Station` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
 
@@ -1150,10 +1150,9 @@ biny) a RMS a celkové RMS 0,45–561 Hz.
   na 450 Hz a hlásí `LOWRATE`).
 - **Vzorky se neberou z FIFO podruhé** (to byla chyba fw 3.21 — kradlo to vzorky INSLIBu).
   Driver Voltino_TriSense zavolá pro každý vzorek, který INSLIB přečte, malý *tap*, a ten
-  jen zkopíruje 12 bajtů do kruhového bufferu (Core 0, ~0,03 %). Tap přidává
-  **patch `Ariadna_V2/patches/voltino_trisense_sample_tap.patch`** (do knihovny:
-  `cd Voltino_TriSense_Library && git apply …/voltino_trisense_sample_tap.patch`).
-  Bez patche se firmware přeloží i poletí normálně — jen při startu vypíše
+  jen zkopíruje 12 bajtů do kruhového bufferu (Core 0, ~0,03 %). Tap
+  (`ICM42688P::setSampleTap()`) je v knihovně **Voltino_TriSense od verze 1.7.0**.
+  Se starší verzí se firmware přeloží i poletí normálně — jen při startu vypíše
   `# vibration: Voltino_TriSense has no setSampleTap()` a konzole ukáže „žádná spektra“.
 - **Všechno počítání běží na Core 1** Position MCU (jinak jen GPS, < 2 %), metodou
   víceúrovňového Welchova průměrování — jinak se 0,5 Hz a 500 Hz do jednoho rozpočtu

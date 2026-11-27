@@ -2284,7 +2284,7 @@ class DiagWindow(ag.MainWindow):
             for n in VIB_CH_NAMES:
                 self.vib_kv.set(n, "—", DIM)
             self.vib_kv.set("Analyzátor",
-                            "žádná spektra – Position MCU bez sample tapu? (Ariadna_V2/patches/, výpis při startu)"
+                            "žádná spektra – Position MCU přeložený se starou Voltino_TriSense? (potřeba ≥ 1.7.0, výpis při startu)"
                             if pos_alive and self.flight_fw else "čeká na spektrum (2 Hz)", DIM)
             return
         stat, fs = 0, 0.0
