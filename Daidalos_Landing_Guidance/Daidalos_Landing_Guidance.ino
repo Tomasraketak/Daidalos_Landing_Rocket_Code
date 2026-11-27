@@ -162,6 +162,11 @@ static const uint8_t  NAV_SYNC1 = 0x1D;
 static const uint8_t  NAV_PAYLOAD = 57;    // flags..t_ms
 static const uint8_t  NAV_FRAME   = NAV_PAYLOAD + 4;
 
+// The Arduino builder puts a generated prototype for every function ABOVE
+// the first one in the file, i.e. before nav_rx_t is defined below.
+// Declaring the type here lets nav_poll()/nav_sane() have prototypes.
+struct nav_rx_t;
+
 static uint16_t crc16_ccitt(const uint8_t *p, uint8_t n)
 {
     uint16_t crc = 0xFFFF;

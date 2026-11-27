@@ -205,6 +205,11 @@ static uint8_t   s_raw[AFR_RAW_MAX * AFR_PAGE];
 static uint8_t  s_hb_flags = 0, s_hb_ack = 0, s_hb_data = 0;
 static uint32_t s_hb_ms    = 0;
 
+// The Arduino builder puts a generated prototype for every function ABOVE
+// the first one in the file, i.e. before RowSink is defined further down.
+// Declaring the type here lets sink_flush(RowSink *) have a prototype.
+struct RowSink;
+
 // =====================================================================
 //  PCA9685 — only the clamp channel is ever driven
 // =====================================================================
