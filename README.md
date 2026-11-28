@@ -16,7 +16,9 @@
 > * **Vibration analysis in flight (fw 3.35):** 0.5–500 Hz spectrum of the vehicle every 0.5 s,
 >   logged to flash; `python tools/daidalos_log.py … --vib-plot vib.png` — see
 >   [USER_MANUAL.md, chapter 17](USER_MANUAL.md#17-vibrační-analýza-za-letu). Needs
->   [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.7.0.
+>   [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) ≥ 1.7.1
+>   (1.7.0 calibrates the gyro to nonsense at the 2 kHz IMU rate; with it the
+>   firmware keeps the IMU at 1 kHz).
 > * **Diagnostic console** (Master on USB): `python Ariadna_V2/Diagnostics/daidalos_diag.py --demo`
 > * **Flight display** (LoRa ground station + uplink & Rampa control): `python Ariadna_V2/Ground_Visualizer/ground_visualizer.py`
 > * **Tests:** `cd test && make check`

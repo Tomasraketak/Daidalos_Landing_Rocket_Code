@@ -921,7 +921,7 @@ Arduino IDE 2, deska **arduino-pico** (earlephilhower).
 | sketch | deska | knihovny |
 |---|---|---|
 | `Master_MCU` | Raspberry Pi Pico 2 W | LoRa (sandeepmistry), Adafruit_NeoPixel |
-| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) **≥ 1.7.0** (`setSampleTap()` pro vibrační analýzu, kap. 17; se starší se vše přeloží a poletí, jen analýza je vypnutá), [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
+| `Position_MCU` | Seeed XIAO RP2350 | [Voltino_TriSense](https://github.com/Tomasraketak/Voltino_TriSense_Library) **≥ 1.7.1** (1.7.0: `setSampleTap()` pro vibrační analýzu, kap. 17; 1.7.1: kalibrace gyra a čtení FIFO při 2 kHz – starší kalibrovala gyro na nesmysl kolem −150 °/s. Se starší knihovnou se vše přeloží, IMU ale zůstane na 1 kHz), [TriSenseINSLIB](https://github.com/Tomasraketak/TriSenseINSLIB) (+ TinyGPSPlus), [TFLuna_I2C](https://github.com/Tomasraketak/TF-Luna-I2C-Library) ≥ 1.1.0, Adafruit_NeoPixel |
 | `Navigation_MCU` | Seeed XIAO RP2350 | Adafruit_NeoPixel |
 | `Ground_Station` | Raspberry Pi Pico 2 | LoRa, Adafruit_GFX, Adafruit_SSD1306 |
 
