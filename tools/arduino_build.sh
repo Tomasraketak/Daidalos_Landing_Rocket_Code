@@ -14,9 +14,14 @@
 # TriSenseINSLIB and TFLuna_I2C - installed, or as checkouts named by
 #   TRISENSE=... INSLIB=... TFLUNA=...
 # Optional: ARDUINO_CLI=<path to arduino-cli>, ARDUINO_CONFIG=<cli.yaml>.
+# tools/setup_arduino.sh installs all of it and sets these up by itself.
 # The CI workflow .github/workflows/arduino-build.yml runs this on every push.
 set -u
 cd "$(dirname "$0")/.."
+
+# tools/setup_arduino.sh leaves its paths here; explicit variables still win.
+ENV_SH="${ARDUINO_HOME:-$HOME/.arduino-ariadna}/env.sh"
+[ -f "$ENV_SH" ] && . "$ENV_SH"
 
 CLI=${ARDUINO_CLI:-arduino-cli}
 [ -n "${ARDUINO_CONFIG:-}" ] && CLI="$CLI --config-file $ARDUINO_CONFIG"
