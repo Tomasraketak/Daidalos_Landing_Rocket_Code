@@ -1,0 +1,67 @@
+# Compiles every sketch with arduino-cli and the arduino-pico core - the same
+# toolchain and .ino preprocessing as the Arduino IDE - so a sketch that
+# would not build in the IDE fails here, on the push, not on the bench.
+# Locally: tools/arduino_build.sh (see its header).
+name: Arduino build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Library checkouts (latest main)
+        run: |
+          mkdir -p "$RUNNER_TEMP/libs"
+          cd "$RUNNER_TEMP/libs"
+          git clone --depth 1 https://github.com/Tomasraketak/Voltino_TriSense_Library
+          git clone --depth 1 https://github.com/Tomasraketak/TriSenseINSLIB
+          git clone --depth 1 https://github.com/Tomasraketak/TF-Luna-I2C-Library
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache the arduino-pico core
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino-pico-${{ runner.os }}-v1
+
+      - name: Core and Library Manager libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+          arduino-cli core update-index
+          arduino-cli core install rp2040:rp2040
+          arduino-cli lib install "Adafruit NeoPixel" "LoRa" "Adafruit SSD1306" \
+            "Adafruit GFX Library" "TinyGPSPlus" "DW1000"
+          # The registry DW1000 0.9.0 does not build on arduino-pico as shipped
+          # (Ariadna_V2/README.md): detectMessageType() can fall off its end.
+          f="$HOME/Arduino/libraries/DW1000/src/DW1000Ranging.cpp"
+          python3 - "$f" <<'PY'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          a = "\t\treturn datas[SHORT_MAC_LEN];\n\t}\n}"
+          if a in s:
+              s = s.replace(a, "\t\treturn datas[SHORT_MAC_LEN];\n\t}\n\treturn -1;\n}")
+              open(p, "w").write(s)
+          PY
+
+      - name: Compile all sketches
+        run: |
+          TRISENSE="$RUNNER_TEMP/libs/Voltino_TriSense_Library" \
+          INSLIB="$RUNNER_TEMP/libs/TriSenseINSLIB" \
+          TFLUNA="$RUNNER_TEMP/libs/TF-Luna-I2C-Library" \
+          tools/arduino_build.sh
+
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make check
+        run: make -C test check

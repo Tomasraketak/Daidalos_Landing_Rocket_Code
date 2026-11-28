@@ -234,7 +234,7 @@ Identical hardware for all 4 ground anchors (`Uwb_Anchor/Uwb_Anchor.ino`, `ANCHO
 |---|---|---|---|
 | GP0 | **I2C0 SDA (Slave `0x2B`)** | `UMB_TX` → `R21` (1 kΩ) + `D4B` ESD → **`J3.4`** (Rocket umbilical SDA) | `PIN_UMB_SDA` |
 | GP1 | **I2C0 SCL (Slave `0x2B`)** | `UMB_RX` → `R22` (100 Ω) + `R23` (100 kΩ PU) + `D4A` ESD → **`J3.3`** (Rocket umbilical SCL) | `PIN_UMB_SCL` |
-| GP2–GP4 | SPI0 SCK/MOSI/MISO | Shared by `U9` W25Q128 flash & `U14` ADS1220 24-bit ADC | `PIN_SPI0_*` |
+| GP2–GP4 | SPI0 SCK/MOSI/MISO | Shared by `U9` W25Q128 flash & `U14` ADS1220 24-bit ADC | `RAMPA_SPI0_*` |
 | GP5 | SPI0 CS | `U9` W25Q128JV flash (`FLASH_CS`, `R17` 10 kΩ PU) | `PIN_FLASH_CS` |
 | GP6 | **I2C1 SDA (Master 400 kHz)** | Internal bus (`R18` 4.7 kΩ PU): `U10` TCA9534, `U1`/`U8` INA226, `U11` ADS1115 | `PIN_INT_SDA` |
 | GP7 | **I2C1 SCL (Master 400 kHz)** | Internal bus (`R19` 4.7 kΩ PU) | `PIN_INT_SCL` |
