@@ -171,6 +171,16 @@
 #ifndef ARIADNA_IMU_ODR_2K
 #  define ARIADNA_IMU_ODR_2K 1
 #endif
+//
+// 2 kHz NEEDS Voltino_TriSense >= 1.7.1. Up to 1.7.0 autoCalibrateGyro()
+// read one sample per 1 ms: at 2 kHz the FIFO overflowed for the whole
+// calibration, an overflow can leave the FIFO being read mid-packet, and
+// the "offset" came out as shifted bytes - seen on the bench as
+// -157 / -143 / -157 deg/s on a still board, a 3-D model spinning in the
+// GUI and a "Kalibrovat gyro" that changed nothing. 1.7.1 drains the FIFO
+// during calibration and resynchronises it on a bad packet header. With an
+// older library imu_lib_fifo_safe() below is false and the IMU stays at
+// 1 kHz, where the old calibration paced correctly (as up to fw 3.34).
 
 #ifndef ARIADNA_USE_INSLIB
 #  define ARIADNA_USE_INSLIB 1
@@ -185,6 +195,20 @@ bool core1_separate_stack = true;
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+
+// True when the Voltino_TriSense driver resynchronises a misaligned FIFO and
+// calibrates at any ODR (>= 1.7.1, which added getFIFOResyncCount()); false
+// with an older library. Decided at compile time, like vib_install_tap().
+template <typename IMU>
+static inline auto imu_lib_fifo_safe(IMU &imu, int) -> decltype(imu.getFIFOResyncCount(), bool())
+{ (void)imu; return true; }
+template <typename IMU>
+static inline bool imu_lib_fifo_safe(IMU &, long) { return false; }
+template <typename IMU>
+static inline auto imu_fifo_resyncs(IMU &imu, int) -> decltype(imu.getFIFOResyncCount(), uint32_t())
+{ return imu.getFIFOResyncCount(); }
+template <typename IMU>
+static inline uint32_t imu_fifo_resyncs(IMU &, long) { return 0; }
 
 // =====================================================================
 //  1. HARDWARE CONFIGURATION
@@ -2498,6 +2522,33 @@ static void ins_to_pad(const float Rn[3][3], float R[3][3])
 
 static Attitude s_att;
 
+/*
+ * A gyro offset is a few deg/s at most on an ICM-42688-P (datasheet: ZRO
+ * +-0.5 deg/s, plus a little over temperature). A calibration that ends
+ * outside +-GYRO_OFF_MAX_DPS - the range of the imu.gyr_off_* parameters -
+ * averaged something other than a still gyro: the vehicle moved, or the
+ * driver handed out misaligned FIFO data (Voltino_TriSense <= 1.7.0 at
+ * 2 kHz). Such an offset must not reach the filter, where it reads as a
+ * steady 150 deg/s rotation. Returns false and says so on the console.
+ */
+static const float GYRO_OFF_MAX_DPS = 10.0f;
+
+static bool gyro_cal_sane(const char *what)
+{
+    float o[3];
+    sensor.imu.getGyroOffset(o[0], o[1], o[2]);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!isfinite(o[i]) || fabsf(o[i]) > GYRO_OFF_MAX_DPS) {
+            POS_PRINT("# gyro: %s calibration REJECTED - offset %.2f %.2f %.2f deg/s is outside "
+                      "+-%.0f deg/s (moved, or misaligned IMU FIFO; FIFO resyncs %lu)\n",
+                      what, (double)o[0], (double)o[1], (double)o[2], (double)GYRO_OFF_MAX_DPS,
+                      (unsigned long)imu_fifo_resyncs(sensor.imu, 0));
+            return false;
+        }
+    }
+    return true;
+}
+
 static void attitude_begin(void)
 {
     memset(&s_att, 0, sizeof(s_att));
@@ -2512,7 +2563,12 @@ static void attitude_begin(void)
     cfg.gnssLatencyMs = 50;            // refined per fix from pos.gps_latency_ms
     cfg.autoZupt      = true;          // switched off at launch, see the loop
 #if ARIADNA_IMU_ODR_2K
-    cfg.imuOdr        = ODR_2KHZ;      // fw 3.35, see ARIADNA_IMU_ODR_2K
+    if (imu_lib_fifo_safe(sensor.imu, 0)) {
+        cfg.imuOdr    = ODR_2KHZ;      // fw 3.35, see ARIADNA_IMU_ODR_2K
+    } else {
+        POS_PRINT("# IMU: Voltino_TriSense < 1.7.1 cannot calibrate the gyro at 2 kHz - "
+                  "staying at 1 kHz (update the library for the 0.5-500 Hz vibration spectrum)\n");
+    }
 #endif
     ins.setMounting(TriSenseINSMount::ComponentsUp);
     sensor.imu.setAccelOffset(ACC_OFFSET[0], ACC_OFFSET[1], ACC_OFFSET[2]);
@@ -2520,6 +2576,10 @@ static void attitude_begin(void)
     ins.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
     ins.setDeclination(MAG_DECLINATION_DEG);   // until the first fix sets the WMM position
     ins.begin(cfg);                    // calibrates the gyro: keep the vehicle still
+    if (!gyro_cal_sane("boot")) {
+        sensor.imu.setGyroOffset(0.0f, 0.0f, 0.0f);   // gyro_saved_check() brings the saved one
+        ins.reset();
+    }
     // INSLIB set the barometer up for itself (50 Hz, OSR x8, no IIR), which
     // is also what the estimator in section 7 samples at.
 #else
@@ -2527,6 +2587,7 @@ static void attitude_begin(void)
     sensor.imu.setAccelScale(ACC_SCALE[0], ACC_SCALE[1], ACC_SCALE[2]);
     fusion.setMagCalibration(MAG_HARD_IRON, MAG_SOFT_IRON);
     sensor.autoCalibrateGyro(1000);
+    if (!gyro_cal_sane("boot")) sensor.imu.setGyroOffset(0.0f, 0.0f, 0.0f);
     fusion.initOrientation(200);
 #endif
 }
@@ -2572,7 +2633,7 @@ static void vib_begin(void)
     vib_init(&s_vib, (uint16_t)odr);
     if (!vib_install_tap(sensor.imu, &vib_tap, 0)) {
         POS_PRINT("# vibration: Voltino_TriSense has no setSampleTap() - "
-                  "update the library to >= 1.7.0; analyser off\n");
+                  "update the library to >= 1.7.1; analyser off\n");
         return;
     }
     __atomic_store_n(&s_vib_on, true, __ATOMIC_RELEASE);
@@ -2640,6 +2701,17 @@ static bool gyro_saved_check(void)
 {
     const float sv[3] = { PRM(IMU_GYR_OFF_X), PRM(IMU_GYR_OFF_Y), PRM(IMU_GYR_OFF_Z) };
     if (sv[0] == 0.0f && sv[1] == 0.0f && sv[2] == 0.0f) return false;   // never saved
+    // An offset AT the parameter limit was clipped there by the GUI (up to
+    // fw 3.35 it clamped and saved whatever the board reported, including the
+    // ~-150 deg/s of the misaligned-FIFO calibration). Not a usable fallback.
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!(fabsf(sv[i]) < GYRO_OFF_MAX_DPS)) {
+            POS_PRINT("# gyro: saved offset %.2f %.2f %.2f deg/s is at the +-%.0f limit (clipped bad "
+                      "calibration) - ignored; press \"Kalibrovat gyro\" to save a good one\n",
+                      (double)sv[0], (double)sv[1], (double)sv[2], (double)GYRO_OFF_MAX_DPS);
+            return false;
+        }
+    }
     float bt[3];
     sensor.imu.getGyroOffset(bt[0], bt[1], bt[2]);
     bool off = false;
@@ -2662,15 +2734,20 @@ static bool gyro_saved_check(void)
     return true;
 }
 
-static void attitude_recalibrate(void)
+/** Returns false when the new calibration was rejected and the old offset kept. */
+static bool attitude_recalibrate(void)
 {
-#if ARIADNA_USE_INSLIB
+    float prev[3];
+    sensor.imu.getGyroOffset(prev[0], prev[1], prev[2]);
     sensor.autoCalibrateGyro(1000);
+    const bool ok = gyro_cal_sane("requested");
+    if (!ok) sensor.imu.setGyroOffset(prev[0], prev[1], prev[2]);
+#if ARIADNA_USE_INSLIB
     ins.reset();
 #else
-    sensor.autoCalibrateGyro(1000);
     fusion.initOrientation(200);
 #endif
+    return ok;
 }
 
 /**
@@ -3799,9 +3876,12 @@ void loop()
     if (s_req_cal_gyro) {
         s_req_cal_gyro = false;
         if (!s_hil_active) {
-            attitude_recalibrate();
-            s_cal_state = 2;
-            s_gyr_checked = true;          // fresh on purpose: no fallback to the saved one
+            // A rejected result keeps the previous offset; the boot-vs-saved
+            // check then still has its say.
+            if (attitude_recalibrate()) {
+                s_cal_state = 2;
+                s_gyr_checked = true;      // fresh on purpose: no fallback to the saved one
+            }
         }
     }
     // Parameters only arrive on the ground (param_receive), so this never runs in flight.

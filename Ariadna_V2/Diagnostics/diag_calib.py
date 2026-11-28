@@ -344,7 +344,17 @@ class CalibTab(QtWidgets.QWidget):
             if all(abs(v) < 1e-6 for v in goff):
                 self.gyro_off_lbl.setText("Deska hlásí nulový offset - neuloženo (kalibrace neproběhla?).")
                 return
-            g = [max(-10.0, min(10.0, float(v))) for v in goff]
+            if any(not (abs(float(v)) < 10.0) for v in goff):
+                # Outside the parameter range: not a still gyro (moved, or the
+                # misaligned-FIFO calibration of Voltino_TriSense <= 1.7.0).
+                # Clipping it to +-10 and saving it, as before, only stored a
+                # wrong offset in flash.
+                self.gyro_off_lbl.setText("Offset " + self._fmt_goff(goff) + " °/s je mimo ±10 °/s - "
+                                          "NEuloženo. Deska se hýbala, nebo je stará knihovna "
+                                          "Voltino_TriSense (< 1.7.1).")
+                self.gyro_msg_until = time.monotonic() + 30.0
+                return
+            g = [float(v) for v in goff]
             self._param_set({"imu.gyr_off_x": g[0], "imu.gyr_off_y": g[1], "imu.gyr_off_z": g[2]})
             self.gyro_off_lbl.setText("Offset " + self._fmt_goff(g) + " °/s uložen do flash ✓")
             self.gyro_msg_until = time.monotonic() + 15.0
