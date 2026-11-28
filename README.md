@@ -456,6 +456,7 @@ arduino-pico core's own `#define`s (`PIN_LED`, `PIN_SPI0_*`). So every sketch is
 compiled with `arduino-cli` and the arduino-pico core, on its real board:
 
 ```bash
+tools/setup_arduino.sh                # once: arduino-cli, arduino-pico, all libraries (Linux x86-64)
 tools/arduino_build.sh                # all 16 sketch builds
 tools/arduino_build.sh Position_MCU   # just one
 ```
