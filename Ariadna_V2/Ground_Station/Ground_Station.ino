@@ -53,6 +53,7 @@
 // =====================================================================
 
 #include "ariadna_link.h"
+#include "ariadna_rampa_link.h"   // ARIADNA_COUNTDOWN_MIN_MS (same floor as the Master)
 
 #include <SPI.h>
 #include <LoRa.h>

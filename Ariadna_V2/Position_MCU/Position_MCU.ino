@@ -196,19 +196,7 @@ bool core1_separate_stack = true;
 #include <stdlib.h>
 #include <math.h>
 
-// True when the Voltino_TriSense driver resynchronises a misaligned FIFO and
-// calibrates at any ODR (>= 1.7.1, which added getFIFOResyncCount()); false
-// with an older library. Decided at compile time, like vib_install_tap().
-template <typename IMU>
-static inline auto imu_lib_fifo_safe(IMU &imu, int) -> decltype(imu.getFIFOResyncCount(), bool())
-{ (void)imu; return true; }
-template <typename IMU>
-static inline bool imu_lib_fifo_safe(IMU &, long) { return false; }
-template <typename IMU>
-static inline auto imu_fifo_resyncs(IMU &imu, int) -> decltype(imu.getFIFOResyncCount(), uint32_t())
-{ return imu.getFIFOResyncCount(); }
-template <typename IMU>
-static inline uint32_t imu_fifo_resyncs(IMU &, long) { return 0; }
+#include "ariadna_imu_compat.h"   // imu_lib_fifo_safe(), imu_fifo_resyncs()
 
 // =====================================================================
 //  1. HARDWARE CONFIGURATION

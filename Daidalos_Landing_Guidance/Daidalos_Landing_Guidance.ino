@@ -52,7 +52,7 @@ static const uint8_t PIN_TVC2    = 4;   // TVC servo, y channel
 static const uint8_t PIN_CLAMP   = 3;   // thrust-clamp servo signal
 static const uint8_t PIN_IGNITER = 6;   // igniter MOSFET gate (LOW = safe)
 static const uint8_t PIN_ARM     = 7;   // arming switch, LOW = armed (pull-up)
-static const uint8_t PIN_LED     = LED_BUILTIN;
+static const uint8_t STATUS_LED  = LED_BUILTIN;   // not PIN_LED: the core #defines it
 
 static const uint8_t PIN_NAV_TX  = 8;   // UART1 TX -> nav processor RX
 static const uint8_t PIN_NAV_RX  = 9;   // UART1 RX <- nav processor TX
@@ -443,7 +443,7 @@ void setup()
     pinMode(PIN_IGNITER, OUTPUT);
     digitalWrite(PIN_IGNITER, LOW);        // before anything else
     pinMode(PIN_ARM, INPUT_PULLUP);
-    pinMode(PIN_LED, OUTPUT);
+    pinMode(STATUS_LED, OUTPUT);
 
     Serial.begin(921600);
 
@@ -466,7 +466,7 @@ void setup()
                    "servo1,servo2,clamp,thrust,p,rx_ok,rx_bad,loop_us,overrun,plan");
 
     if (!post) {                           // refuse to fly, and say so
-        for (;;) { digitalWrite(PIN_LED, millis() % 200 < 100); delay(10); }
+        for (;;) { digitalWrite(STATUS_LED, millis() % 200 < 100); delay(10); }
     }
     s_ready = true;
 }
@@ -558,7 +558,7 @@ void loop()
         tvc_write(s_out.servo1_deg, s_out.servo2_deg);
         clamp_write(s_out.clamp);
     }
-    digitalWrite(PIN_LED, s_out.phase == DG_PHASE_BURN ? HIGH
+    digitalWrite(STATUS_LED, s_out.phase == DG_PHASE_BURN ? HIGH
                                                        : (millis() % 1000 < 50));
 
     // ---- telemetry ----------------------------------------------------

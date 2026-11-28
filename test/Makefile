@@ -200,6 +200,7 @@ SYNC_PAIRS = \
   $(V2)/common/ariadna_uart_dma.h:$(NAV_DIR)/ariadna_uart_dma.h \
   $(V2)/common/ariadna_rgb.h:$(NAV_DIR)/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(V2)/Ground_Station/ariadna_link.h \
+  $(V2)/common/ariadna_rampa_link.h:$(V2)/Ground_Station/ariadna_rampa_link.h \
   $(V2)/common/ariadna_rgb.h:$(V2)/Uwb_Anchor/ariadna_rgb.h \
   $(V2)/common/ariadna_link.h:$(EX_DIR)/Actuator_Console/ariadna_link.h \
   $(V2)/common/actcon_pyro.h:$(EX_DIR)/Actuator_Console/actcon_pyro.h \

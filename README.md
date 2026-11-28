@@ -445,6 +445,28 @@ table all came through the rewrite untouched.
 mistake that otherwise only appears with a board in front of you: a typo, a wrong argument
 type, a rename in `guidance.h` the sketch was not updated for.
 
+### Real Arduino build of every sketch
+
+`make syntax` uses plain g++, which does **not** do what the Arduino IDE does to a `.ino`
+before compiling it: write a prototype for every function and put them all above the first
+function in the file. Two classes of IDE-only build breaks slip through that way — a
+function whose argument type is a struct defined further down (`'LoRaSyncSnap' was not
+declared in this scope`), and a template function in a `.ino` — as do clashes with the
+arduino-pico core's own `#define`s (`PIN_LED`, `PIN_SPI0_*`). So every sketch is also
+compiled with `arduino-cli` and the arduino-pico core, on its real board:
+
+```bash
+tools/arduino_build.sh                # all 16 sketch builds
+tools/arduino_build.sh Position_MCU   # just one
+```
+
+GitHub Actions (`.github/workflows/arduino-build.yml`) runs it, together with
+`make check`, on **every push and pull request**: a sketch that would not build in the IDE
+shows up as a red ✗ on the commit, before anyone flashes it. Rules that keep the IDE happy:
+templates and anything with `auto … -> decltype` go in a `.h`, not the `.ino`; a struct used
+in a function's signature is forward-declared near the top (`struct LoRaSyncSnap;`); no
+sketch constant may be named like a core macro (`PIN_*`, `LED_BUILTIN`, `SS`, …).
+
 ---
 
 ## Telemetry

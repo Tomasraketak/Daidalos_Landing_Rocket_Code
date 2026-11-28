@@ -69,9 +69,10 @@ static const uint8_t PIN_PYRO3_FIRE   = 18;  // U7.24 -> R41 -> Q24 (J7)
 static const uint8_t PIN_PYRO_ARM     = 19;  // U7.25 -> R29 -> Q21 -> Q20 (VPYRO_ARMED)
 
 // Spare / expansion hardware pins (defined for future sensor logging)
-static const uint8_t PIN_SPI0_SCK     = 2;   // U9 W25Q128 + U14 ADS1220
-static const uint8_t PIN_SPI0_MOSI    = 3;
-static const uint8_t PIN_SPI0_MISO    = 4;
+// Not PIN_SPI0_*: arduino-pico's pins_arduino.h #defines those names.
+static const uint8_t RAMPA_SPI0_SCK   = 2;   // U9 W25Q128 + U14 ADS1220
+static const uint8_t RAMPA_SPI0_MOSI  = 3;
+static const uint8_t RAMPA_SPI0_MISO  = 4;
 static const uint8_t PIN_FLASH_CS     = 5;
 static const uint8_t PIN_ADS1220_CS   = 15;
 static const uint8_t PIN_ADS1220_DRDY = 21;

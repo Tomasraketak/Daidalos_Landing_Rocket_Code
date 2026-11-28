@@ -838,7 +838,7 @@ This matters more than anything else in this README.
 | **UWB anchor survey** | ⚠️ **cannot be verified in software at all.** The boot self test catches duplicated addresses, anchors closer than a metre and a geometry that cannot solve; it cannot catch an anchor that is simply not where the table says. Measure it, and watch the post-fit residual. |
 | **UWB driver** | ⚠️ **not host-compiled with the radio present** — the ranging library is absent from the host build. The geometry is fully tested; the SPI and IRQ handling is not. |
 | **body→pad rotation** | ⚠️ **not verified.** Three conventions have to agree and only one is ours. |
-| **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. All five sketches build clean with `arduino-cli` (arduino-pico 6.2.0, `--warnings all`); nothing in `make check` does that. |
+| **Master, Position, ground station sketches** | not host-compiled — they pull in LoRa, SSD1306 and TriSense. Every sketch is built with `arduino-cli` + arduino-pico by `tools/arduino_build.sh`, which CI (`.github/workflows/arduino-build.yml`) runs on every push. |
 
 The three ⚠️ rows share a failure mode: they do not produce a plausible-but-wrong number,
 they mirror an axis. A mirrored axis turns the attitude loop into positive feedback, which
